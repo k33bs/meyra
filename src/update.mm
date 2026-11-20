@@ -22,6 +22,7 @@ static NSString *const kAssetPrefix = @"Meyra-";      // Meyra-v0.1.0.zip, a zip
 static const long long kMaxBytes = 50 * 1000 * 1000;  // the app zips to a few megabytes
 static const double kTimeout = 15;                    // seconds, for the api request
 static const double kDownloadTimeout = 300;
+static const long long kMaxUnpacked = 250 * 1000 * 1000; // what the zip may claim to unpack to
 
 bool parseVersion(const std::string &str, std::vector<int> &v) {
     NSString *s = [@(str.c_str()) stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -167,6 +168,29 @@ static NSURL *stagingFor(NSURL *app, std::string &err) {
     return d;
 }
 
+// game mode off edits the installed app's Info.plist (app.mm), and an edited bundle no longer verifies. the signed
+// original is kept next to the previous version so it can be put back byte for byte
+static NSURL *signedPlist() {
+    NSURL *as = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+    return [as URLByAppendingPathComponent:@"Meyra/Info.plist.signed"];
+}
+
+void keepSignedPlist(NSURL *app) {
+    // only bytes the signature still covers: a plist that was edited before must not become "the original"
+    if (runTool(@"/usr/bin/codesign", @[@"--verify", @"--strict", app.path]) != 0) return;
+    NSData *d = [NSData dataWithContentsOfURL:[app URLByAppendingPathComponent:@"Contents/Info.plist"]];
+    [NSFileManager.defaultManager createDirectoryAtURL:signedPlist().URLByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+    if (d) [d writeToURL:signedPlist() atomically:YES];
+}
+
+bool restoreSignedPlist(NSURL *app) {
+    NSDictionary *was = [NSDictionary dictionaryWithContentsOfURL:signedPlist()], *is = infoOf(app);
+    if (!was || !is || [is[@"LSSupportsGameMode"] boolValue]) return false; // nothing kept, or not edited
+    for (NSString *k in @[@"CFBundleIdentifier", @"CFBundleShortVersionString", @"CFBundleVersion"])
+        if (![was[k] isEqual:is[k]]) return false; // from another build
+    return [[NSData dataWithContentsOfURL:signedPlist()] writeToURL:[app URLByAppendingPathComponent:@"Contents/Info.plist"] atomically:YES];
+}
+
 static NSURL *keptDir() {
     NSURL *as = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
     return [as URLByAppendingPathComponent:@"Meyra/Previous Version" isDirectory:YES];
@@ -212,8 +236,13 @@ static std::string validate(NSURL *nu, const Release &r, NSURL *app) {
     if (compareVersions(v, cur) <= 0) return "The downloaded app (" + versionString(v) + ") is not newer than this one (" + versionString(cur) + ").";
     std::string why;
     if (runTool(@"/usr/bin/codesign", @[@"--verify", @"--deep", @"--strict", nu.path], &why) != 0) return "The downloaded app's code signature is not valid: " + why;
+    // signed with a developer id: the new one must chain to apple and carry the same team. reading the team name out
+    // of the new bundle is not enough, anyone can write one into a certificate of their own.
+    // not exercised yet, there is no developer id build to test it with
     std::string team = teamOf(app);
-    if (!team.empty() && teamOf(nu) != team) return "The downloaded app is not signed by the same developer as this one.";
+    NSString *req = [NSString stringWithFormat:@"-R=anchor apple generic and certificate leaf[subject.OU] = \"%s\"", team.c_str()];
+    if (!team.empty() && runTool(@"/usr/bin/codesign", @[@"--verify", @"--deep", @"--strict", req, nu.path]) != 0)
+        return "The downloaded app is not signed by the same developer as this one.";
     return "";
 }
 
@@ -225,6 +254,17 @@ NSURL *unpack(NSURL *zip, const Release &r, NSURL *app, std::string &err) {
         if (!line.length || [line hasPrefix:@"__MACOSX/"]) continue;
         if (![line hasPrefix:@"Meyra.app/"] || [line rangeOfString:@".."].location != NSNotFound) { err = "The download contains files outside Meyra.app."; return nil; }
     }
+    // the long listing: no links (one pointing out of the bundle gets written through while unpacking; the app has
+    // none of its own), and a limit on what it says it unpacks to.
+    // the sizes are the archive's own claim. a lying one is stopped by the disk, not here
+    if (runTool(@"/usr/bin/unzip", @[@"-Z", zip.path], &list) != 0) { err = "The download is not a zip archive."; return nil; }
+    long long total = -1;
+    for (NSString *line in [ns(list) componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        if ([line hasPrefix:@"l"]) { err = "The download contains links, which Meyra.app does not have."; return nil; }
+        NSRange r = [line rangeOfString:@"^[0-9]+ files?, [0-9]+ bytes uncompressed" options:NSRegularExpressionSearch];
+        if (r.location != NSNotFound) total = [[line componentsSeparatedByString:@", "][1] longLongValue];
+    }
+    if (total < 0 || total > kMaxUnpacked) { err = "The download unpacks to more than an app update can be."; return nil; }
     NSURL *stage = stagingFor(app, err);
     if (!stage) return nil;
     NSURL *nu = [stage URLByAppendingPathComponent:@"Meyra.app"];
@@ -236,6 +276,7 @@ NSURL *unpack(NSURL *zip, const Release &r, NSURL *app, std::string &err) {
 
 // app -> aside, staged -> app, aside -> kept. a failure before the second rename puts everything back
 bool swapIn(NSURL *app, NSURL *staged, NSURL *kept, std::string &err) {
+    restoreSignedPlist(app); // the copy that is kept must verify again when it is reverted to
     NSURL *aside = [staged.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"Meyra (replaced).app"];
     if (rename(app.fileSystemRepresentation, aside.fileSystemRepresentation) != 0) {
         err = std::string("The current version could not be moved aside (") + strerror(errno) + "). Nothing was changed.";
@@ -346,6 +387,8 @@ static void fetchAndInstall(const Release &r, NSURL *src, NSURL *app, NSURL *kep
     dl.dest = [dir URLByAppendingPathComponent:@"update.zip"];
     Release rel = r;
     dl.done = ^(NSURL *file, NSString *failure) {
+      // checksum, unzip and codesign take seconds: not on the main queue, the picture's window lives there
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         std::string e = failure ? failure.UTF8String : "";
         NSURL *staged = nil;
         // no checksum, no install: this runs unattended at launch for everyone
@@ -356,7 +399,8 @@ static void fetchAndInstall(const Release &r, NSURL *src, NSURL *app, NSURL *kep
         [NSFileManager.defaultManager removeItemAtURL:dir error:nil];
         // if the app is missing its old copy may still be in there: leave it for the user (the error says where)
         if (staged && isRealDir(app)) [NSFileManager.defaultManager removeItemAtURL:staged.URLByDeletingLastPathComponent error:nil];
-        done(e);
+        dispatch_async(dispatch_get_main_queue(), ^{ done(e); });
+      });
     };
     NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
     cfg.timeoutIntervalForResource = kDownloadTimeout;

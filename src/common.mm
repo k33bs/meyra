@@ -64,10 +64,10 @@ void settingsLoad() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     [d registerDefaults:@{@"levels": @0, @"deband": @YES, @"upscale": @1, @"sharpen": @0.6, @"frameGen": @YES, @"early": @NO,
                           @"passthrough": @NO, @"audio": @YES, @"audioTrimMs": @0, @"refresh": @1, @"overlay": @YES,
-                          @"checkUpdatesAtLaunch": @YES}];
+                          @"checkUpdatesAtLaunch": @YES, @"srWithGen": @YES, @"srPad": @YES, @"vsync": @YES, @"gameMode": @YES}];
     gSet.levels = (int)[d integerForKey:@"levels"] % 3;
     gSet.deband = [d boolForKey:@"deband"];
-    gSet.upscale = (int)[d integerForKey:@"upscale"] % 2;
+    gSet.upscale = (int)[d integerForKey:@"upscale"] % 5;
     gSet.sharpen = fminf(1, fmaxf(0, [d floatForKey:@"sharpen"]));
     gSet.frameGen = [d boolForKey:@"frameGen"];
     gSet.early = [d boolForKey:@"early"];
@@ -76,6 +76,10 @@ void settingsLoad() {
     gSet.audioTrim = [d doubleForKey:@"audioTrimMs"] / 1000;
     gSet.refresh = (int)[d integerForKey:@"refresh"] % 3;
     gSet.overlay = [d boolForKey:@"overlay"];
+    gSet.srWithGen = [d boolForKey:@"srWithGen"];
+    gSet.srPad = [d boolForKey:@"srPad"];
+    gSet.vsync = [d boolForKey:@"vsync"];
+    gSet.colour = (int)[d integerForKey:@"colour"] % 3;
 }
 
 void settingsSave(const char *key) {
@@ -83,6 +87,10 @@ void settingsSave(const char *key) {
     NSString *k = @(key);
     if ([k isEqual:@"levels"]) [d setInteger:gSet.levels forKey:k];
     else if ([k isEqual:@"deband"]) [d setBool:gSet.deband forKey:k];
+    else if ([k isEqual:@"srPad"]) [d setBool:gSet.srPad forKey:k];
+    else if ([k isEqual:@"vsync"]) [d setBool:gSet.vsync forKey:k];
+    else if ([k isEqual:@"colour"]) [d setInteger:gSet.colour forKey:k];
+    else if ([k isEqual:@"srWithGen"]) [d setBool:gSet.srWithGen forKey:k];
     else if ([k isEqual:@"upscale"]) [d setInteger:gSet.upscale forKey:k];
     else if ([k isEqual:@"sharpen"]) [d setFloat:gSet.sharpen forKey:k];
     else if ([k isEqual:@"frameGen"]) [d setBool:gSet.frameGen forKey:k];

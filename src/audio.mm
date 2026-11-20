@@ -121,8 +121,14 @@ void pushInt32(const int32_t *s, long n, int ch, double t, int64_t packetTime) {
         float l = s[0] * k, r = s[1] * k;
         if (ch >= 8) { // hdmi order fl fr lfe fc ls rs bl br. plain fold down, lfe left out. does nothing to a stereo source
             float c = 0.707f * s[3] * k;
-            l = std::clamp(l + c + 0.707f * (s[4] * k + s[6] * k), -1.0f, 1.0f);
-            r = std::clamp(r + c + 0.707f * (s[5] * k + s[7] * k), -1.0f, 1.0f);
+            l += c + 0.707f * (s[4] * k + s[6] * k);
+            r += c + 0.707f * (s[5] * k + s[7] * k);
+            // the sum of a loud surround mix goes past full scale. turned down just far enough while it does, back up
+            // over ~0.3 s: clipping it instead crackled. a stereo source never gets here, its gain stays 1
+            static float gain = 1;
+            float pk = fmaxf(fabsf(l), fabsf(r));
+            gain = pk * gain > 1 ? 1 / pk : fminf(1, gain + (1 - gain) * 7e-5f);
+            l *= gain; r *= gain;
         }
         float *d = gRing + (((w + i) & (kRing - 1)) << 1);
         d[0] = l; d[1] = r;

@@ -10,7 +10,7 @@
 # overridden, e.g. make SIGN="Developer ID Application: ..." for a distributable build, or make OUT=/tmp/x for a
 # second build next to one that is running.
 
-VERSION   = 0.1.0
+VERSION   = 0.2.0
 BUILD     = 1
 BUNDLE_ID = io.github.k33bs.meyra
 MIN_MACOS = 14.0

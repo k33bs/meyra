@@ -35,6 +35,8 @@
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSCameraUseContinuityCameraDeviceType</key>
+	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Meyra shows the picture from your capture device.</string>
 	<key>NSMicrophoneUsageDescription</key>

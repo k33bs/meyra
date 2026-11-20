@@ -18,6 +18,7 @@ static Req gReq;                          // under gLock
 static std::atomic<bool> gPending{false};
 static std::atomic<uint64_t> gWanted{0};
 static CVPixelBufferRef gResult;          // under gLock, +1
+static uint64_t gResultTicket;            // under gLock: the request gResult answers
 static dispatch_semaphore_t gDone;
 static std::atomic<double> gPeak{0};
 static std::atomic<int> gWantW{0}, gWantH{0}, gReadyW{0}, gReadyH{0};
@@ -47,7 +48,7 @@ const char *status() {
     if (!available()) return "not available on this mac";
     switch (gState.load()) {
     case 1: return "starting";
-    case 3: return "could not start for this picture size";
+    case 3: return "not working for this picture (off and on again retries)";
     default: return "";
     }
 }
@@ -71,7 +72,11 @@ CVPixelBufferRef take(double graceMs) {
     os_unfair_lock_lock(&gLock);
     CVPixelBufferRef mid = gResult;
     gResult = NULL;
+    // a frame that finished after its take gave up is still lying here when the next pair is late too. it belongs
+    // between two older frames: showing it would step motion backwards
+    bool stale = mid && gResultTicket != gWanted;
     os_unfair_lock_unlock(&gLock);
+    if (stale) { CFRelease(mid); mid = NULL; }
     return mid;
 }
 
@@ -93,6 +98,7 @@ API_AVAILABLE(macos(26.0))
 static void loop() {
     VTFrameProcessor *proc = nil;
     CVPixelBufferPoolRef dstPool = NULL;
+    int fails = 0, restarts = 0; // calls that failed in a row, and sessions restarted over it
     while (!gQuit) {
         double idle = nowSec() - gLastAsk.load();
         int ww = gWantW, wh = gWantH;
@@ -101,8 +107,9 @@ static void loop() {
                 [proc endSession];
                 proc = nil;
                 if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; }
-                gState = 0; gReadyW = gReadyH = 0;
             }
+            gState = 0; gReadyW = gReadyH = 0; // also after a failed start, so the next use tries again
+            fails = restarts = 0;
             usleep(20000);
             continue;
         }
@@ -142,7 +149,7 @@ static void loop() {
         @autoreleasepool {
             double t = nowSec();
             CVPixelBufferRef dst = NULL;
-            bool ok = false;
+            bool ok = false, tried = false;
             bool sizeOk = gState == 2 && (int)CVPixelBufferGetWidth(r.cur) == gReadyW && (int)CVPixelBufferGetHeight(r.cur) == gReadyH;
             if (sizeOk && gWanted == r.ticket && CVPixelBufferPoolCreatePixelBuffer(NULL, dstPool, &dst) == kCVReturnSuccess) {
                 tag709(dst);
@@ -151,13 +158,24 @@ static void loop() {
                 VTFrameProcessorFrame *fd = [[VTFrameProcessorFrame alloc] initWithBuffer:dst presentationTimeStamp:CMTimeMake(500, 30000)];
                 VTLowLatencyFrameInterpolationParameters *p = [[VTLowLatencyFrameInterpolationParameters alloc] initWithSourceFrame:fc previousFrame:fp interpolationPhase:@[@0.5f] destinationFrames:@[fd]];
                 NSError *err = nil;
+                tried = true;
                 ok = p && [proc processWithParameters:p error:&err];
+                if (!ok && fails == 0) logLine("frame generation: a frame failed%s%s", err ? ": " : "", err ? err.localizedDescription.UTF8String : "");
+            }
+            // a session can start fine and then fail every frame. it still said "ready" then and nothing was generated:
+            // start a new one, and give up (visible in the overlay) if that keeps failing too
+            if (ok) fails = restarts = 0;
+            else if (tried && ++fails >= 30) {
+                fails = 0;
+                if (++restarts > 2) { gState = 3; logLine("frame generation: keeps failing, stopped until it is turned off and on"); }
+                else { gReadyW = gReadyH = 0; logLine("frame generation: 30 frames failed in a row, starting a new session"); }
             }
             double ms = (nowSec() - t) * 1000;
             bool keep = ok && gWanted == r.ticket;
             os_unfair_lock_lock(&gLock);
             CVPixelBufferRef old = gResult;
             gResult = keep ? dst : NULL;
+            gResultTicket = r.ticket;
             if (ok) { gS.sumMs += ms; gS.n++; if (ms > gS.maxMs) gS.maxMs = ms; gPeak = fmax(ms, gPeak.load() * 0.995); }
             os_unfair_lock_unlock(&gLock);
             if (old) CFRelease(old);

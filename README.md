@@ -22,9 +22,9 @@ this is a dev release. it works well on my setup, expect rough edges on yours.
   generation off.
 - **frame generation.** a 30 fps game arrives as 60 hz with every frame sent twice. meyra swaps each repeat for a
   frame generated between the two real ones (apple's low latency frame interpolator), so it moves like 60 fps.
-  costs 30 to 50 ms of extra delay, depending on the schedule.
-- **cleaner picture.** removes the fine dither pattern many games add, upscales to the window with metalfx and
-  sharpens brightness only, with a limit so there are no halos.
+  costs about 30 ms of extra delay.
+- **cleaner picture.** removes the fine dither pattern many games add, upscales to the window with metalfx (or
+  an edge-aware shader, or apple super resolution) and sharpens brightness only, with a limit so there are no halos.
 - **correct levels.** video range and full range are detected on their own.
 - **sound in step.** the source's audio is played delayed to match the picture.
 - **even motion.** switches the display, while it runs, to a refresh rate the source divides into evenly.
@@ -48,6 +48,7 @@ after that it updates itself, see [updates](#updates). or build it yourself, see
 |---|---|
 | meyra | a mac with apple silicon, macos 14 or later |
 | frame generation | macos 26 or later. without it the menu item is greyed out, the rest works |
+| apple super resolution | macos 26 or later, same as above |
 | a capture device | any hdmi capture card macos can see |
 | building | xcode command line tools (`xcode-select --install`), nothing else |
 
@@ -106,8 +107,9 @@ source and all settings. everything is in the menu bar, the single keys work whi
 | source | device, input or format, audio input, restart source | ⌘R | |
 | source | save snapshot (png, to pictures) | ⌘S | |
 | picture | levels: automatic, video range, full range | R | automatic |
+| picture | colour: bt.709, srgb, the screen's own | C | bt.709 |
 | picture | dither removal | B | on |
-| picture | upscaling: plain, metalfx | M | metalfx |
+| picture | upscaling: plain, metalfx, edge-aware (fsr 1 or sgsr 1), apple super resolution | M | metalfx |
 | picture | sharpening: off, low, medium, high | ] [ | medium |
 | picture | plain passthrough (all processing off) | Z | off |
 | motion | frame generation | G | on |
@@ -116,15 +118,47 @@ source and all settings. everything is in the menu bar, the single keys work whi
 | audio | play audio, earlier / later by 5 ms | A, ; ' | on, 0 |
 | window | show status overlay | H | on |
 | window | enter full screen, actual size | F, ⌘0 | |
+| window | window size: next size (720p, 900p, 1080p, 1440p, 2160p, whatever fits the screen) | W | |
+| meyra | vsync | V | on |
+| meyra | game mode in full screen | | on |
 | meyra | check for updates, at launch, revert to previous version | | at launch: on |
 
 - **frame generation** only acts when the source repeats frames. 60 fps content is shown as it is. one cpu core
   stays busy while it is on. turn it off for games where reaction time matters most.
-- **frame schedule**: on the tick gives the steadiest motion. early shows frames sooner, about 20 ms less delay.
+- **edge-aware (fsr 1)**: the easu pass of amd's fidelityfx super resolution 1 as a shader, then the usual
+  sharpening. costs nothing worth measuring and runs with frame generation. sits between plain and metalfx:
+  cleaner edges than plain, less grain and crunch than metalfx.
+- **edge-aware (sgsr 1)**: snapdragon game super resolution 1, same idea in one pass. it only touches edges and
+  leaves flat areas as plain, so grain stays as it came.
+- **apple super resolution**: apple's low latency super resolution scaler instead of metalfx. it only takes up to
+  about 1280 pixels a side, so a 1080p frame goes through as two overlapping halves, scaled to 2880×1620, then
+  down to the window. cleaner than metalfx (does not pick up dither or grain) but softer, and every frame waits
+  for it: about 9 ms at 1080p, and one more cpu core busy. it shares the neural engine with frame generation
+  and each slows the other, so with both on they take turns: generate, scale the generated frame, scale the
+  next real one. that fits, and costs about 9 ms more delay than metalfx (45 against 36 ms measured). "run with
+  frame generation" in the upscaling menu turns that off, then metalfx is used while frame generation is on.
+  "pad edges" draws 16 mirrored pixels around each tile, because the scaler rings at the outer edge of what it
+  is given. it falls back to metalfx while it starts (a few seconds the first time) and for sizes it cannot
+  take, e.g. 4k.
+- **frame schedule**: on the tick gives the steadiest motion. early shows frames a few ms sooner (about 3).
+- **colour**: how the picture's colours are handed to macos. bt.709 is what the source says they are and looks
+  the same on every screen, a little flat. srgb has the contrast of a tv. the screen's own skips colour
+  management: most saturated, and different on each screen.
 - **levels**: if blacks look grey or shadows look crushed, pick the range by hand. the overlay shows the darkest
   value seen: 16 on a black picture means the source sends video range.
 - **match display refresh** only touches the display when its rate is not a multiple of the source's (a 100 hz
   display with 60 fps content), and only while meyra runs.
+- **variable refresh**: if the screen has adaptive sync (set its refresh rate to "variable" in system settings)
+  or promotion, go full screen. meyra then leaves the mode alone and the screen shows each frame as it comes:
+  even motion and much less delay than a fixed 60 hz mode (measured on a 48-100 hz screen: about 5 ms without
+  frame generation, 36 ms with, against 25 and 85). in a window macos draws at the screen's top rate, so there
+  the matched mode is used as before.
+- **vsync**: off shows frames without waiting for the display, a few ms sooner, and can tear. on a variable
+  refresh screen it makes next to no difference (measured 1 to 2 ms).
+- **game mode**: meyra tells macos it is a game, so full screen gets game mode (more cpu and gpu priority,
+  quicker bluetooth controllers and headphones). macos has no switch for that per app, so turning it off here
+  takes the claim out of the installed app's `Info.plist`. it counts from the next start, and it edits the app
+  bundle, so `codesign --verify` will complain afterwards. the app runs the same.
 - **streaming**: the window is titled "Meyra". keep it visible while another app captures it, macos stops
   updating covered or minimised windows.
 
@@ -159,6 +193,7 @@ newer. turn that off in the meyra menu, "check for updates at launch".
 | `src/app.mm` | application, window, menus, source picker, overlay, command line |
 | `src/renderer.mm` | metal pipeline, frame analysis, presentation schedules, render thread |
 | `src/framegen.mm` | frame generation thread |
+| `src/superres.mm` | apple super resolution thread |
 | `src/audio.mm` | audio ring buffer, delay matching, output |
 | `src/source*.mm` | capture: system route, vendor drivers, replay |
 | `src/display.mm` | display refresh matching |
@@ -180,7 +215,7 @@ newer. turn that off in the meyra menu, "check for updates at launch".
 | `--snapshot FILE` | save one processed frame as png |
 | `--capture-test FILE` | capture the window as other apps would, save as png |
 | `--window WxH`, `--screen NAME`, `--fullscreen` | where and how to open |
-| `--command NAME` | run a menu command after launch, e.g. `sharp:0.3`, `levels:2` |
+| `--command NAME[@SECONDS]` | run a menu command after launch or that many seconds in, e.g. `sharp:0.3`, `upscale+@5` |
 | `--menu-dump` | log every menu item with its state |
 | `--set KEY=VALUE` | store a setting as if chosen in the menu |
 | `-KEY VALUE` | override a setting for this run, e.g. `-frameGen NO` |
@@ -188,7 +223,7 @@ newer. turn that off in the meyra menu, "check for updates at launch".
 | `--update-test JSON ZIP APP KEPTDIR` | run the install path on local files, against a copy of the app |
 
 setting keys: `levels`, `deband`, `upscale`, `sharpen`, `frameGen`, `early`, `passthrough`, `audio`,
-`audioTrimMs`, `refresh`, `overlay`, `checkUpdatesAtLaunch`, `muteOutput`. `defaults delete
+`audioTrimMs`, `refresh`, `overlay`, `checkUpdatesAtLaunch`, `srWithGen`, `srPad`, `vsync`, `colour`, `gameMode`, `muteOutput`. `defaults delete
 io.github.k33bs.meyra` resets them.
 
 **making a release.** set `VERSION` in the `Makefile`, update `CHANGELOG.md`, run `make release`. it builds

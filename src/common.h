@@ -17,7 +17,7 @@ void tag709(CVPixelBufferRef pb);       // mark a buffer as bt.709, which every 
 struct Settings {
     std::atomic<int> levels{0};          // 0 auto, 1 video range, 2 full range
     std::atomic<bool> deband{true};      // dither removal
-    std::atomic<int> upscale{1};         // 0 plain (bilinear), 1 metalfx
+    std::atomic<int> upscale{1};         // 0 plain (bilinear), 1 metalfx, 2 apple super resolution (metalfx until it is up), 3 edge-aware (fsr 1 easu), 4 edge-aware (sgsr 1)
     std::atomic<float> sharpen{0.6f};    // 0 = off
     std::atomic<bool> frameGen{false};
     std::atomic<bool> early{true};       // early schedule for generated frames, else on the tick
@@ -26,6 +26,10 @@ struct Settings {
     std::atomic<double> audioTrim{0};    // seconds, positive = later
     std::atomic<int> refresh{1};         // 0 leave the display alone, 1 auto, 2 match source rate
     std::atomic<bool> overlay{false};
+    std::atomic<int> colour{0};          // how the picture's colours are handed to macos: 0 bt.709 (exact), 1 srgb (more contrast), 2 the screen's own (unmanaged, most saturated)
+    std::atomic<bool> vsync{true};       // presents wait for the display. off: a few ms sooner, can tear
+    std::atomic<bool> srPad{true};       // apple super resolution: mirrored padding around the tiles against ringing at the picture's edges
+    std::atomic<bool> srWithGen{true};   // run apple super resolution next to frame generation too, one after the other: ~9 ms more delay
 };
 extern Settings gSet;
 
@@ -37,3 +41,5 @@ inline bool effDeband() { return gSet.deband && !gSet.passthrough; }
 inline int effUpscale() { return gSet.passthrough ? 0 : gSet.upscale.load(); }
 inline float effSharpen() { return gSet.passthrough ? 0 : gSet.sharpen.load(); }
 inline bool effFrameGen() { return gSet.frameGen && !gSet.passthrough; }
+// with srWithGen off: super resolution steps aside while frame generation is on (no extra delay that way)
+inline bool srYields() { return gSet.upscale == 2 && effFrameGen() && !gSet.srWithGen; }

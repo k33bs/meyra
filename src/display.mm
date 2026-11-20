@@ -2,6 +2,7 @@
 // Copyright (C) 2026 k33bs
 #include "display.h"
 #include "common.h"
+#include <atomic>
 #include <cmath>
 
 namespace display {
@@ -9,6 +10,7 @@ namespace display {
 static CGDirectDisplayID gChanged;  // display we switched, 0 = none
 static CGDisplayModeRef gOriginal;  // its mode before
 static std::string gStatus = "";
+static std::atomic<bool> gVariable{false};
 
 static CGDirectDisplayID idOf(NSScreen *s) { return [s.deviceDescription[@"NSScreenNumber"] unsignedIntValue]; }
 
@@ -33,7 +35,7 @@ void restore() {
     gChanged = 0;
 }
 
-void apply(NSScreen *screen, double fps, int mode) {
+void apply(NSScreen *screen, double fps, int mode, bool fullScreen) {
     if (!screen) return;
     CGDirectDisplayID did = idOf(screen);
     if (gChanged && (gChanged != did || mode == 0)) restore();
@@ -41,6 +43,26 @@ void apply(NSScreen *screen, double fps, int mode) {
     if (!cur) return;
     double curHz = CGDisplayModeGetRefreshRate(cur);
     char b[160];
+    // variable refresh (adaptive sync, promotion): the screen shows each frame when it comes, as long as the source's
+    // frame time is inside its range. better than any fixed mode: even motion and no wait for a tick (measured on a
+    // 48-100 hz screen, full screen: about half the delay of the matched 60 hz mode).
+    // only full screen: a window is drawn by the compositor at the screen's top rate (measured: 10/20 ms steps at
+    // 100 hz), so there the fixed mode below is still the even one.
+    // the range is remembered from before we switch: on a fixed mode of ours the screen reports that mode's rate
+    static CGDirectDisplayID rangeOf; static double lo, hi;
+    if (gChanged != did || rangeOf != did) { rangeOf = did; lo = screen.minimumRefreshInterval; hi = screen.maximumRefreshInterval; }
+    bool vrr = mode == 1 && fullScreen && fps >= 1 && hi - lo > 0.0005 && 1 / fps >= lo - 0.0002 && 1 / fps <= hi + 0.0002;
+    gVariable = vrr;
+    { static int lastKey = -1; int key = (int)vrr | (int)fullScreen << 1 | (hi - lo > 0.0005) << 2; // why, once per change
+      if (mode == 1 && fps >= 1 && key != lastKey) { lastKey = key; logLine("display: range %.1f-%.1f ms, full screen %d, variable %d", lo * 1000, hi * 1000, (int)fullScreen, (int)vrr); } }
+    if (vrr) {
+        if (gChanged == did) restore();
+        snprintf(b, sizeof b, "%s variable %.0f-%.0f Hz, following the source", screen.localizedName.UTF8String, 1 / hi, 1 / lo);
+        if (gStatus != b) logLine("display: %s (source %.2f fps)", b, fps);
+        gStatus = b;
+        CGDisplayModeRelease(cur);
+        return;
+    }
     if (mode == 0 || fps < 1) {
         snprintf(b, sizeof b, "%s %.0f Hz", screen.localizedName.UTF8String, curHz);
         gStatus = b;
@@ -93,5 +115,6 @@ void apply(NSScreen *screen, double fps, int mode) {
 }
 
 std::string status() { return gStatus; }
+bool variable() { return gVariable; }
 
 }

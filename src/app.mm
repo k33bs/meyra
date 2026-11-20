@@ -10,6 +10,7 @@
 #include "common.h"
 #include "display.h"
 #include "framegen.h"
+#include "superres.h"
 #include "renderer.h"
 #include "source.h"
 #include "update.h"
@@ -40,6 +41,40 @@ static NSString *ns(const std::string &s) { return @(s.c_str()); }
 @end
 
 static AppDelegate *gApp;
+
+// game mode: macos turns it on for a full screen app whose Info.plist says it is a game and supports it (the build's
+// plist does). there is no call to switch it per run, so "off" takes the keys out of the installed app's own plist.
+// launch services only reads a bundle again when its date changes, hence the touch and the re-register, and it only
+// counts from the next start.
+// this edits a signed bundle. fine for the ad hoc builds (still starts, same permissions, only
+// `codesign --verify` complains); with developer id + notarisation it has to become something else
+static bool gGameModeChanged;
+static NSString *infoPlist() { return [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Info.plist"]; }
+static bool gameModeDeclared() { return [[NSDictionary dictionaryWithContentsOfFile:infoPlist()][@"LSSupportsGameMode"] boolValue]; }
+static bool setGameMode(bool on) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:infoPlist()];
+    if (!d) return false;
+    bool had = [d[@"LSSupportsGameMode"] boolValue];
+    if (!on && had) update::keepSignedPlist(NSBundle.mainBundle.bundleURL); // the untouched one (if it still is), see update.mm
+    if (on && !had && update::restoreSignedPlist(NSBundle.mainBundle.bundleURL)) d = nil; // back to the signed bytes, nothing to write
+    else if (on) { d[@"LSSupportsGameMode"] = @YES; d[@"GCSupportsGameMode"] = @YES; d[@"LSApplicationCategoryType"] = @"public.app-category.games"; }
+    else { [d removeObjectsForKeys:@[@"LSSupportsGameMode", @"GCSupportsGameMode"]]; d[@"LSApplicationCategoryType"] = @"public.app-category.video"; }
+    NSData *x = d ? [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:nil] : nil;
+    if (d && (!x || ![x writeToFile:infoPlist() atomically:YES])) return false; // read-only place, e.g. run from a disk image
+    [NSFileManager.defaultManager setAttributes:@{NSFileModificationDate: NSDate.date} ofItemAtPath:NSBundle.mainBundle.bundlePath error:nil];
+    LSRegisterURL((__bridge CFURLRef)NSBundle.mainBundle.bundleURL, true);
+    logLine("game mode: %s in the app's Info.plist, counts from the next start", on ? "declared" : "removed");
+    return true;
+}
+
+// which upscaler ran this second, and why it is not the chosen one when it is not
+static NSString *upscalerText(int up, const renderer::Stats &s, const superres::Stats &r) {
+    NSString *t = s.sr ? [NSString stringWithFormat:@"Apple SR %.1f avg %.1f max ms", r.n ? r.sumMs / r.n : 0, r.maxMs] : up == 1 ? @"MetalFX" : up == 3 ? @"edge-aware FSR 1" : up == 4 ? @"edge-aware SGSR 1" : @"plain";
+    if (srYields()) t = [t stringByAppendingString:@" (Apple SR waits while frame generation is on)"];
+    else if (s.srLate) t = [t stringByAppendingFormat:@", %d frames by MetalFX (late)", s.srLate];
+    else if (effUpscale() == 2 && !s.sr && *superres::status()) t = [t stringByAppendingFormat:@" (Apple SR %s)", superres::status()];
+    return t;
+}
 
 @implementation MeyraView
 - (instancetype)initWithFrame:(NSRect)r {
@@ -76,7 +111,7 @@ static AppDelegate *gApp;
 - (void)keyDown:(NSEvent *)ev {
     if (ev.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) { [super keyDown:ev]; return; }
     NSString *k = ev.charactersIgnoringModifiers;
-    NSDictionary *map = @{@"f": @"fullscreen", @"h": @"overlay", @"g": @"framegen", @"e": @"schedule", @"z": @"passthrough", @"r": @"levels+",
+    NSDictionary *map = @{@"f": @"fullscreen", @"v": @"vsync", @"w": @"winsize+", @"h": @"overlay", @"g": @"framegen", @"e": @"schedule", @"z": @"passthrough", @"r": @"levels+", @"c": @"colour+",
                           @"b": @"deband", @"m": @"upscale+", @"[": @"sharp-", @"]": @"sharp+", @"a": @"audio", @";": @"trim-", @"'": @"trim+"};
     if (map[k]) [gApp command:map[k]];
     else if (ev.keyCode == 53 && (self.window.styleMask & NSWindowStyleMaskFullScreen)) [self.window toggleFullScreen:nil];
@@ -93,6 +128,7 @@ static AppDelegate *gApp;
     SourceStatus _status;
     bool _sourceAudio;
     bool _hadFrames;
+    bool _goingFull; // entering full screen, or in it
     int _framesLastSecond;
     double _fps;
     int _aspectW, _aspectH;
@@ -125,6 +161,7 @@ static AppDelegate *gApp;
     }
     renderer::startThread();
     framegen::startThread();
+    superres::startThread();
 
     NSRect frame = NSMakeRect(0, 0, gArgs.winW ?: 1280, gArgs.winH ?: 720);
     _win = [[NSWindow alloc] initWithContentRect:frame
@@ -154,17 +191,28 @@ static AppDelegate *gApp;
     [_win makeFirstResponder:_view];
     [_view fit];
     if (!gArgs.test) [NSApp activateIgnoringOtherApps:YES];
-    if (gArgs.fullscreen) [_win toggleFullScreen:nil];
+    if (gArgs.fullscreen) { _goingFull = true; [_win toggleFullScreen:nil]; } // the will-enter callback can come after the first frame
 
-    id act = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"live video"];
+    // kept for the life of the app: the activity ends when its token goes away. display sleep off too: a controller
+    // is no input to the mac, the screen would dim mid-game
+    static id act;
+    act = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical | NSActivityIdleDisplaySleepDisabled reason:@"live video"];
     (void)act;
     [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *) { [self second]; }];
     watchDevices([self] { [self devicesChanged]; });
     [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidChangeScreenNotification object:_win queue:nil usingBlock:^(NSNotification *) { [self applyRefresh]; }];
 
     [self chooseInitialSource];
-    // --command NAME: run a menu command after launch, the same path a menu click or key press takes
-    for (auto &c : gArgs.commands) { logLine("command: %s", c.c_str()); [self command:ns(c)]; }
+    // --command NAME[@SECONDS]: run a menu command after launch (or that many seconds later), the same path a menu
+    // click or key press takes
+    for (auto &c : gArgs.commands) {
+        size_t at = c.find('@');
+        std::string name = c.substr(0, at);
+        double t = at == std::string::npos ? 0 : atof(c.c_str() + at + 1);
+        void (^run)(void) = ^{ logLine("command: %s", name.c_str()); [self command:ns(name)]; };
+        if (t > 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t * NSEC_PER_SEC)), dispatch_get_main_queue(), run);
+        else run();
+    }
 
     if (gArgs.snapshotAt < 0 && gArgs.seconds > 0) gArgs.snapshotAt = gArgs.seconds * 0.6;
     if (gArgs.captureAt < 0 && gArgs.seconds > 0) gArgs.captureAt = gArgs.seconds * 0.7;
@@ -177,6 +225,9 @@ static AppDelegate *gApp;
     if (gArgs.seconds > 0)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gArgs.seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self quit]; });
     // on by default, quiet unless there is something newer. it contacts api.github.com, the readme says what is sent
+    // an update brings a fresh plist: put the choice back
+    if (!gArgs.test && [NSUserDefaults.standardUserDefaults boolForKey:@"gameMode"] != gameModeDeclared())
+        gGameModeChanged = setGameMode([NSUserDefaults.standardUserDefaults boolForKey:@"gameMode"]);
     if (!gArgs.test && [NSUserDefaults.standardUserDefaults boolForKey:@"checkUpdatesAtLaunch"]) [self checkForUpdates:YES];
 }
 
@@ -193,6 +244,7 @@ static AppDelegate *gApp;
     [self stopSource];
     renderer::stopThread();
     framegen::stopThread();
+    superres::stopThread();
     audio::stop();
     display::restore();
     logLine("quit");
@@ -235,8 +287,8 @@ static AppDelegate *gApp;
 
 - (void)stopSource {
     if (_source) {
+        _source->stop(); // first: capture threads may still be reporting
         _source->onStatus = nullptr;
-        _source->stop();
         _source.reset();
     }
 }
@@ -322,6 +374,7 @@ static AppDelegate *gApp;
 - (void)second {
     renderer::Stats s = renderer::takeStats();
     framegen::Stats g = framegen::takeStats();
+    superres::Stats r = superres::takeStats();
     audio::Stats a = audio::takeStats();
     _last = s;
     _framesLastSecond = s.in;
@@ -333,8 +386,8 @@ static AppDelegate *gApp;
     // muteOutput: automated tests keep the speakers quiet while still measuring the sound path
     audio::retarget(_videoDelay > 0 ? _videoDelay : kDefaultVideoDelay, gSet.audioTrim, !gSet.audio || [NSUserDefaults.standardUserDefaults boolForKey:@"muteOutput"]);
 
-    int w, h, fw, fh; bool fx;
-    renderer::lastSize(w, h, fw, fh, fx);
+    int w, h, fw, fh, up;
+    renderer::lastSize(w, h, fw, fh, up);
     if (w > 0 && h > 0 && (w * _aspectH != h * _aspectW)) {
         _aspectW = w; _aspectH = h;
         _win.contentAspectRatio = NSMakeSize(w, h);
@@ -367,13 +420,13 @@ static AppDelegate *gApp;
             genState, s.gen, s.genLate, s.genSkipped, g.n ? g.sumMs / g.n : 0, g.maxMs, s.convN ? s.convSum / s.convN : 0,
             s.gpuN ? s.gpuSum / s.gpuN : 0, s.gpuMax, s.tickMax, s.drawableMax, s.schedLateMax,
             s.toPresN ? s.toPresSum / s.toPresN : 0, s.toGlassN ? s.toGlassSum / s.toGlassN : 0, s.toGlassN ? s.toGlassMin : 0, s.toGlassMax, s.toGlassN,
-            w, h, fw, fh, effUpscale() && fx ? "metalfx" : "plain", effSharpen(), (int)effDeband(), renderer::fullRange() ? "full" : "video", s.in ? s.darkest : -1);
+            w, h, fw, fh, upscalerText(up, s, r).lowercaseString.UTF8String, effSharpen(), (int)effDeband(), renderer::fullRange() ? "full" : "video", s.in ? s.darkest : -1);
     if (audio::running())
         logLine("   audio %d frames/s | delay %.0f ms (video %.0f, trim %+.0f) | underruns %d overruns %d resyncs %d gaps %d | jitter %.1f ms | "
                 "peak in %.3f %.3f (any channel %.3f) out %.3f | %s",
                 a.frames, a.delayMs, _videoDelay * 1000, gSet.audioTrim * 1000, a.underruns, a.overruns, a.resyncs, a.gaps, a.jitterMs,
                 a.peakL, a.peakR, a.rawPeak, a.outPeak, audio::statusLine().c_str());
-    [self updateOverlay:s gen:g];
+    [self updateOverlay:s gen:g sr:r];
     if (_win.styleMask & NSWindowStyleMaskFullScreen) [NSCursor setHiddenUntilMouseMoves:YES];
 }
 
@@ -383,38 +436,41 @@ static AppDelegate *gApp;
 }
 
 - (void)applyRefresh {
-    if (!_hadFrames || _fps <= 0) { display::apply(_win.screen, 0, 0); return; }
-    display::apply(_win.screen, _fps, gSet.refresh);
+    bool fs = _goingFull || (_win.styleMask & NSWindowStyleMaskFullScreen) != 0;
+    // a source that is (re)starting keeps the matched mode: giving it back and taking it again is two black re-syncs
+    if (!_hadFrames || _fps <= 0) { if (!_source) display::apply(_win.screen, 0, 0, fs); return; }
+    display::apply(_win.screen, _fps, gSet.refresh, fs);
 }
 
 
-- (void)updateOverlay:(const renderer::Stats &)s gen:(const framegen::Stats &)g {
+- (void)updateOverlay:(const renderer::Stats &)s gen:(const framegen::Stats &)g sr:(const superres::Stats &)r {
     if (!gSet.overlay) { renderer::setHud(nil); return; }
-    int w, h, fw, fh; bool fx;
-    renderer::lastSize(w, h, fw, fh, fx);
+    int w, h, fw, fh, up;
+    renderer::lastSize(w, h, fw, fh, up);
     NSString *genLine;
     if (gSet.passthrough) genLine = @"off (passthrough)";
     else if (!gSet.frameGen) genLine = @"off";
     else if (!framegen::available()) genLine = @"not available on this Mac";
     else if (*framegen::status()) genLine = ns(framegen::status());
-    else genLine = [NSString stringWithFormat:@"%@, %d real + %d made /s, %.0f ms each%@", gSet.early ? @"early" : @"on the tick", s.real, s.gen,
+    else genLine = [NSString stringWithFormat:@"%@, %d real + %d made /s, %.0f ms each%@", renderer::deepNow() ? @"in turns with Apple SR" : gSet.early ? @"[E] early" : @"[E] on the tick", s.real, s.gen,
                     g.n ? g.sumMs / g.n : 0, (s.genLate || s.genSkipped) ? [NSString stringWithFormat:@", missed %d", s.genLate + s.genSkipped] : @""];
     NSString *levels = gSet.levels == 1 ? @"video range" : gSet.levels == 2 ? @"full range" : renderer::fullRange() ? @"full range (auto)" : @"video range (auto)";
     if (s.in) levels = [levels stringByAppendingFormat:@", darkest %d", s.darkest]; // 16 on black = the source sends video range
-    NSString *scale = w ? [NSString stringWithFormat:@"%d×%d → %d×%d %@", w, h, fw, fh, effUpscale() == 1 && fx ? @"MetalFX" : @"plain"] : @"–";
+    NSString *scale = w ? [NSString stringWithFormat:@"%d×%d → %d×%d %@", w, h, fw, fh, upscalerText(up, s, r)] : @"–";
     NSString *text = [NSString stringWithFormat:
         @"source   %@  %@\n"
         @"input    %d fps (%d new)   rolled %d   drawn %d   uneven %d of %d\n"
         @"delay    capture → screen %.0f ms   gpu %.1f ms\n"
-        @"picture  %@   %@   dither removal %@   sharpen %@\n"
-        @"motion   frame generation %@\n"
-        @"audio    %@%@\n"
-        @"display  %@",
+        @"picture  [R] %@   [M] %@   [B] dither removal %@   [ [ ] ] sharpen %@\n"
+        @"motion   [G] frame generation %@\n"
+        @"audio    [A] %@%@   [ ; ' ] trim\n"
+        @"display  %@\n"
+        @"keys     [F] full screen   [W] window size   [Z] plain passthrough   [H] hide this   ⌘S snapshot",
         ns(_sourceName), ns(_status.text), s.in, s.real, s.rolled, s.drawn, s.gapBad, s.gapN,
         s.toGlassN ? s.toGlassSum / s.toGlassN + (s.lagN ? s.lagSum / s.lagN : 0) : 0, s.gpuN ? s.gpuSum / s.gpuN : 0,
         levels, scale, effDeband() ? @"on" : @"off", effSharpen() > 0 ? [NSString stringWithFormat:@"%.1f", effSharpen()] : @"off",
         genLine, audio::running() ? ns(audio::statusLine()) : @"off", fabs(gSet.audioTrim) > 0.0005 ? [NSString stringWithFormat:@", trim %+.0f ms", gSet.audioTrim * 1000] : @"",
-        ns(display::status())];
+        [ns(display::status()) stringByAppendingFormat:@"   [V] vsync %@   [C] colour %@", gSet.vsync ? @"on" : @"off", gSet.colour == 1 ? @"srgb" : gSet.colour == 2 ? @"screen's own" : @"bt.709"]];
     CGFloat scaleF = _win.backingScaleFactor ?: 1;
     NSDictionary *attrs = @{NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 * scaleF weight:NSFontWeightMedium], NSForegroundColorAttributeName: NSColor.whiteColor};
     NSSize ts = [text boundingRectWithSize:NSMakeSize(4000, 4000) options:NSStringDrawingUsesLineFragmentOrigin attributes:attrs].size;
@@ -445,15 +501,22 @@ static AppDelegate *gApp;
     NSRange colon = [c rangeOfString:@":"];
     if (colon.location != NSNotFound) { arg = [c substringFromIndex:colon.location + 1]; c = [c substringToIndex:colon.location]; }
     if ([c isEqual:@"fullscreen"]) [_win toggleFullScreen:nil];
-    else if ([c isEqual:@"overlay"]) { gSet.overlay = !gSet.overlay; settingsSave("overlay"); [self updateOverlay:_last gen:framegen::Stats()]; }
+    else if ([c isEqual:@"overlay"]) { gSet.overlay = !gSet.overlay; settingsSave("overlay"); [self updateOverlay:_last gen:framegen::Stats() sr:superres::Stats()]; }
     else if ([c isEqual:@"framegen"]) { gSet.frameGen = !gSet.frameGen; settingsSave("frameGen"); }
     else if ([c isEqual:@"schedule"]) { gSet.early = arg ? arg.intValue != 0 : !gSet.early; settingsSave("early"); }
     else if ([c isEqual:@"passthrough"]) { gSet.passthrough = !gSet.passthrough; settingsSave("passthrough"); }
     else if ([c isEqual:@"levels"]) { gSet.levels = arg.intValue % 3; settingsSave("levels"); }
     else if ([c isEqual:@"levels+"]) { gSet.levels = (gSet.levels + 1) % 3; settingsSave("levels"); }
+    else if ([c isEqual:@"colour"] || [c isEqual:@"colour+"]) {
+        gSet.colour = ([c isEqual:@"colour"] ? arg.intValue : gSet.colour + 1) % 3;
+        settingsSave("colour");
+        renderer::applyColour();
+    }
     else if ([c isEqual:@"deband"]) { gSet.deband = !gSet.deband; settingsSave("deband"); }
-    else if ([c isEqual:@"upscale"]) { gSet.upscale = arg.intValue % 2; settingsSave("upscale"); }
-    else if ([c isEqual:@"upscale+"]) { gSet.upscale = (gSet.upscale + 1) % 2; settingsSave("upscale"); }
+    else if ([c isEqual:@"srpad"]) { gSet.srPad = !gSet.srPad; settingsSave("srPad"); }
+    else if ([c isEqual:@"srgen"]) { gSet.srWithGen = !gSet.srWithGen; settingsSave("srWithGen"); }
+    else if ([c isEqual:@"upscale"]) { gSet.upscale = arg.intValue % 5; settingsSave("upscale"); }
+    else if ([c isEqual:@"upscale+"]) { int n = (gSet.upscale + 1) % 5; gSet.upscale = n == 2 && !superres::available() ? 3 : n; settingsSave("upscale"); }
     else if ([c isEqual:@"sharp"]) { gSet.sharpen = arg.floatValue; settingsSave("sharpen"); }
     else if ([c isEqual:@"sharp+"]) { gSet.sharpen = fminf(1, roundf(gSet.sharpen * 10 + 1) / 10); settingsSave("sharpen"); }
     else if ([c isEqual:@"sharp-"]) { gSet.sharpen = fmaxf(0, roundf(gSet.sharpen * 10 - 1) / 10); settingsSave("sharpen"); }
@@ -474,14 +537,23 @@ static AppDelegate *gApp;
     else if ([c isEqual:@"picker"]) [self showPicker];
     else if ([c isEqual:@"snapshot"]) [self saveSnapshot];
     else if ([c isEqual:@"actual"]) [self actualSize];
+    else if ([c isEqual:@"winsize"]) [self windowHeight:arg.intValue];
+    else if ([c isEqual:@"winsize+"]) [self windowHeight:0];
     else if ([c isEqual:@"keys"]) [self showKeys];
     else if ([c isEqual:@"updates"]) [self checkForUpdates:NO];
+    else if ([c isEqual:@"vsync"]) { gSet.vsync = !gSet.vsync; settingsSave("vsync"); renderer::layer().displaySyncEnabled = gSet.vsync; }
+    else if ([c isEqual:@"gamemode"]) {
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        bool on = ![d boolForKey:@"gameMode"];
+        if (setGameMode(on)) { [d setBool:on forKey:@"gameMode"]; gGameModeChanged = !gGameModeChanged; }
+        else NSBeep();
+    }
     else if ([c isEqual:@"updatesAtLaunch"]) {
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
         [d setBool:![d boolForKey:@"checkUpdatesAtLaunch"] forKey:@"checkUpdatesAtLaunch"];
     }
     else if ([c isEqual:@"revertUpdate"]) [self revertUpdate];
-    if (gSet.overlay) [self updateOverlay:_last gen:framegen::Stats()];
+    if (gSet.overlay) [self updateOverlay:_last gen:framegen::Stats() sr:superres::Stats()];
 }
 
 // updates from github releases, see update.mm
@@ -587,9 +659,31 @@ static AppDelegate *gApp;
     renderer::snapshot(path);
 }
 
+// picture height in pixels for the window, width from the source's shape. 0 = the next size up that fits the screen,
+// back to the smallest after the biggest
+- (void)windowHeight:(int)px {
+    static const int sizes[] = {720, 900, 1080, 1440, 2160};
+    if (_win.styleMask & NSWindowStyleMaskFullScreen) return;
+    int w, h, fw, fh, up;
+    renderer::lastSize(w, h, fw, fh, up);
+    double aspect = w && h ? (double)w / h : 16.0 / 9, s = _win.backingScaleFactor ?: 1;
+    NSSize room = [_win contentRectForFrameRect:_win.screen.visibleFrame].size;
+    auto fits = [&](int p) { return p / s <= room.height && p * aspect / s <= room.width; };
+    if (px <= 0) {
+        double cur = _win.contentView.bounds.size.height * s;
+        px = sizes[0];
+        for (int z : sizes) if (z > cur + 1 && fits(z)) { px = z; break; }
+    }
+    [_win setContentSize:NSMakeSize(round(px * aspect) / s, px / s)];
+    NSRect f = _win.frame, v = _win.screen.visibleFrame; // keep it on the screen
+    f.origin.x = fmax(v.origin.x, fmin(f.origin.x, NSMaxX(v) - f.size.width));
+    f.origin.y = fmax(v.origin.y, fmin(f.origin.y, NSMaxY(v) - f.size.height));
+    [_win setFrameOrigin:f.origin];
+}
+
 - (void)actualSize {
-    int w, h, fw, fh; bool fx;
-    renderer::lastSize(w, h, fw, fh, fx);
+    int w, h, fw, fh, up;
+    renderer::lastSize(w, h, fw, fh, up);
     if (!w || (_win.styleMask & NSWindowStyleMaskFullScreen)) return;
     CGFloat s = _win.backingScaleFactor ?: 1;
     [_win setContentSize:NSMakeSize(w / s, h / s)];
@@ -628,6 +722,9 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     NSMenu *bar = [NSMenu new];
     NSMenu *app = submenu(bar, @"Meyra");
     [app addItemWithTitle:@"About Meyra" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
+    [app addItem:item(@"VSync", @"vsync", @"v", 0)];
+    [app addItem:item(@"Game Mode in Full Screen", @"gamemode", nil)];
+    [app addItem:NSMenuItem.separatorItem];
     [app addItem:item(@"Check for Updates…", @"updates", nil)];
     [app addItem:item(@"Check for Updates at Launch", @"updatesAtLaunch", nil)];
     [app addItem:item(@"Revert to Previous Version…", @"revertUpdate", nil)];
@@ -653,10 +750,20 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     [lv addItem:item(@"Automatic", @"levels:0", nil)];
     [lv addItem:item(@"Video Range (16–235)", @"levels:1", nil)];
     [lv addItem:item(@"Full Range (0–255)", @"levels:2", nil)];
+    NSMenu *co = submenu(pic, @"Colour");
+    [co addItem:item(@"BT.709 (Exact)", @"colour:0", nil)];
+    [co addItem:item(@"sRGB (More Contrast)", @"colour:1", nil)];
+    [co addItem:item(@"The Screen's Own (Most Saturated)", @"colour:2", nil)];
     [pic addItem:item(@"Dither Removal", @"deband", @"b", NSEventModifierFlagCommand | NSEventModifierFlagOption)];
     NSMenu *up = submenu(pic, @"Upscaling");
     [up addItem:item(@"Plain", @"upscale:0", nil)];
     [up addItem:item(@"MetalFX", @"upscale:1", nil)];
+    [up addItem:item(@"Edge-Aware (FSR 1)", @"upscale:3", nil)];
+    [up addItem:item(@"Edge-Aware (SGSR 1)", @"upscale:4", nil)];
+    [up addItem:item(@"Apple Super Resolution", @"upscale:2", nil)];
+    [up addItem:NSMenuItem.separatorItem];
+    [up addItem:item(@"Super Resolution: Pad Edges", @"srpad", nil)];
+    [up addItem:item(@"Super Resolution: Run With Frame Generation (9 ms more delay)", @"srgen", nil)];
     NSMenu *sh = submenu(pic, @"Sharpening");
     [sh addItem:item(@"Off", @"sharp:0", nil)];
     [sh addItem:item(@"Low", @"sharp:0.3", nil)];
@@ -691,6 +798,9 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     NSMenuItem *fs = [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
     fs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
     [wm addItem:item(@"Actual Size", @"actual", @"0")];
+    NSMenu *ws = submenu(wm, @"Window Size");
+    [ws addItem:item(@"Next Size", @"winsize+", @"w", 0)];
+    for (int z : {720, 900, 1080, 1440, 2160}) [ws addItem:item([NSString stringWithFormat:@"%dp", z], [NSString stringWithFormat:@"winsize:%d", z], nil)];
     [wm addItem:item(@"Show Status Overlay", @"overlay", @"i")];
     [wm addItem:NSMenuItem.separatorItem];
     [wm addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
@@ -792,8 +902,20 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     bool on = false, enabled = true;
     bool pass = gSet.passthrough;
     if ([c isEqual:@"levels"]) on = gSet.levels == arg.intValue;
+    else if ([c isEqual:@"colour"]) on = gSet.colour == arg.intValue;
     else if ([c isEqual:@"deband"]) { on = gSet.deband; enabled = !pass; }
-    else if ([c isEqual:@"upscale"]) { on = gSet.upscale == arg.intValue; enabled = !pass; }
+    else if ([c isEqual:@"srpad"]) { on = gSet.srPad; enabled = !pass && superres::available(); }
+    else if ([c isEqual:@"srgen"]) { on = gSet.srWithGen; enabled = !pass && superres::available(); }
+    else if ([c isEqual:@"upscale"]) {
+        on = gSet.upscale == arg.intValue;
+        enabled = !pass && (arg.intValue != 2 || superres::available());
+        if (arg.intValue == 2) { // say why it is off or not running
+            const char *st = superres::status();
+            mi.title = !superres::available() ? @"Apple Super Resolution (needs macOS 26 and Apple silicon)"
+                     : on && srYields() ? @"Apple Super Resolution (frame generation off only, using MetalFX)"
+                     : on && *st && strcmp(st, "starting") ? [NSString stringWithFormat:@"Apple Super Resolution (%s, using MetalFX)", st] : @"Apple Super Resolution";
+        }
+    }
     else if ([c isEqual:@"sharp"]) { on = fabsf(gSet.sharpen - arg.floatValue) < 0.05f; enabled = !pass; }
     else if ([c isEqual:@"sharp+"] || [c isEqual:@"sharp-"]) enabled = !pass;
     else if ([c isEqual:@"passthrough"]) on = pass;
@@ -816,6 +938,11 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     else if ([c isEqual:@"restart"] || [c isEqual:@"snapshot"] || [c isEqual:@"actual"]) enabled = !_sourceId.empty();
     else if ([c isEqual:@"updates"]) enabled = !_updating;
     else if ([c isEqual:@"updatesAtLaunch"]) on = [d boolForKey:@"checkUpdatesAtLaunch"];
+    else if ([c isEqual:@"vsync"]) on = gSet.vsync;
+    else if ([c isEqual:@"gamemode"]) {
+        on = [d boolForKey:@"gameMode"];
+        mi.title = gGameModeChanged ? @"Game Mode in Full Screen (from the next start of Meyra)" : @"Game Mode in Full Screen";
+    }
     else if ([c isEqual:@"revertUpdate"]) {
         std::string v;
         mi.hidden = !update::previousVersion(v);
@@ -948,7 +1075,22 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
 - (void)pickerReplay:(id)sender { [_win endSheet:_picker]; [self openReplay]; }
 
 
-- (void)windowDidEnterFullScreen:(NSNotification *)n { [NSCursor setHiddenUntilMouseMoves:YES]; }
+- (void)windowDidEnterFullScreen:(NSNotification *)n { [NSCursor setHiddenUntilMouseMoves:YES]; [self applyRefresh]; }
+- (void)windowDidExitFullScreen:(NSNotification *)n { _goingFull = false; [self applyRefresh]; } // variable refresh only works full screen
+// on the way in counts as in: a first frame arriving mid-animation must not put a variable refresh screen on a fixed mode
+- (void)windowWillEnterFullScreen:(NSNotification *)n { _goingFull = true; [self applyRefresh]; }
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)w {
+    _goingFull = false;
+    [self applyRefresh];
+    // happens when another full screen app was just closed and its space is still going away. once more, a bit later
+    static bool again;
+    if (again) return;
+    again = true;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (!(w.styleMask & NSWindowStyleMaskFullScreen)) { self->_goingFull = true; [w toggleFullScreen:nil]; }
+    });
+}
+- (void)windowWillExitFullScreen:(NSNotification *)n { _goingFull = false; }
 
 // automated test: capture our own window the way other apps would (screencapturekit)
 

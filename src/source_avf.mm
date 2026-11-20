@@ -161,8 +161,18 @@ public:
         if (st == AVAuthorizationStatusNotDetermined && !opt_.mayPrompt) { err = "Camera access has not been granted yet."; return false; }
         auto alive = alive_;
         report(SourceState::Starting, "Opening " + std::string(dev_.localizedName.UTF8String ?: ""));
-        auto go = [this, alive] {
-            dispatch_async(sessionQ_, ^{ if (*alive) configure(); });
+        // the microphone question is asked here, before the session queue gets anything to do: asked from that
+        // queue it blocked it until answered, and stop() waiting for the queue froze the app behind the prompt
+        dispatch_queue_t q = sessionQ_; // by value: the answer can come after this source is gone
+        SourceOptions opt = opt_;
+        AVCaptureDevice *dev = dev_;
+        auto go = [this, alive, q, opt, dev] { // `this` only on the session queue, behind the alive check
+            void (^run)(BOOL) = ^(BOOL) { dispatch_async(q, ^{ if (*alive) configure(); }); };
+            bool wanted = opt.audio && opt.audioInput != "none" && opt.mayPrompt;
+            bool have = wanted && (opt.audioInput.empty() || opt.audioInput == "auto" ? matchingAudio(dev) : [AVCaptureDevice deviceWithUniqueID:@(opt.audioInput.c_str())]) != nil;
+            bool ask = have && [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusNotDetermined;
+            if (ask) [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:run];
+            else run(YES);
         };
         if (st == AVAuthorizationStatusNotDetermined) {
             report(SourceState::Starting, "Waiting for camera access");
@@ -180,14 +190,7 @@ public:
         AVCaptureDevice *audioDev = nil;
         if (opt_.audio && opt_.audioInput != "none") {
             audioDev = opt_.audioInput.empty() || opt_.audioInput == "auto" ? matchingAudio(dev_) : [AVCaptureDevice deviceWithUniqueID:@(opt_.audioInput.c_str())];
-            AVAuthorizationStatus ast = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
-            if (audioDev && ast == AVAuthorizationStatusNotDetermined && opt_.mayPrompt) {
-                dispatch_semaphore_t s = dispatch_semaphore_create(0);
-                [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL) { dispatch_semaphore_signal(s); }];
-                dispatch_semaphore_wait(s, DISPATCH_TIME_FOREVER);
-                ast = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
-            }
-            if (audioDev && ast != AVAuthorizationStatusAuthorized) {
+            if (audioDev && [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] != AVAuthorizationStatusAuthorized) {
                 logLine("avfoundation: no microphone access, picture only");
                 audioDev = nil;
             }

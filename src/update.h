@@ -41,4 +41,8 @@ bool swapIn(NSURL *app, NSURL *staged, NSURL *keptDir, std::string &err);
 bool revertIn(NSURL *app, NSURL *keptDir, std::string &err);
 int selfTest(const std::vector<std::string> &args);             // exit code
 
+// for the game mode switch, which edits the app's Info.plist: keep the signed original, put it back byte for byte
+void keepSignedPlist(NSURL *app);
+bool restoreSignedPlist(NSURL *app);                            // false: none kept for this build
+
 }
