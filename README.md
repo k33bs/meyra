@@ -111,7 +111,7 @@ source and all settings. everything is in the menu bar, the single keys work whi
 | picture | dither removal | B | on |
 | picture | upscaling: plain, metalfx, edge-aware (fsr 1 or sgsr 1), apple super resolution | M | metalfx |
 | picture | sharpening: off, low, medium, high | ] [ | medium |
-| picture | plain passthrough (all processing off) | Z | off |
+| picture | plain passthrough (all processing off, every frame shown as it came) | Z | off |
 | motion | frame generation | G | on |
 | motion | frame schedule: early, on the tick | E | on the tick |
 | motion | match display refresh: off, automatic, source rate | | automatic |

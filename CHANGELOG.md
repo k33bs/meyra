@@ -1,5 +1,12 @@
 # changelog
 
+## v0.2.1 (dev release)
+
+- frame generation off: repeated frames are shown, so each frame of a 30 fps game stays up two refreshes.
+  skipped they came out uneven and looked choppy. one repeat is left out only when the display's queue has
+  backed up.
+- passthrough leaves nothing out: repeats and rolled frames are shown as they came.
+
 ## v0.2.0 (dev release)
 
 - picture: apple super resolution as a third upscaler (macos 26), next to plain and metalfx. off by default.

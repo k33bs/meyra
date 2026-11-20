@@ -42,6 +42,7 @@ static bool gNewestRepeat, gNewestChanged;
 static const int kDarkLuma = 10, kDarkSamples = 3, kDarkFrames = 5; // of the 2048 sampled per frame
 static std::atomic<bool> gFullSeen{false};
 static std::atomic<int> gDarkFrames{0};
+static std::atomic<double> gQueueLag{0};   // from handing a frame to the display to it being on screen, last frame
 static std::atomic<double> gLevelsFrom{0}; // no verdict before this time
 // the signal's format changed: a new verdict, and not from the changeover itself. an xbox going to 720p sent ~6 s
 // with samples at 1 and then a video range picture, which stuck on "full" and looked washed out. 15 s is how long
@@ -363,10 +364,11 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     }
 
     // every frame: when did it really reach the screen. counts alone can look perfect while the spacing is not
-    double dur = gFrameDur;
+    double dur = gFrameDur, handed = nowSec();
     [dr addPresentedHandler:^(id<MTLDrawable> d) {
         static std::atomic<double> last{0};
         double pt = d.presentedTime;
+        if (pt > 0) gQueueLag = pt - handed;
         os_unfair_lock_lock(&gLock);
         if (pt <= 0) gS.notShown++;
         else {
@@ -562,17 +564,15 @@ static void tick(CVPixelBufferRef pb, double arrival, bool repeat, bool changed)
     if (prevNv && (CVPixelBufferGetWidth(prevNv) != CVPixelBufferGetWidth(pb) || CVPixelBufferGetHeight(prevNv) != CVPixelBufferGetHeight(pb))) dropHeld();
     if (!genOk) {
         if (prevNv || curNv) { framegen::cancel(); dropHeld(); }
-        // a repeat is the picture already on screen. presenting it anyway fills the display's queue: at a 60 hz screen
-        // we then submit exactly as fast as it drains, a backlog from start-up never clears, and passthrough ends up
-        // two refreshes slower than frame generation. so skip repeats, except to refresh now and then (overlay,
-        // resize, a paused source)
-        static double lastShow; static CGSize lastSize;
+        // repeats are shown too. left out, each frame of a 30 fps game stayed up for one refresh or three whenever the
+        // timing wobbled (the counts looked perfect, the picture looked choppy); shown, each one stays exactly two.
+        // the catch: at a 60 hz screen frames then go in exactly as fast as they come out, and a backlog (from start-up,
+        // from a stall) never clears: measured 75 ms to the screen instead of 21. so when the display's queue has
+        // backed up, one repeat is left out to drain a place. passthrough leaves nothing out at all
+        static double lastSkip;
         double now = CACurrentMediaTime();
-        CGSize sz = gLayer.drawableSize;
-        // not on a variable refresh screen: nothing queues there, and showing only every other frame of a 30 fps game
-        // (33 ms apart) falls out of the screen's range, it then repeats on its own coarse grid (measured 30/40 ms)
-        if (repeat && !changed && !display::variable() && now - lastShow < 0.1 && CGSizeEqualToSize(sz, lastSize)) { CFRelease(pb); return; }
-        lastShow = now; lastSize = sz;
+        bool backed = gQueueLag > 2.0 * gFrameDur && now - lastSkip > 0.25;
+        if (!gSet.passthrough && repeat && !changed && !display::variable() && backed) { lastSkip = now; CFRelease(pb); return; }
         show(pb, repeat ? 0 : arrival);
         CFRelease(pb);
         return;
@@ -731,7 +731,7 @@ void submit(CVPixelBufferRef pb, double arrival, double captured, bool late) {
         CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
         static int rolledRun; // a real roll is a frame or two. more in a row is the detector fooled: let the picture through
         if (!(gHaveProf && rollOf(p, gProf))) rolledRun = 0;
-        else if (++rolledRun <= 2) { // screen keeps the last good frame
+        else if (!gSet.passthrough && ++rolledRun <= 2) { // screen keeps the last good frame. passthrough shows it as it came
             bump(&Stats::rolled);
             CFRelease(pb);
             return;
