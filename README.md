@@ -3,6 +3,13 @@
 shows a game console on a mac through an hdmi capture card. little delay, a cleaner and sharper picture, and
 generated in-between frames for 30 fps games.
 
+| off | on |
+|---|---|
+| ![plain passthrough](.github/assets/demo-off.jpg) | ![with meyra's picture chain](.github/assets/demo-on.jpg) |
+
+same frame, straight from the capture card and with dither removal, metalfx upscale and sharpening. click for
+full size.
+
 i made it to get more fps out of my xbox series s. the game i play runs at 30, and i wanted it to look and move
 better on the mac's screen. the idea comes from [veyra-nrvideo](https://github.com/Likely7/Veyra-NRVideo), which
 does this on windows. meyra is the mac counterpart, written from scratch on apple's own frameworks.
