@@ -457,6 +457,12 @@ static NSString *upscalerText(int up, const renderer::Stats &s, const superres::
     NSString *levels = gSet.levels == 1 ? @"video range" : gSet.levels == 2 ? @"full range" : renderer::fullRange() ? @"full range (auto)" : @"video range (auto)";
     if (s.in) levels = [levels stringByAppendingFormat:@", darkest %d", s.darkest]; // 16 on black = the source sends video range
     NSString *scale = w ? [NSString stringWithFormat:@"%d×%d → %d×%d %@", w, h, fw, fh, upscalerText(up, s, r)] : @"–";
+    // the line says what ran. when that is not the one chosen with M, say which is chosen and why it is idle: the
+    // key looked dead in a window no larger than the source
+    static NSString *const kUp[] = {@"plain", @"MetalFX", @"Apple SR", @"edge-aware FSR 1", @"edge-aware SGSR 1"};
+    int want = gSet.upscale;
+    if (w && gSet.passthrough) scale = [scale stringByAppendingFormat:@" (%@ chosen, off in passthrough)", kUp[want]];
+    else if (w && want && (fw <= w || fh <= h)) scale = [scale stringByAppendingFormat:@" (%@ chosen, idle: the picture is not larger than the source)", kUp[want]];
     NSString *text = [NSString stringWithFormat:
         @"source   %@  %@\n"
         @"input    %d fps (%d new)   rolled %d   drawn %d   uneven %d of %d\n"
