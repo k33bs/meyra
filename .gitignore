@@ -1,0 +1,15 @@
+# build output (make OUT=... can put it elsewhere)
+build/
+*.zip
+release-notes.md
+
+# macos and editors
+.DS_Store
+*.swp
+.vscode/
+.idea/
+xcuserdata/
+
+# local test material and logs
+*.log
+*.uyvy
