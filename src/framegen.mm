@@ -6,7 +6,9 @@
 #import <QuartzCore/QuartzCore.h>
 #import <VideoToolbox/VideoToolbox.h>
 #include "framegen.h"
+#include "flyhigh.h"
 #include "common.h"
+#include <algorithm>
 #include <atomic>
 #include <os/lock.h>
 #include <unistd.h>
@@ -14,18 +16,22 @@
 namespace framegen {
 
 static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
-struct Req { CVPixelBufferRef prev, cur; uint64_t ticket; };
+struct Req { CVPixelBufferRef prev, cur; uint64_t ticket; bool (^ready)(void); double asked; bool full, sd; };
 static Req gReq;                          // under gLock
 static std::atomic<bool> gPending{false};
 static std::atomic<uint64_t> gWanted{0};
 static CVPixelBufferRef gResult;          // under gLock, +1
 static uint64_t gResultTicket;            // under gLock: the request gResult answers
 static dispatch_semaphore_t gDone;
-static std::atomic<double> gPeak{0};
+static dispatch_semaphore_t gTell;        // under gLock, see tellWhenDone
+static std::atomic<double> gPeak{0}, gWaitPeak{0}, gLast{0};
 static std::atomic<int> gWantW{0}, gWantH{0}, gReadyW{0}, gReadyH{0};
+static std::atomic<int> gWantM{0}, gReadyM{0}; // which generator: 0 apple's, 1 and 2 the second one at its two working sizes
 static std::atomic<double> gLastAsk{0};   // last time anyone asked for the session
 static std::atomic<int> gState{0};        // 0 idle, 1 starting, 2 ready, 3 failed
 static Stats gS;
+static float gRing[120];                  // under gLock: the last generation times, for usualMs
+static int gRingN, gRingAt;
 static std::atomic<bool> gQuit{false};
 static dispatch_semaphore_t gStopped;
 static const double kIdleEnd = 3;         // seconds nobody asked before the session (and the neural engine) is let go
@@ -39,10 +45,17 @@ bool available() {
     return v == 1;
 }
 
-bool ready(int w, int h) {
+int model() {
+    int m = gSet.genModel;
+    return m && flyhigh::installed() ? m : 0;
+}
+
+const char *modelNote() { return gSet.genModel ? flyhigh::note() : ""; }
+
+bool ready(int w, int h, int model) {
     gLastAsk = nowSec();
-    gWantW = w; gWantH = h;
-    return gState == 2 && gReadyW == w && gReadyH == h;
+    gWantW = w; gWantH = h; gWantM = model;
+    return gState == 2 && gReadyW == w && gReadyH == h && gReadyM == model;
 }
 
 const char *status() {
@@ -54,19 +67,31 @@ const char *status() {
     }
 }
 
-void request(CVPixelBufferRef prev, CVPixelBufferRef cur) {
+void request(CVPixelBufferRef prev, CVPixelBufferRef cur, bool (^ready)(void), bool full, bool sd) {
     while (dispatch_semaphore_wait(gDone, DISPATCH_TIME_NOW) == 0) {} // drain old signals first
     CFRetain(prev); CFRetain(cur);
     uint64_t t = ++gWanted;
     os_unfair_lock_lock(&gLock);
     Req old = gReq;
     bool had = gPending.exchange(true);
-    gReq = {prev, cur, t};
+    gReq = {prev, cur, t, ready, nowSec(), full, sd};
     os_unfair_lock_unlock(&gLock);
     if (had) { CFRelease(old.prev); CFRelease(old.cur); } // never got picked up
 }
 
 void cancel() { ++gWanted; }
+
+void tellWhenDone(dispatch_semaphore_t s) {
+    os_unfair_lock_lock(&gLock);
+    gTell = s;
+    os_unfair_lock_unlock(&gLock);
+}
+bool done() {
+    os_unfair_lock_lock(&gLock);
+    bool d = !gPending && gResultTicket == gWanted;
+    os_unfair_lock_unlock(&gLock);
+    return d;
+}
 
 CVPixelBufferRef take(double graceMs) {
     dispatch_semaphore_wait(gDone, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(graceMs * NSEC_PER_MSEC))); // a late frame must not push things around
@@ -82,6 +107,19 @@ CVPixelBufferRef take(double graceMs) {
 }
 
 double peakMs() { return gPeak; }
+double usualMs() {
+    float v[120];
+    os_unfair_lock_lock(&gLock);
+    int n = gRingN;
+    memcpy(v, gRing, sizeof v);
+    os_unfair_lock_unlock(&gLock);
+    if (n < 20) return 0;
+    int k = n * 95 / 100;
+    std::nth_element(v, v + k, v + n);
+    return v[k];
+}
+double lastMs() { return gLast; }
+double waitPeakMs() { return gWaitPeak; }
 
 Stats takeStats() {
     os_unfair_lock_lock(&gLock);
@@ -102,8 +140,9 @@ static void loop() {
     int fails = 0, restarts = 0; // calls that failed in a row, and sessions restarted over it
     while (!gQuit) {
         double idle = nowSec() - gLastAsk.load();
-        int ww = gWantW, wh = gWantH;
+        int ww = gWantW, wh = gWantH, wm = gWantM;
         if (idle > kIdleEnd) {
+            if (gReadyM) { flyhigh::stop(); gReadyM = 0; if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; } }
             if (proc) {
                 [proc endSession];
                 proc = nil;
@@ -114,8 +153,34 @@ static void loop() {
             usleep(20000);
             continue;
         }
-        if (ww > 0 && (ww != gReadyW || wh != gReadyH) && !(gState == 3 && ww == gReadyW && wh == gReadyH)) {
+        bool other = ww != gReadyW || wh != gReadyH || wm != gReadyM;
+        if (ww > 0 && other && wm) {
+            // the second generator. files that turn out unusable are refused in there, model() is then 0 and the
+            // render thread asks for apple's on its next frame
             @autoreleasepool {
+                if (proc) { [proc endSession]; proc = nil; }
+                if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; }
+                gState = 1;
+                double t0 = nowSec();
+                bool ok = flyhigh::start(ww, wh, wm == 2 ? 720 : 480);
+                if (ok) {
+                    NSDictionary *a = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange), (id)kCVPixelBufferWidthKey: @(ww),
+                                        (id)kCVPixelBufferHeightKey: @(wh), (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES};
+                    CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)a, &dstPool);
+                    ok = dstPool != NULL;
+                }
+                gReadyW = ww; gReadyH = wh; gReadyM = wm;
+                os_unfair_lock_lock(&gLock); gRingN = gRingAt = 0; os_unfair_lock_unlock(&gLock); // another generator or size: its times are its own
+                gState = ok ? 2 : 3;
+                fails = restarts = 0;
+                logLine("frame generation %s for %dx%d, second generator at %d lines (%.0f ms)%s%s", ok ? "ready" : "unavailable", ww, wh, wm == 2 ? 720 : 480,
+                        (nowSec() - t0) * 1000, ok ? "" : ": ", ok ? "" : flyhigh::note());
+            }
+            continue;
+        }
+        if (ww > 0 && other && !(gState == 3 && ww == gReadyW && wh == gReadyH && wm == gReadyM)) {
+            @autoreleasepool {
+                if (gReadyM) { flyhigh::stop(); gReadyM = 0; }
                 if (proc) { [proc endSession]; proc = nil; }
                 if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; }
                 gState = 1;
@@ -132,6 +197,7 @@ static void loop() {
                     ok = dstPool != NULL;
                 }
                 gReadyW = ww; gReadyH = wh;
+                os_unfair_lock_lock(&gLock); gRingN = gRingAt = 0; os_unfair_lock_unlock(&gLock);
                 gState = ok ? 2 : 3;
                 if (!ok) proc = nil;
                 logLine("frame generation %s for %dx%d (%.0f ms)%s%s", ok ? "ready" : "unavailable", ww, wh, (nowSec() - t0) * 1000,
@@ -148,11 +214,23 @@ static void loop() {
         gPending = false;
         os_unfair_lock_unlock(&gLock);
         @autoreleasepool {
+            // spinning, not sleeping, for the same reason as above. 50 ms: something broke, go on with what is there
+            double wait = 0;
+            if (r.ready) {
+                while (!r.ready() && gWanted == r.ticket && nowSec() - r.asked < 0.05) {}
+                wait = (nowSec() - r.asked) * 1000;
+            }
+            gWaitPeak = fmax(wait, gWaitPeak.load() * 0.995);
             double t = nowSec();
             CVPixelBufferRef dst = NULL;
             bool ok = false, tried = false;
             bool sizeOk = gState == 2 && (int)CVPixelBufferGetWidth(r.cur) == gReadyW && (int)CVPixelBufferGetHeight(r.cur) == gReadyH;
-            if (sizeOk && gWanted == r.ticket && CVPixelBufferPoolCreatePixelBuffer(NULL, dstPool, &dst) == kCVReturnSuccess) {
+            if (sizeOk && gReadyM && gWanted == r.ticket && CVPixelBufferPoolCreatePixelBuffer(NULL, dstPool, &dst) == kCVReturnSuccess) {
+                tag709(dst);
+                tried = true;
+                ok = flyhigh::generate(r.prev, r.cur, dst, r.full, r.sd);
+                if (!ok && fails == 0) logLine("frame generation: a frame failed (second generator)");
+            } else if (sizeOk && gWanted == r.ticket && CVPixelBufferPoolCreatePixelBuffer(NULL, dstPool, &dst) == kCVReturnSuccess) {
                 tag709(dst);
                 VTFrameProcessorFrame *fp = [[VTFrameProcessorFrame alloc] initWithBuffer:r.prev presentationTimeStamp:CMTimeMake(0, 30000)];
                 VTFrameProcessorFrame *fc = [[VTFrameProcessorFrame alloc] initWithBuffer:r.cur presentationTimeStamp:CMTimeMake(1001, 30000)];
@@ -177,14 +255,20 @@ static void loop() {
             CVPixelBufferRef old = gResult;
             gResult = keep ? dst : NULL;
             gResultTicket = r.ticket;
-            if (ok) { gS.sumMs += ms; gS.n++; if (ms > gS.maxMs) gS.maxMs = ms; gPeak = fmax(ms, gPeak.load() * 0.995); }
+            if (ok) { gS.sumMs += ms; gS.n++; if (ms > gS.maxMs) gS.maxMs = ms; gPeak = fmax(ms, gPeak.load() * 0.995); gLast = ms; }
+            if (ok) { gRing[gRingAt] = (float)ms; gRingAt = (gRingAt + 1) % 120; if (gRingN < 120) gRingN++; }
+            if (r.ready) { gS.waitSum += wait; gS.waitN++; if (wait > gS.waitMax) gS.waitMax = wait; }
+            dispatch_semaphore_t tell = gTell;
+            gTell = nil;
             os_unfair_lock_unlock(&gLock);
+            if (tell) dispatch_semaphore_signal(tell);
             if (old) CFRelease(old);
             if (dst && !keep) CFRelease(dst);
             CFRelease(r.prev); CFRelease(r.cur);
             dispatch_semaphore_signal(gDone);
         }
     }
+    if (gReadyM) flyhigh::stop();
     if (proc) [proc endSession];
     if (dstPool) CVPixelBufferPoolRelease(dstPool);
     os_unfair_lock_lock(&gLock);

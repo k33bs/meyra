@@ -15,5 +15,7 @@ void apply(NSScreen *screen, double sourceFps, int mode, bool fullScreen);
 void restore();
 std::string status(); // for the overlay
 bool variable();      // the screen follows the source by itself (variable refresh), nothing was switched
+void modeChanged(NSScreen *screen); // the mode was changed by someone: read its rate again, touch nothing
+double period();      // seconds between two refreshes of the screen as it runs now (variable: the shortest it can do), 0 = not known yet
 
 }

@@ -287,7 +287,9 @@ public:
         bool late = prev > 0 && now - prev > 1.5 * dur_.load();
         if (state_.exchange(1) != 1) report(SourceState::Running, signal_);
         CFRetain(pb);
-        renderer::submit(pb, now, captured, late);
+        // the device's own timestamp as it came, for the capture clock (ptsTime): only its steps are used
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+        renderer::submit(pb, now, captured, late, CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) : -1);
     }
 
     void audioIn(CMSampleBufferRef sb) {

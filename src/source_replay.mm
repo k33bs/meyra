@@ -87,6 +87,8 @@ private:
                 size_t rb = CVPixelBufferGetBytesPerRow(pb);
                 for (int y = 0; y < H; y++) memcpy(dst + y * rb, (const uint8_t *)d.bytes + (size_t)y * W * 2, (size_t)W * 2);
                 CVPixelBufferUnlockBaseAddress(pb, 0);
+                // its number in the folder, so a test can ask for the picture of one exact frame
+                CVBufferSetAttachment(pb, renderer::kFrameKey, (__bridge CFNumberRef)@(i), kCVAttachmentMode_ShouldNotPropagate);
                 frames_.push_back(pb);
             }
         }
@@ -98,15 +100,24 @@ private:
         logLine("replay: %zu frames %dx%d from %s", frames_.size(), W, H, prefix.c_str());
         report(SourceState::Running, [NSString stringWithFormat:@"Replay %dx%d @ 59.94, %zu frames", W, H, frames_.size()].UTF8String);
         makeRealtime(kDur); // paced by sleeping, so it needs on-time wake-ups
+        // for tests of the capture clock (hidden, command line): replayJitter MS hands every frame over late by a random
+        // 0..MS, replayLate N hands every Nth over 10 ms late on top. the timestamps stay on the even grid
+        NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+        double jitter = [ud doubleForKey:@"replayJitter"] / 1000;
+        long lateEvery = [ud integerForKey:@"replayLate"];
+        uint32_t rnd = 12345;
         double next = nowSec();
         for (size_t i = 0; !quit_; i++) {
             next += kDur;
             double wait = next - nowSec();
+            if (jitter > 0) { rnd = rnd * 1664525u + 1013904223u; wait += jitter * (rnd >> 8) / 16777216.0; }
+            if (lateEvery > 0 && i % lateEvery == (size_t)lateEvery - 1) wait += 0.010;
             if (wait > 0) usleep((useconds_t)(wait * 1e6));
             CVPixelBufferRef f = frames_[i % frames_.size()];
+            if (i % frames_.size() == 0) renderer::replayLoop((int)(i / frames_.size()));
             CFRetain(f);
             double now = nowSec();
-            renderer::submit(f, now, now, now - next > 0.003); // late = missed our own deadline
+            renderer::submit(f, now, now, now - next > 0.003, next); // late = missed our own deadline
         }
         dispatch_semaphore_signal(done_);
     }

@@ -112,6 +112,130 @@ POSSIBILITY OF SUCH DAMAGE.
 
 SPDX-License-Identifier: BSD-3-Clause
 
+## PushFPS Live HUD Lock
+
+The hud lock (`fsLockUpdate`, `fsNvFixLock` and their helpers in `resources/Shaders.metal`) is a port to Metal of
+`shaders/PushHudLockUpdate.hlsl` and `shaders/PushHudLockCompose.hlsl` of PushFPS
+(https://github.com/DosukaSOL/PushFPS, commit 3be641ca70f8179838cef4a8ff6cc3117664d185). Changed for Meyra on
+2026-11-22: fragment passes instead of compute passes, the frames are read as two-plane YCbCr, the tolerance is a
+setting, and the compose step is appended to the pass that already repairs generated frames. Both files carry:
+
+Copyright (C) 2026 DosukaSOL and the PushFPS contributors. Part of PushFPS, a modified version of Veyra.
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+PushFPS is licensed under the GNU General Public License version 3 (see `LICENSE`, the same text); its
+`NOTICE.md` states that the files written for PushFPS are additionally available under any later version of that
+licence, which these two are. PushFPS comes with no warranty.
+
+## FlyHigh Engine (the second frame generator)
+
+`src/flyhigh.mm` is a port to Objective-C++, MPSGraph and Metal of parts of FlyHigh Engine
+(https://github.com/getflyhigh/flyhigh-engine, commit 34c3fb6): what each operator of its model graph does
+(`crates/flyhigh-engine/src/net/build.rs`) and the kernels `tex_down`, `render_tex`, `interp`, `warp`, `sad`,
+`convex`, `film`, `luma` and `blend` in `shaders/`. Changed for Meyra on 2026-11-22: the operators are built as one
+MPSGraph instead of WebGPU compute passes, the frames are read and written as two-plane YCbCr, the result is
+written plane by plane, and only the half-way frame is made. The engine's still test, static protection, pattern
+repair, pacing and scene classification are not included.
+
+FlyHigh Engine is licensed under the Apache License, Version 2.0; a copy is in `vendor/flyhigh-engine/LICENSE`,
+its `NOTICE` file next to it. That file reads:
+
+```
+FlyHigh Engine
+Copyright 2026 getflyhigh (https://github.com/getflyhigh)
+```
+
+**The model is not included.** The engine's model files (`graph.json`, `flyhighfg.json`, `flyhighfg.bin`) are
+licensed separately under Creative Commons Attribution-NonCommercial 4.0 International, which cannot be combined
+with the GPL. They are not in this repository or in the app, in any form: Meyra reads them at run time from
+`~/Library/Application Support/Meyra/flyhighfg/` if the user has put them there or had Meyra download them (only on
+request, from that project, after saying what the licence allows), and uses Apple's interpolator otherwise. Whoever installs them is bound by their licence (noncommercial use, attribution).
+
+## FSRCNNX weights
+
+`resources/nets/1-fsrcnnx-8-0-4-1.net` holds the weights of FSRCNNX x2 8-0-4-1, taken from the mpv user shader
+`FSRCNNX_x2_8-0-4-1.glsl` (release 1.1 of https://github.com/igv/FSRCNN-TensorFlow) and rewritten as plain numbers
+by `tools/mpv2net.py`; the shader code that runs them is Meyra's own (`src/nets.mm`). The file keeps the
+shader's notice:
+
+Copyright (C) 2017-2021 igv
+
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU Lesser
+General Public License as published by the Free Software Foundation; either version 3.0 of the License, or (at
+your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the
+implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public
+License for more details.
+
+The GNU Lesser General Public License version 3 consists of the GNU General Public License version 3 (see
+`LICENSE`) and the additional permissions at https://www.gnu.org/licenses/lgpl-3.0.html.
+
+SPDX-License-Identifier: LGPL-3.0-or-later
+
+## ArtCNN weights
+
+`resources/nets/2-artcnn-c4f16.net` and `resources/nets/3-artcnn-c4f16-ds.net` hold the weights of ArtCNN C4F16
+and C4F16 DS, taken from the mpv user shaders `ArtCNN_C4F16.glsl` and `ArtCNN_C4F16_DS.glsl` of
+https://github.com/Artoriuz/ArtCNN in the same way. They are used under the MIT licence:
+
+Copyright (c) 2024 Joao Chrisostomo, Kacper Michajłow
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+
+## Real-ESRGAN weights
+
+`resources/nets/99-realesr-general-x4v3.net` holds the weights of realesr-general-x4v3 (release v0.2.5.0 of
+https://github.com/xinntao/Real-ESRGAN) as plain numbers, restructured to one luma channel, not retrained.
+the `teach-general` nets and the `teach-x2plus` nets were trained to copy the output of realesr-general-x4v3 and
+RealESRGAN_x2plus from the same project; their weights are meyra's own. Real-ESRGAN is used under the BSD 3-Clause
+licence:
+
+```
+BSD 3-Clause License
+
+Copyright (c) 2021, Xintao Wang
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
 ## Methods (no third-party code included)
 
 - **Sharpening** (`fsOut` in `resources/Shaders.metal`) follows the method of AMD FidelityFX Contrast Adaptive
@@ -122,3 +246,8 @@ SPDX-License-Identifier: BSD-3-Clause
   taps on rings around the pixel and keeping the average only where it is close to the pixel). No libplacebo
   code is included.
 - **Frame generation** uses Apple's VideoToolbox low latency frame interpolation, a system framework.
+- **Cut test, tolerant repeats, capture clock** (`src/cadence.h`) follow methods described for Veyra
+  (https://github.com/Likely7/Veyra-NRVideo, GPL-3.0): scene cuts from a 64x36 luma grid and a histogram,
+  repeated frames compared within a band of 3 levels against the last new frame, and presents timed from the
+  capture timestamp plus a tracked clock offset. Meyra's code is its own implementation with its own tests and
+  thresholds; no Veyra code is included.

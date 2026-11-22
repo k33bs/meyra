@@ -11,7 +11,7 @@
 # overridden, e.g. make SIGN="Developer ID Application: ..." for a distributable build, or make OUT=/tmp/x for a
 # second build next to one that is running.
 
-VERSION   = 0.2.1
+VERSION   = 0.3.0
 BUILD     = 1
 BUNDLE_ID = io.github.k33bs.meyra
 MIN_MACOS = 14.0
@@ -27,13 +27,15 @@ OBJ  = $(patsubst src/%.mm,$(OUT)/obj/%.o,$(SRC)) $(if $(filter 0,$(DECKLINK)),,
 HDR  = $(wildcard src/*.h)
 SDK  = vendor/decklink
 ZIP  = $(OUT)/Meyra-v$(VERSION).zip
+# weights of the enhance nets, one text file each. every *.net in there is offered in the menu
+NETS = $(wildcard resources/nets/*.net)
 
 CXX      = clang++
 ARCH     = -arch arm64 -mmacosx-version-min=$(MIN_MACOS)
 CXXFLAGS = $(ARCH) -std=c++17 -O2 -fobjc-arc -Wall -Wextra -Wunguarded-availability -isystem $(SDK) -Isrc -DMEYRA_DECKLINK=$(DECKLINK)
 FW       = -framework Cocoa -framework Metal -framework MetalFX -framework QuartzCore -framework CoreVideo -framework CoreMedia \
            -framework VideoToolbox -framework AVFoundation -framework AudioToolbox -framework CoreAudio -framework ImageIO \
-           -framework IOSurface -framework Security -weak_framework ScreenCaptureKit
+           -framework IOSurface -framework Security -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -weak_framework ScreenCaptureKit
 
 all: $(APP)
 
@@ -50,11 +52,13 @@ $(BIN): $(OBJ)
 	@mkdir -p $(APP)/Contents/MacOS
 	$(CXX) $(ARCH) $(OBJ) $(FW) -o $@
 
-$(APP): $(BIN) resources/Info.plist resources/Shaders.metal resources/Meyra.entitlements Makefile
+$(APP): $(BIN) resources/Info.plist resources/Shaders.metal resources/Meyra.entitlements resources/Meyra.icns $(NETS) Makefile
 	@mkdir -p $(APP)/Contents/Resources
 	sed -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/' -e 's/@VERSION@/$(VERSION)/' -e 's/@BUILD@/$(BUILD)/' -e 's/@MIN_MACOS@/$(MIN_MACOS)/' \
 		resources/Info.plist > $(APP)/Contents/Info.plist
-	cp resources/Shaders.metal $(APP)/Contents/Resources/
+	cp resources/Shaders.metal resources/Meyra.icns $(APP)/Contents/Resources/
+	@mkdir -p $(APP)/Contents/Resources/nets && rm -f $(APP)/Contents/Resources/nets/*.net
+	cp $(NETS) $(APP)/Contents/Resources/nets/
 	codesign --force --options runtime --entitlements resources/Meyra.entitlements --sign "$(SIGN)" $(APP)
 	@touch $(APP)
 

@@ -265,7 +265,10 @@ public:
             if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_422YpCbCr8) { CVPixelBufferRef y = toYuv(pb); CFRelease(pb); pb = y; }
             if (pb) {
                 setState(SourceState::Running, signal_.empty() ? std::string("1920x1080 @ 59.94") : signal_);
-                renderer::submit(pb, now, now, late);
+                // when the card's hardware took the frame in, on its own clock, for the capture clock (ptsTime)
+                BMDTimeValue ht = 0, hd = 0;
+                double pts = fr->GetHardwareReferenceTimestamp(1000000, &ht, &hd) == S_OK ? ht / 1e6 : -1;
+                renderer::submit(pb, now, now, late, pts);
             }
         }
         mb->Release();

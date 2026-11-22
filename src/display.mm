@@ -12,6 +12,7 @@ static CGDirectDisplayID gChanged;  // display we switched, 0 = none
 static CGDisplayModeRef gOriginal;  // its mode before
 static std::string gStatus = "";
 static std::atomic<bool> gVariable{false};
+static std::atomic<double> gPeriod{0};
 
 static CGDirectDisplayID idOf(NSScreen *s) { return [s.deviceDescription[@"NSScreenNumber"] unsignedIntValue]; }
 
@@ -54,6 +55,7 @@ void apply(NSScreen *screen, double fps, int mode, bool fullScreen) {
     if (gChanged != did || rangeOf != did) { rangeOf = did; lo = screen.minimumRefreshInterval; hi = screen.maximumRefreshInterval; }
     bool vrr = mode == 1 && fullScreen && fps >= 1 && hi - lo > 0.0005 && 1 / fps >= lo - 0.0002 && 1 / fps <= hi + 0.0002;
     gVariable = vrr;
+    gPeriod = vrr && lo > 0 ? lo : curHz > 0 ? 1 / curHz : 0;
     { static int lastKey = -1; int key = (int)vrr | (int)fullScreen << 1 | (hi - lo > 0.0005) << 2; // why, once per change
       if (mode == 1 && fps >= 1 && key != lastKey) { lastKey = key; logLine("display: range %.1f-%.1f ms, full screen %d, variable %d", lo * 1000, hi * 1000, (int)fullScreen, (int)vrr); } }
     if (vrr) {
@@ -110,6 +112,7 @@ void apply(NSScreen *screen, double fps, int mode, bool fullScreen) {
     char key[256];
     snprintf(key, sizeof key, "%s (source %.2f fps, %s)", b, fps, mode == 1 ? "automatic" : "source rate");
     if (lastLog != key) logLine("display: %s", key);
+    if (target > 0) gPeriod = 1 / target;
     lastLog = key;
     gStatus = b;
     CGDisplayModeRelease(cur);
@@ -117,5 +120,13 @@ void apply(NSScreen *screen, double fps, int mode, bool fullScreen) {
 
 std::string status() { return gStatus; }
 bool variable() { return gVariable; }
+double period() { return gPeriod; }
+void modeChanged(NSScreen *screen) {
+    if (!screen || gVariable) return;
+    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(idOf(screen));
+    double hz = cur ? CGDisplayModeGetRefreshRate(cur) : 0;
+    if (hz > 0) gPeriod = 1 / hz;
+    if (cur) CGDisplayModeRelease(cur);
+}
 
 }

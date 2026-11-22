@@ -17,7 +17,7 @@ vertex V vs(uint vid [[vertex_id]]) {
 // full = 1 when the source uses the whole 0..255 range (black at 0) instead of video range (black at 16).
 // reading a full range signal as video range crushes shadows and clips highlights.
 // mode: 1 = sd source (bt.601 colour), 2 = old green rule (see fsNvFix), added up
-struct L { float full; float still; float stillTol; float mode; };
+struct L { float full; float still; float stillTol; float mode; }; // still: 0 no still-area rule, else which (see stillWeight)
 
 // bt.709 yuv -> gamma rgb. sd (480 / 576 lines) is bt.601: read as 709 its reds and greens come out visibly off
 static float3 toRgb(float y, float cb, float cr, float full, bool sd = false) {
@@ -59,9 +59,70 @@ fragment float4 fsNv(V in [[stage_in]], texture2d<float> ty [[texture(0)]], text
 // grass and other real greens sit in the same range (cb 85 cr 89 measured), so low alone is not enough: the real
 // frame's chroma at that spot must be clearly higher, which is what a collapse looks like and green on green is not.
 // mode 2 is the rule before that (low alone), kept to compare
-fragment float4 fsNvFix(V in [[stage_in]], texture2d<float> ty [[texture(0)]], texture2d<float> tc [[texture(1)]],
-                        texture2d<float> ry [[texture(2)]], texture2d<float> rc [[texture(3)]], texture2d<float> py [[texture(4)]],
-                        constant L &l [[buffer(0)]]) {
+// the still-area rule, all of it in here: how much of the real frame's pixel a generated frame takes at uv, 0..1.
+// still things (hud, anything that did not change between the two real frames) are softened and can be wobbled by
+// the interpolator, the real pixel is exact. g: the generated luma here, ry / py: luma of the newer and older real
+// frame. mode (genStill + 1): 1 the hard rule, 2 soft, 3 and 4 metalgoose's
+constant float kStillOut = 6.0 / 255.0; // soft rule: this far outside what the real frame has nearby and the generated pixel starts to stay
+static float stillWeight(float2 uv, float g, texture2d<float> ry, texture2d<float> py, float mode, float tol) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    constexpr sampler n(filter::nearest, address::clamp_to_edge);
+    float2 ly = 1.0 / float2(ry.get_width(), ry.get_height());
+    if (mode > 2.5) {
+        // metalgoose's stability blend (gpl-3, Shaders/Stability.metal), on luma: largest change between the real
+        // frames within 5x5 over the largest step between neighbours there is about "pixels moved". weight falls
+        // with it, none from 0.9; 4/255 is their noise floor. nothing changed within 3x3: the real pixel as it is.
+        // mode 4: that last test on 3x3 averages, because a game's dither changes every frame and never passes it
+        float P[49], N[49];
+        for (int j = 0; j < 7; j++)
+            for (int i = 0; i < 7; i++) {
+                float2 o = uv + float2(i - 3, j - 3) * ly;
+                N[j * 7 + i] = ry.sample(n, o).r;
+                P[j * 7 + i] = py.sample(n, o).r;
+            }
+        float dmax = 0, cmax = 0, dnear = 0, bn = 0, bp = 0;
+        for (int j = 1; j < 6; j++)
+            for (int i = 1; i < 6; i++) {
+                int k = j * 7 + i;
+                float d = abs(N[k] - P[k]);
+                dmax = max(dmax, d);
+                cmax = max(cmax, max(max(abs(P[k - 1] - P[k]), abs(P[k + 1] - P[k])), max(abs(P[k - 7] - P[k]), abs(P[k + 7] - P[k]))));
+                cmax = max(cmax, max(max(abs(N[k - 1] - N[k]), abs(N[k + 1] - N[k])), max(abs(N[k - 7] - N[k]), abs(N[k + 7] - N[k]))));
+                if (i > 1 && i < 5 && j > 1 && j < 5) { dnear = max(dnear, d); bn += N[k]; bp += P[k]; }
+            }
+        if (mode > 3.5) dnear = abs(bn - bp) / 9;
+        if (dnear <= tol) return 1;
+        float r = saturate(1 - dmax / (cmax + 4.0 / 255.0) / 0.9);
+        return r * r;
+    }
+    // still = both real frames agree on luma here and all around here
+    float d = 0, lo = 1, hi = 0;
+    for (int j = -2; j <= 2; j += 2)
+        for (int i = -2; i <= 2; i += 2) {
+            float2 o = uv + float2(i, j) * ly;
+            float r = ry.sample(n, o).r;
+            d = max(d, abs(r - py.sample(n, o).r));
+            lo = min(lo, r); hi = max(hi, r);
+        }
+    if (mode < 1.5) return d < tol ? 1.0 : 0.0; // the hard rule: unchanged to within tol or not at all
+    // soft: a game's dither changes every frame, so still is not identical and a hard limit switches pixels on and off
+    float w = 1 - smoothstep(tol, 2 * tol, d);
+    // something small and fast is at neither of its two places here: both real frames show what is behind it
+    // and agree, and the real pixel would rub it out of every generated frame. told apart from a still thing the
+    // interpolator only softened by its value: a softened pixel stays between the values the real frame has
+    // around it, something that is only in the generated frame mostly does not
+    if (w > 0) {
+        for (int k = 0; k < 4; k++) { // in between the taps above, two by two pixels each
+            float r = ry.sample(s, uv + float2(k & 1 ? 1.5 : -1.5, k & 2 ? 1.5 : -1.5) * ly).r;
+            lo = min(lo, r); hi = max(hi, r);
+        }
+        w *= 1 - smoothstep(kStillOut, 2 * kStillOut, max(lo - g, g - hi));
+    }
+    return w;
+}
+
+// the generated frame's pixel after both rules, still as y cb cr
+static float3 nvFix(V in, texture2d<float> ty, texture2d<float> tc, texture2d<float> ry, texture2d<float> rc, texture2d<float> py, constant L &l) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     constexpr sampler n(filter::nearest, address::clamp_to_edge);
     float2 px = 1.0 / float2(tc.get_width(), tc.get_height());
@@ -73,23 +134,114 @@ fragment float4 fsNvFix(V in [[stage_in]], texture2d<float> ty [[texture(0)]], t
             float g = max(c.r, c.g);
             if (oldRule || max(q.r, q.g) > g + 0.06) low = min(low, g);
         }
-    bool bad = low < 0.36;
-    // still areas (hud, anything that did not change between the two real frames): the interpolator softens them and
-    // can wobble them, the real pixel is exact. still = both real frames agree on luma here and all around here
-    if (l.still > 0.5 && !bad) {
-        float2 ly = 1.0 / float2(ry.get_width(), ry.get_height());
-        float d = 0;
-        for (int j = -2; j <= 2; j += 2)
-            for (int i = -2; i <= 2; i += 2) {
-                float2 o = in.uv + float2(i, j) * ly;
-                d = max(d, abs(ry.sample(n, o).r - py.sample(n, o).r));
-            }
-        bad = d < l.stillTol;
+    float w = low < 0.36 ? 1.0 : 0.0; // how much of the real frame's pixel
+    float g = ty.sample(s, in.uv).r, r = ry.sample(s, in.uv).r;
+    if (l.still > 0.5 && w < 0.5) {
+        w = stillWeight(in.uv, g, ry, py, l.still, l.stillTol);
+        if (l.still > 2.5 && w < 1) r = 0.5 * (r + py.sample(s, in.uv).r); // metalgoose: part weights go to the two real frames' mix
     }
-    float2 cuv = in.uv + float2(kChromaShift / ty.get_width(), 0);
-    float2 c = bad ? rc.sample(s, cuv).rg : tc.sample(s, cuv).rg;
-    float y = bad ? ry.sample(s, in.uv).r : ty.sample(s, in.uv).r;
-    return float4(toRgb(y, c.r, c.g, l.full, isSd(l.mode)), 1);
+    // each frame's chroma is read on its own grid: a generated frame can be smaller than the real ones (genSmall)
+    float2 c = mix(tc.sample(s, in.uv + float2(kChromaShift / ty.get_width(), 0)).rg, rc.sample(s, in.uv + float2(kChromaShift / ry.get_width(), 0)).rg, w);
+    float y = mix(g, r, w);
+    return float3(y, c);
+}
+fragment float4 fsNvFix(V in [[stage_in]], texture2d<float> ty [[texture(0)]], texture2d<float> tc [[texture(1)]],
+                        texture2d<float> ry [[texture(2)]], texture2d<float> rc [[texture(3)]], texture2d<float> py [[texture(4)]],
+                        constant L &l [[buffer(0)]]) {
+    float3 q = nvFix(in, ty, tc, ry, rc, py, l);
+    return float4(toRgb(q.x, q.y, q.z, l.full, isSd(l.mode)), 1);
+}
+
+// hud lock. the two passes are ported from PushFPS (github.com/DosukaSOL/PushFPS, shaders/PushHudLockUpdate.hlsl and
+// PushHudLockCompose.hlsl at commit 3be641ca, GPL-3.0-or-later, Copyright (C) 2026 DosukaSOL and the PushFPS
+// contributors; see THIRD_PARTY_NOTICES.md). changed for here: fragment passes instead of compute, the frames come as
+// 420v planes (change is taken on the rgb they stand for, contrast on luma), the tolerance is a setting, and the
+// compose step is the tail of the pass that already repairs generated frames.
+// state per pixel of the real frames: r = how long it has stayed the same, 0..1, g = how much contrast it has with
+// its neighbours, a held maximum that fades.
+constant float kLockRise = 0.06; // 1/0.06: about 38 real frames (1.3 s at 30 fps) to reach 0.9 from nothing
+constant float kLockFade = 0.97; // held contrast fades about 3% a frame
+static float lockLuma(float y, float full) { return full > 0.5 ? y : saturate((y - 16.0 / 255.0) * (255.0 / 219.0)); }
+// once per new real frame. ty tc: that frame, py pc: the real frame before it, st: the state so far.
+// l.still: 1 = start over, l.stillTol: largest channel change still counted as the same pixel (0.02)
+fragment float4 fsLockUpdate(V in [[stage_in]], texture2d<float> ty [[texture(0)]], texture2d<float> tc [[texture(1)]],
+                             texture2d<float> py [[texture(2)]], texture2d<float> pc [[texture(3)]], texture2d<float> st [[texture(4)]],
+                             constant L &l [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    constexpr sampler n(filter::nearest, address::clamp_to_edge);
+    if (l.still > 0.5) return float4(0, 0, 0, 1);
+    float2 px = 1.0 / float2(ty.get_width(), ty.get_height()), cs = float2(kChromaShift / ty.get_width(), 0);
+    float y = ty.sample(n, in.uv).r;
+    float2 c = tc.sample(s, in.uv + cs).rg, q = pc.sample(s, in.uv + cs).rg;
+    float3 d = abs(toRgb(y, c.r, c.g, l.full, isSd(l.mode)) - toRgb(py.sample(n, in.uv).r, q.r, q.g, l.full, isSd(l.mode)));
+    float change = max(d.r, max(d.g, d.b));
+    float lc = lockLuma(y, l.full);
+    float contrast = max(max(abs(lc - lockLuma(ty.sample(n, in.uv + float2(px.x, 0)).r, l.full)), abs(lc - lockLuma(ty.sample(n, in.uv - float2(px.x, 0)).r, l.full))),
+                         max(abs(lc - lockLuma(ty.sample(n, in.uv + float2(0, px.y)).r, l.full)), abs(lc - lockLuma(ty.sample(n, in.uv - float2(0, px.y)).r, l.full))));
+    float2 v = st.sample(n, in.uv).rg;
+    v.x = change < l.stillTol ? v.x + (1 - v.x) * kLockRise : 0;
+    v.y = change < l.stillTol ? max(contrast, v.y * kLockFade) : contrast;
+    return float4(v, 0, 1);
+}
+// a generated frame takes its locked pixels from the real frame. a pixel is locked when it has been still for about a
+// second itself and it, or a neighbour that is just as still, has an edge: the inside of a thin stroke and the pixel
+// beside an edge belong to the overlay too. a pixel that moves is never locked
+static float lockStill(float2 v) { return smoothstep(0.80, 0.95, v.x); }
+static float lockEdge(float2 v) { return smoothstep(0.04, 0.10, v.y); }
+// the same pass as fsNvFix with the lock after it: the still-area rule decides for this pair of frames, the lock for
+// what has been still a while. lk has the real frame's size, which is this pass's size
+static float3 nvFixLock(V in, texture2d<float> ty, texture2d<float> tc, texture2d<float> ry, texture2d<float> rc, texture2d<float> py, texture2d<float> lk, constant L &l) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    constexpr sampler n(filter::nearest, address::clamp_to_edge);
+    float3 q = nvFix(in, ty, tc, ry, rc, py, l);
+    float still = lockStill(lk.sample(n, in.uv).rg), edge = 0;
+    if (still > 0) {
+        float2 px = 1.0 / float2(lk.get_width(), lk.get_height());
+        for (int j = -1; j <= 1; j++)
+            for (int i = -1; i <= 1; i++) {
+                float2 v = lk.sample(n, in.uv + float2(i, j) * px).rg;
+                edge = max(edge, lockEdge(v) * lockStill(v));
+            }
+    }
+    float w = still * edge;
+    // towards the real frame's own pixel, also where metalgoose's rule has mixed the two real frames
+    if (w > 0) q = mix(q, float3(ry.sample(s, in.uv).r, rc.sample(s, in.uv + float2(kChromaShift / ry.get_width(), 0)).rg), w);
+    return q;
+}
+fragment float4 fsNvFixLock(V in [[stage_in]], texture2d<float> ty [[texture(0)]], texture2d<float> tc [[texture(1)]],
+                            texture2d<float> ry [[texture(2)]], texture2d<float> rc [[texture(3)]], texture2d<float> py [[texture(4)]],
+                            texture2d<float> lk [[texture(5)]], constant L &l [[buffer(0)]]) {
+    float3 q = nvFixLock(in, ty, tc, ry, rc, py, lk, l);
+    return float4(toRgb(q.x, q.y, q.z, l.full, isSd(l.mode)), 1);
+}
+
+// hud areas (hudRects): rectangles the user marked on the picture. inside one a generated frame takes the newer real
+// frame's pixel whatever the rules above said, with a few pixels of soft edge outside it so the border does not show.
+// r: left, top, right, bottom in parts of the picture. n.x: how many, n.y: the soft edge in pixels of the real frame
+struct HA { float4 r[8]; float4 n; };
+static float3 hudAreas(float3 q, float2 uv, texture2d<float> ry, texture2d<float> rc, constant HA &h) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float2 size = float2(ry.get_width(), ry.get_height()), p = uv * size;
+    float w = 0;
+    for (int i = 0; i < int(h.n.x); i++) {
+        float2 d = max(h.r[i].xy * size - p, p - h.r[i].zw * size); // how far outside, per axis
+        w = max(w, 1 - smoothstep(0.0, h.n.y, length(max(d, 0.0))));
+    }
+    if (w > 0) q = mix(q, float3(ry.sample(s, uv).r, rc.sample(s, uv + float2(kChromaShift / ry.get_width(), 0)).rg), w);
+    return q;
+}
+// the same two passes with the areas last. only used while any are set
+fragment float4 fsNvFixHud(V in [[stage_in]], texture2d<float> ty [[texture(0)]], texture2d<float> tc [[texture(1)]],
+                           texture2d<float> ry [[texture(2)]], texture2d<float> rc [[texture(3)]], texture2d<float> py [[texture(4)]],
+                           constant L &l [[buffer(0)]], constant HA &h [[buffer(1)]]) {
+    float3 q = hudAreas(nvFix(in, ty, tc, ry, rc, py, l), in.uv, ry, rc, h);
+    return float4(toRgb(q.x, q.y, q.z, l.full, isSd(l.mode)), 1);
+}
+fragment float4 fsNvFixLockHud(V in [[stage_in]], texture2d<float> ty [[texture(0)]], texture2d<float> tc [[texture(1)]],
+                               texture2d<float> ry [[texture(2)]], texture2d<float> rc [[texture(3)]], texture2d<float> py [[texture(4)]],
+                               texture2d<float> lk [[texture(5)]], constant L &l [[buffer(0)]], constant HA &h [[buffer(1)]]) {
+    float3 q = hudAreas(nvFixLock(in, ty, tc, ry, rc, py, lk, l), in.uv, ry, rc, h);
+    return float4(toRgb(q.x, q.y, q.z, l.full, isSd(l.mode)), 1);
 }
 
 struct U { float2 texel; float amount; float pad; };
@@ -113,6 +265,15 @@ fragment float4 fsDeband(V in [[stage_in]], texture2d<float> t [[texture(0)]], c
     return float4(c, 1);
 }
 
+// look: a tone curve on luma (33 points, linear in between), then one factor on the colour. g[33] is the factor
+fragment float4 fsLook(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant float *g [[buffer(1)]]) {
+    constexpr sampler s(filter::nearest, address::clamp_to_edge);
+    float3 c = t.sample(s, in.uv).rgb;
+    float y = dot(c, float3(0.2126, 0.7152, 0.0722)), x = saturate(y) * 32;
+    int i = min(int(x), 31);
+    return float4(saturate(mix(g[i], g[i + 1], x - i) + g[33] * (c - y)), 1);
+}
+
 // last pass: plain copy / bilinear scale when amount is 0, otherwise contrast adaptive sharpening on luma only
 // (no colour fringes), eased off on isolated noisy pixels so grain is not amplified, and clamped to the
 // neighbourhood so it cannot ring
@@ -134,6 +295,16 @@ fragment float4 fsOut(V in [[stage_in]], texture2d<float> t [[texture(0)]], cons
     float w = amp * (-1.0 / mix(8.0, 5.0, u.amount)) * (1 - 0.5 * noise);
     float lo = (lb * w + ld * w + lf * w + lh * w + le) / (1 + 4 * w);
     return float4(clamp(e + (lo - le), mn, mx), 1);
+}
+
+// compare view, diagonal cut: the original below a line from the top left to the bottom right corner, over the finished
+// picture that is already there. amount: the line's half width in pixels
+fragment float4 fsCut(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant U &u [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float3 c = t.sample(s, in.uv).rgb;
+    float d = in.uv.y - in.uv.x, px = fwidth(d) * u.amount;
+    if (d < -px) discard_fragment();
+    return float4(d < px ? float3(0.6) : c, 1);
 }
 
 // edge-aware upscale: amd fidelityfx super resolution 1, the easu pass (mit, see THIRD_PARTY_NOTICES.md), in plain float.
@@ -252,6 +423,24 @@ fragment float4 fsTileC(V in [[stage_in]], texture2d<float> t [[texture(0)]], co
     return float4(toYuv(t.sample(s, float2(u.off + in.uv.x * u.scale, u.yoff + in.uv.y * u.yscale)).rgb).yz, 0, 1);
 }
 
+// a whole picture back to 420v in the source's own range and matrix (the L of the pass that read it): the pre stages
+// of the chain hand the interpolator, and later the screen, a frame like any other. chroma sits on the left luma
+// sample of each pair, as it came
+static float3 toYuvAs(float3 c, float full, bool sd) {
+    float3 w = sd ? float3(0.299, 0.587, 0.114) : float3(0.2126, 0.7152, 0.0722);
+    float y = dot(c, w), cb = (c.b - y) / (sd ? 1.772 : 1.8556), cr = (c.r - y) / (sd ? 1.402 : 1.5748);
+    if (full > 0.5) return float3(y, 128.0 / 255 + cb, 128.0 / 255 + cr);
+    return float3(16.0 / 255 + y * (219.0 / 255), 128.0 / 255 + cb * (224.0 / 255), 128.0 / 255 + cr * (224.0 / 255));
+}
+fragment float4 fsBackY(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant L &l [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return float4(toYuvAs(t.sample(s, in.uv).rgb, l.full, isSd(l.mode)).x, 0, 0, 1);
+}
+fragment float4 fsBackC(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant L &l [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return float4(toYuvAs(t.sample(s, in.uv - float2(kChromaShift / t.get_width(), 0)).rgb, l.full, isSd(l.mode)).yz, 0, 1);
+}
+
 // first tile's right edge, second's left edge (0: one tile), padding across and down. the seam fades across the middle
 // half of what the two tiles share
 struct C { float a1; float b0; float px; float py; };
@@ -275,6 +464,104 @@ fragment float4 fsTiles(V in [[stage_in]], texture2d<float> y0 [[texture(0)]], t
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++) sum += tileAt(y0, c0, y1, c1, in.uv + ((float2(i, j) + 0.5) / n - 0.5) * d, u);
     return float4(sum / (n * n), 1);
+}
+
+// a picture larger than its place on screen (the 2x result of an enhance net in a smaller window).
+// amount 0, area: n x n bilinear taps spread over each screen pixel. at exactly half size that is the mean of the four
+// pixels, which hands back very nearly the picture the net was given (measured 51 db): safe, and little gained.
+// amount 1, lanczos 2 stretched to the screen pixel: keeps what the net added below the screen's own limit (at half
+// size 0.88 of the finest detail a screen pixel can carry instead of 0.71), clamped to the pixels around so it
+// cannot ring
+fragment float4 fsDown(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant U &u [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float2 d = float2(abs(dfdx(in.uv.x)), abs(dfdy(in.uv.y)));
+    float2 r = max(d / u.texel, 1.0); // source pixels per screen pixel
+    if (u.amount < 0.5) {
+        int n = clamp(int(max(r.x, r.y) + 0.5), 1, 4);
+        float3 sum = 0;
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) sum += t.sample(s, in.uv + ((float2(i, j) + 0.5) / n - 0.5) * d).rgb;
+        return float4(sum / (n * n), 1);
+    }
+    constexpr sampler n(filter::nearest, address::clamp_to_edge);
+    float2 pp = in.uv / u.texel - 0.5, fp = floor(pp);
+    float3 sum = 0, mn = 1, mx = 0;
+    float ws = 0;
+    for (int j = -3; j <= 4; j++)
+        for (int i = -3; i <= 4; i++) {
+            float2 o = float2(i, j), x = abs(fp + o - pp) / r; // distance in screen pixels
+            if (x.x >= 2 || x.y >= 2) continue;
+            float2 a = max(x * 3.14159265, 1e-4), k = sin(a) * sin(a * 0.5) / (a * a * 0.5);
+            float3 c = t.sample(n, (fp + o + 0.5) * u.texel).rgb;
+            sum += c * k.x * k.y; ws += k.x * k.y;
+            if (x.x < 1 && x.y < 1) { mn = min(mn, c); mx = max(mx, c); }
+        }
+    return float4(clamp(sum / ws, mn, mx), 1);
+}
+
+// supersample: a picture scaled to exactly twice its place on screen, brought down by the mean of each 2x2 block,
+// taken in linear light (amount = the gamma the values are decoded with, 1 = averaged as they are). in gamma the mean
+// of a bright and a dark pixel comes out too dark, which is what thins bright lines and fattens dark ones
+fragment float4 fsBox(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant U &u [[buffer(0)]]) {
+    uint2 p = uint2(in.pos.xy) * 2;
+    float3 g = float3(u.amount);
+    float3 sum = pow(t.read(p).rgb, g) + pow(t.read(p + uint2(1, 0)).rgb, g) + pow(t.read(p + uint2(0, 1)).rgb, g) + pow(t.read(p + uint2(1, 1)).rgb, g);
+    return float4(pow(sum * 0.25, 1 / g), 1);
+}
+
+// enhanceReal, enhanceHold: what an enhance net added to a real frame is kept apart from the picture, in a texture
+// at the net's output size: r = what it added to luma, g = the luma it was given (bilinear for a 2x net), the guide
+// that says later whether a pixel still shows what the kept change was made for.
+// pitch: one pixel of the net's input in texels of the kept texture (2 for a 2x net)
+struct K { float pitch; float tol; float a; float b; };
+constant float3 kLw = float3(0.2126, 0.7152, 0.0722);
+// the picture t against the guide in k, over 3x3 input pixels: 1 = the same to within tol, 0 from twice that
+static float keptMatch(texture2d<float> t, texture2d<float> k, float2 uv, float pitch, float tol) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    constexpr sampler n(filter::nearest, address::clamp_to_edge);
+    float2 st = pitch / float2(k.get_width(), k.get_height());
+    float d = 0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            float2 o = uv + float2(i, j) * st;
+            d = max(d, abs(dot(t.sample(s, o).rgb, kLw) - k.sample(n, o).g));
+        }
+    return 1 - smoothstep(tol, 2 * tol, d);
+}
+// the frame the kept change was made from, shown (again): the net's picture without running the net
+fragment float4 fsKeepAdd(V in [[stage_in]], texture2d<float> t [[texture(0)]], texture2d<float> k [[texture(1)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return float4(saturate(t.sample(s, in.uv).rgb + k.read(uint2(in.pos.xy)).r), 1);
+}
+// another frame (a generated one, a repeat): the kept change where the picture still matches its guide, nothing where
+// it does not. a = 1: a second kept frame in k2 fills in where the first does not match
+fragment float4 fsKeepUse(V in [[stage_in]], texture2d<float> t [[texture(0)]], texture2d<float> k [[texture(1)]], texture2d<float> k2 [[texture(2)]],
+                          constant K &u [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    uint2 p = uint2(in.pos.xy);
+    float w = keptMatch(t, k, in.uv, u.pitch, u.tol);
+    float r = w * k.read(p).r;
+    if (u.a > 0.5 && w < 1) r += (1 - w) * keptMatch(t, k2, in.uv, u.pitch, u.tol) * k2.read(p).r;
+    return float4(saturate(t.sample(s, in.uv).rgb + r), 1);
+}
+// steady enhance: only what the net added is filtered over time, never the picture. the change kept from the real
+// frame before (h, same pixel: there are no motion vectors) is trusted where the guide still matches, held inside
+// the range the fresh change has in the 3x3 around (plus b) so it cannot carry something the net no longer puts
+// there, and mixed in with weight a. where the picture changed the fresh change goes out as it is
+fragment float4 fsHold(V in [[stage_in]], texture2d<float> now [[texture(0)]], texture2d<float> h [[texture(1)]], constant K &u [[buffer(0)]]) {
+    constexpr sampler n(filter::nearest, address::clamp_to_edge);
+    float2 px = 1.0 / float2(now.get_width(), now.get_height());
+    float2 c = now.sample(n, in.uv).rg;
+    float d = 0, lo = c.r, hi = c.r;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            float2 o = float2(i, j) * px;
+            d = max(d, abs(now.sample(n, in.uv + o * u.pitch).g - h.sample(n, in.uv + o * u.pitch).g));
+            float r = now.sample(n, in.uv + o).r;
+            lo = min(lo, r); hi = max(hi, r);
+        }
+    float q = 1 - smoothstep(u.tol, 2 * u.tol, d);
+    return float4(mix(c.r, clamp(h.sample(n, in.uv).r, lo - u.b, hi + u.b), u.a * q), c.g, 0, 1);
 }
 
 // status overlay, premultiplied alpha
