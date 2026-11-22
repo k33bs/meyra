@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 k33bs
+// additional terms under section 7 of the licence: see "licence" in README.md
 //
 // app shell: window, menus, source picker, status overlay text, updates, command line flags for automated runs.
 #import <Cocoa/Cocoa.h>

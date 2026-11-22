@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 k33bs
+// additional terms under section 7 of the licence: see "licence" in README.md
 //
 // blackmagic decklink / ultrastudio capture through the desktop video sdk. frames arrive as iosurface backed 2vuy
 // pixel buffers that go into metal without a copy. no camera permission needed. the runtime is loaded on demand

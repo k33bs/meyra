@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 k33bs
+// additional terms under section 7 of the licence: see "licence" in README.md
 //
 // replay: plays a folder of raw uyvy frames (PREFIX_f000.uyvy, PREFIX_f001.uyvy ...) at 59.94 in a loop, as if they
 // came from a capture device. for testing the whole chain on known footage and for demos

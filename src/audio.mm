@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 k33bs
+// additional terms under section 7 of the licence: see "licence" in README.md
 //
 // audio comes in packets (one per video frame from decklink, ~10-20 ms chunks from avfoundation). the output callback
 // reads the ring at a fractional position steered to stay `delay` behind the packet arrival clock: small errors are

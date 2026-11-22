@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 k33bs
+// additional terms under section 7 of the licence: see "licence" in README.md
 //
 // what this protects against: a broken or truncated download (size cap, sha-256 from the release notes, codesign
 // verify) and a wrong file (bundle id, version). what it does not: whoever controls the github account controls the
