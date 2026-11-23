@@ -134,14 +134,14 @@ bool installed() {
     static std::atomic<double> at{-1};
     static std::atomic<bool> there{false};
     double now = nowSec();
-    if (at < 0 || now - at > 1) { there = present(); at = now; }
+    if (at < 0 || ([NSThread isMainThread] && now - at > 1)) { there = present(); at = now; } // after the first look only the main thread goes to the disk (the app asks once a second), the render thread asks every frame
     return there && !gRefused;
 }
 const char *note() {
     static thread_local char text[200];
     if (installed()) return "";
     os_unfair_lock_lock(&gNoteLock);
-    if (gRefused) snprintf(text, sizeof text, "frame generator files not usable: %s", gWhy.c_str());
+    if (gRefused) snprintf(text, sizeof text, "second generator not usable: %s", gWhy.c_str());
     else snprintf(text, sizeof text, "frame generator files not installed");
     os_unfair_lock_unlock(&gNoteLock);
     return text;
@@ -217,7 +217,7 @@ static void refuse(const std::string &why) {
     gWhy = why;
     os_unfair_lock_unlock(&gNoteLock);
     gRefused = true;
-    logLine("frame generator files refused: %s", why.c_str());
+    logLine("second generator refused: %s", why.c_str());
 }
 
 // ---- the graph file, op by op, as an mpsgraph
@@ -256,7 +256,8 @@ static std::vector<long> tensorShape(Net &n, NSString *name, long *offset) {
         need(cnt < (1L << 28), std::string("tensor too large: ") + name.UTF8String);
     }
     long off = [t[@"offset"] longValue];
-    need(off >= 0 && (off + cnt) * 2 <= (long)n.blob.length, std::string("tensor outside the weights file: ") + name.UTF8String);
+    need(off >= 0 && cnt <= (long)n.blob.length / 2 - off, // not (off + cnt) * 2: a huge offset wraps around and passes
+          std::string("tensor outside the weights file: ") + name.UTF8String);
     *offset = off;
     return v;
 }

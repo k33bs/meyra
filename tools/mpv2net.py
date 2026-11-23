@@ -11,10 +11,12 @@
 #   tools/mpv2net.py SHADER.glsl "Menu Name" OUT.net
 import re, sys
 
-NUM = r'-?[0-9.]+(?:e-?[0-9]+)?'
+NUM = r'[-+]?[0-9.]+(?:[eE][-+]?[0-9]+)?'
 
-def nums(s):
-    return re.findall(NUM, s)
+def nums(s, n=0):  # n: how many there must be. a single value is not spread out: mat4(x) is a diagonal
+    v = re.findall(NUM, s)
+    assert not n or len(v) == n, 'expected %d numbers: %s' % (n, s[:60])
+    return v
 
 def passes(src):
     out = []
@@ -62,14 +64,16 @@ def fsrcnnx(ps):
         L = Layer('l%d' % len(layers), 4 * len(grp))
         for g, p in enumerate(grp):
             body = p['body'][p['body'].index('hook()'):]
-            L.b[4 * g:4 * g + 4] = nums(re.search(r'vec4 res = vec4\(([^)]*)\)', body).group(1))
+            L.b[4 * g:4 * g + 4] = nums(re.search(r'vec4 res = vec4\(([^)]*)\)', body).group(1), 4)
             for m in re.finditer(r'res \+= (?:mat4(?:x4)?|vec4)\(([^)]*)\) \* (?:float\()?(\w+)_texOff\((?:vec2\((-?\d+),(-?\d+)\)|0)\)', body):
                 v, tex, dx, dy = nums(m.group(1)), m.group(2), int(m.group(3) or 0), int(m.group(4) or 0)
                 if tex == 'LUMA':
+                    assert len(v) == 4
                     src, base = 'y', 0
                     for r in range(4): L.tap(4 * g + r, 0, dx, dy, v[r])
                 else:
                     src, base = where[tex]
+                    assert len(v) == 16
                     for c in range(4):
                         for r in range(4): L.tap(4 * g + r, base + c, dx, dy, v[c * 4 + r])  # glsl matrices are column major
                 if src not in L.src: L.src.append(src)
@@ -78,7 +82,7 @@ def fsrcnnx(ps):
                 assert base == 4 * g
                 if src not in L.add: L.add.append(src)
             m = re.search(r'res = max\(res, vec4\(0\.0\)\) \+ vec4\(([^)]*)\) \* min\(res, vec4\(0\.0\)\);', body)
-            if m: L.act = 'prelu'; L.a[4 * g:4 * g + 4] = nums(m.group(1))
+            if m: L.act = 'prelu'; L.a[4 * g:4 * g + 4] = nums(m.group(1), 4)
             n = len(re.findall(r'res \+= ', body))
             assert n == len(re.findall(r'res \+= (?:mat4|vec4)', body)) + len(re.findall(r'res \+= \w+_texOff\(0\);', body))
         assert len(L.src) == 1
@@ -98,9 +102,10 @@ def artcnn(ps):
         L.src = ['y' if b == 'LUMA' else b for b in p['bind']]
         if len(L.src) > 1: assert re.search(r'inp\[0\]\[y\]\[x\] = V4\(\w+_mul \* texelFetch\([^;]*\) \+ \w+_mul \* texelFetch', body)
         for g in groups:
-            L.b[4 * g:4 * g + 4] = nums(re.search(r'V4 result%d = V4\(([^)]*)\)' % g, body).group(1))
+            L.b[4 * g:4 * g + 4] = nums(re.search(r'V4 result%d = V4\(([^)]*)\)' % g, body).group(1), 4)
         for m in re.finditer(r'result(\d+) \+= (M4|V4)\(([^)]*)\) \* inp_(\d+)_(\d+)_(\d+);', body):
             g, v, ig, x, y = int(m.group(1)), nums(m.group(3)), int(m.group(4)), int(m.group(5)) - 1, int(m.group(6)) - 1
+            assert len(v) == (4 if m.group(2) == 'V4' else 16)
             if m.group(2) == 'V4':
                 for r in range(4): L.tap(4 * g + r, 0, x, y, v[r])
             else:

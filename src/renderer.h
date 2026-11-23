@@ -39,7 +39,7 @@ struct Stats {
     // for the overlay's order line: how many of the drawn frames went through each stage (kDid*)
     int did[16] = {};
     // gpu ms per stage (kSt*), summed over the command buffers measured (stageN), and those buffers' whole gpu time.
-    // only with -stageTimes YES
+    // on unless -stageTimes NO
     double stage[9] = {}, stageCb = 0; int stageN = 0;
 };
 // a generated frame, dither removal and the enhance net before the interpolator, dither removal, the net after dither

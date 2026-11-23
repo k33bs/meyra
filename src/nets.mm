@@ -60,7 +60,11 @@ static bool parse(const std::string &text, Net &net) {
     auto floats = [&](const char *tag, std::vector<float> &v, size_t n) {
         if (!(in >> tok) || tok != tag) return false;
         v.resize(n);
-        for (float &f : v) if (!(in >> f)) return false;
+        for (float &f : v) { // by way of a double: reading a float refuses anything below FLT_MIN, which a trained net can hold
+            double d;
+            if (!(in >> d) || !(d >= -FLT_MAX && d <= FLT_MAX)) return false;
+            f = (float)d;
+        }
         return true;
     };
     int ver = 0;

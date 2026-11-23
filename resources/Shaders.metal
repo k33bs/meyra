@@ -90,7 +90,10 @@ static float stillWeight(float2 uv, float g, texture2d<float> ry, texture2d<floa
                 cmax = max(cmax, max(max(abs(N[k - 1] - N[k]), abs(N[k + 1] - N[k])), max(abs(N[k - 7] - N[k]), abs(N[k + 7] - N[k]))));
                 if (i > 1 && i < 5 && j > 1 && j < 5) { dnear = max(dnear, d); bn += N[k]; bp += P[k]; }
             }
-        if (mode > 3.5) dnear = abs(bn - bp) / 9;
+        // mode 4's averages also agree by chance on single pixels of something that moves, and the real frame's pixel
+        // there is a speck in the generated one (measured 336 a frame against 2): only where nothing within 5x5
+        // changed by more than a dither does (9 of 255, where the soft rule ends too)
+        if (mode > 3.5) dnear = dmax <= 9.0 / 255.0 ? abs(bn - bp) / 9 : 1;
         if (dnear <= tol) return 1;
         float r = saturate(1 - dmax / (cmax + 4.0 / 255.0) / 0.9);
         return r * r;
@@ -140,8 +143,17 @@ static float3 nvFix(V in, texture2d<float> ty, texture2d<float> tc, texture2d<fl
         w = stillWeight(in.uv, g, ry, py, l.still, l.stillTol);
         if (l.still > 2.5 && w < 1) r = 0.5 * (r + py.sample(s, in.uv).r); // metalgoose: part weights go to the two real frames' mix
     }
+    // the rim: in the outermost rows of colour, top and bottom, the collapse is only part of the way (measured cb 0.35
+    // cr 0.40 where the picture has 0.47 0.52), above the limit of the rule further up, and shows as a green line
+    // along the edge. there both channels clearly under the real frame's is enough, and only the colour is taken
+    float wc = w;
+    if (w < 0.5 && min(in.uv.y, 1 - in.uv.y) * tc.get_height() < 2.0)
+        for (int i = -1; i <= 1; i++) {
+            float2 o = in.uv + float2(i, 0) * px, e = tc.sample(n, o).rg, q = rc.sample(n, o).rg;
+            if (q.r > e.r + 0.04 && q.g > e.g + 0.04) wc = 1;
+        }
     // each frame's chroma is read on its own grid: a generated frame can be smaller than the real ones (genSmall)
-    float2 c = mix(tc.sample(s, in.uv + float2(kChromaShift / ty.get_width(), 0)).rg, rc.sample(s, in.uv + float2(kChromaShift / ry.get_width(), 0)).rg, w);
+    float2 c = mix(tc.sample(s, in.uv + float2(kChromaShift / ty.get_width(), 0)).rg, rc.sample(s, in.uv + float2(kChromaShift / ry.get_width(), 0)).rg, wc);
     float y = mix(g, r, w);
     return float3(y, c);
 }

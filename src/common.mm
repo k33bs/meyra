@@ -105,8 +105,7 @@ std::string chainText(int b) {
 }
 
 void hudRectsParse(const char *s) {
-    int n = 0;
-    gSet.hudN = 0;
+    int n = 0; // the count last, never 0 in between: the render thread reads it while a preset loads the same areas again
     for (NSString *one in [@(s ?: "") componentsSeparatedByString:@";"]) {
         NSArray<NSString *> *v = [one componentsSeparatedByString:@","];
         if (v.count != 4 || n >= kHudMax) continue;
@@ -137,19 +136,19 @@ void settingsLoad() {
                           @"passthrough": @NO, @"audio": @YES, @"audioTrimMs": @0, @"refresh": @1, @"overlay": @YES,
                           @"checkUpdatesAtLaunch": @YES, @"srWithGen": @YES, @"srPad": @YES, @"vsync": @YES, @"gameMode": @YES,
                           @"genSmall": @NO, @"genStill": @0, @"denoise": @NO, @"noise": @0.5}];
-    gSet.levels = (int)[d integerForKey:@"levels"] % 3;
+    gSet.levels = (int)((([d integerForKey:@"levels"] % 3) + 3) % 3); // a negative number stays a place in the list
     gSet.deband = [d boolForKey:@"deband"];
-    gSet.upscale = (int)[d integerForKey:@"upscale"] % 5;
+    gSet.upscale = (int)((([d integerForKey:@"upscale"] % 5) + 5) % 5);
     gSet.enhance = (int)MAX(0, [d integerForKey:@"enhance"]); // a number with no net behind it counts as off
     gSet.enhanceAt = (int)((([d integerForKey:@"enhanceAt"] % 3) + 3) % 3);
-    gSet.enhanceDown = (int)[d integerForKey:@"enhanceDown"] % 2;
+    gSet.enhanceDown = (int)((([d integerForKey:@"enhanceDown"] % 2) + 2) % 2);
     gSet.sharpen = fminf(1, fmaxf(0, [d floatForKey:@"sharpen"]));
     gSet.frameGen = [d boolForKey:@"frameGen"];
     gSet.early = [d boolForKey:@"early"];
     gSet.passthrough = [d boolForKey:@"passthrough"];
     gSet.audio = [d boolForKey:@"audio"];
     gSet.audioTrim = [d doubleForKey:@"audioTrimMs"] / 1000;
-    gSet.refresh = (int)[d integerForKey:@"refresh"] % 3;
+    gSet.refresh = (int)((([d integerForKey:@"refresh"] % 3) + 3) % 3);
     gSet.overlay = [d boolForKey:@"overlay"];
     gSet.overlayFull = [d boolForKey:@"overlayFull"];
     gSet.look = (int)((([d integerForKey:@"look"] % 4) + 4) % 4);
@@ -169,7 +168,7 @@ void settingsLoad() {
     gSet.srWithGen = [d boolForKey:@"srWithGen"];
     gSet.srPad = [d boolForKey:@"srPad"];
     gSet.vsync = [d boolForKey:@"vsync"];
-    gSet.colour = (int)[d integerForKey:@"colour"] % 3;
+    gSet.colour = (int)((([d integerForKey:@"colour"] % 3) + 3) % 3);
     gSet.keepRes = [d boolForKey:@"keepRes"];
     gSet.denoise = [d boolForKey:@"denoise"];
     gSet.hudLock = [d boolForKey:@"hudLock"];

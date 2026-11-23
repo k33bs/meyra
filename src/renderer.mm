@@ -633,11 +633,11 @@ static bool is601(CVPixelBufferRef pb) {
 
 // the picture to show for a real frame: its pre picture when it has one. a filtered one may still be in the works:
 // wait that long for it, then the raw frame goes up instead
-static CVPixelBufferRef picOf(CVPixelBufferRef pb, double graceMs) {
+static CVPixelBufferRef picOf(CVPixelBufferRef pb, double graceMs, bool count = false) { // count: this frame goes up now
     CVPixelBufferRef p = CVPixelBufferIsPlanar(pb) ? held(pb, kPicKey) : NULL;
     if (!p) return pb;
     if (CVBufferHasAttachment(p, kPreKey) || noise::wait(p, graceMs)) return p; // gpu work needs no wait: same queue, it runs before whatever reads it
-    bump(&Stats::noiseRaw);
+    if (count) bump(&Stats::noiseRaw);
     return pb;
 }
 
@@ -748,8 +748,9 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         real = prevReal = NULL;
     } else thaw();
     CVPixelBufferRef raw = pb; // as it came, before the noise filter or a stage ahead of the interpolator
-    pb = picOf(pb, onlyNet ? 2 : 14); // a frame shown the moment it arrived (no frame generation, 60 fps content) waits for its filter here
+    pb = picOf(pb, onlyNet ? 2 : 14, !onlyNet); // a frame shown the moment it arrived (no frame generation, 60 fps content) waits for its filter here
     if (real) real = picOf(real, 2);
+    if (gSet.freeze && CVBufferHasAttachment(pb, kPreKey)) pb = raw; // frozen: the chain as it is now, not the pre picture made when the frame came
     if (prevReal) prevReal = picOf(prevReal, 0);
     int ch = gCh;
     bool cs = ch & kChainSet, preDone = CVBufferHasAttachment(real ?: pb, kPreKey);
@@ -879,7 +880,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         }
     }
     if (en && at == 1 && (net = runNet(src))) { src = net; cmp.push_back({"enhance", src}); }
-    if (effDeband() && postD) {
+    if (effDeband() && postD && !(onlyNet && at == 1)) { // the run ahead with the net first: src is what the net added, not a picture, and nobody reads this
         float db[4] = {1.0f / W, 1.0f / H, gDebandT / 255, 0}; // reach in source pixels, also on the net's larger picture
         bool big = net && net.width > W;
         if (big && !gFlat2) gFlat2 = makeTex(2 * W, 2 * H, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
@@ -924,7 +925,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         [cb commit];
         return;
     }
-    if (net && net.width > W) up = 0; // the net has made the larger picture. one that hands back the same size leaves the upscaler its job
+    if (net && net.width > W && src.width > W) up = 0; // not after sharpen-first brought it back to the source size (a chain's E moved behind the interpolator). the net has made the larger picture. one that hands back the same size leaves the upscaler its job
     // supersample: the upscaler works to twice the window and the mean of every 2x2 block, in linear light, is the
     // picture. plain scaling has nothing to gain from it, apple super resolution already scales past the window
     // and is filtered down (fsTiles), a 2x net's picture is not the upscaler's
@@ -970,7 +971,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     if (net && (src.width > fw || src.height > fh)) {
         if (!gDown) gDown = makeTex(fw, fh, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
         float du[4] = {1.0f / src.width, 1.0f / src.height, (float)gSet.enhanceDown, 0};
-        if (gDown) { pass(cb, gPipeDown, src, nil, gDown, (MTLViewport){0, 0, (double)fw, (double)fh, 0, 1}, du); src = gDown; }
+        if (gDown) { pass(cb, gPipeDown, src, nil, gDown, (MTLViewport){0, 0, (double)fw, (double)fh, 0, 1}, du); src = gDown; did |= 1u << kDidDown; if (!cmp.empty()) cmp.push_back({"shrink", src}); }
     }
     // look: after everything that makes the picture, before the sharpening. ten bits a channel, the curve would band in eight
     int look = gSet.passthrough ? 0 : gSet.look.load();
@@ -1151,7 +1152,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     if (lr) lr->present = sinceStart();
     os_unfair_lock_lock(&gLock);
     gS.drawn++;
-    did |= (real ? 1u << kDidGen : 0) | (ran ? 1u << (kDidUp + ran) : 0) | (net ? 1u << (kDidE0 + at) : 0) | (net && src == gDown ? 1u << kDidDown : 0) | (u[2] > 0 ? 1u << kDidSharp : 0);
+    did |= (real ? 1u << kDidGen : 0) | (ran ? 1u << (kDidUp + ran) : 0) | (net ? 1u << (kDidE0 + at) : 0) | (u[2] > 0 ? 1u << kDidSharp : 0);
     for (int i = 0; i < kDidN; i++) gS.did[i] += did >> i & 1;
     if (ran == 2) gS.sr++;
     if (arrival > 0) { gS.toPresSum += (nowSec() - arrival) * 1000; gS.toPresN++; }
@@ -1363,7 +1364,11 @@ static void ask(CVPixelBufferRef a, CVPixelBufferRef b) {
         if (cb) ready = ^{ return (bool)(cb.status >= MTLCommandBufferStatusCompleted); };
         else if (!CVBufferHasAttachment(in, kPreKey)) ready = ^{ return noise::done(in); }; // the request holds on to the frame
     }
-    framegen::request(genIn(a), in, ready, fullRange(), gSd);
+    // the older one's noise filter can still be at work when the newer frame was turned down over it: its buffer is
+    // half written then, and the newer frame is raw anyway
+    CVPixelBufferRef pa = genIn(a);
+    if (pa != a && pa == held(a, kPicKey) && !CVBufferHasAttachment(pa, kPreKey) && !noise::done(pa)) pa = a;
+    framegen::request(pa, in, ready, fullRange(), gSd);
 }
 
 // frame scheduling, render thread only.
@@ -1456,6 +1461,7 @@ static void netAhead(CVPixelBufferRef nv) {
     if (!gSet.enhanceReal || !gAhead || gSet.passthrough || !effEnhance() || (gCh & kPreE)) return;
     CVPixelBufferRef p = held(nv, kPicKey);
     for (Kept &k : gKept) if (k.of && (k.of == nv || k.of == p)) return; // done already
+    if (p && !CVBufferHasAttachment(p, kPreKey) && !noise::done(p)) return; // the noise filter is not through: the net would run on the raw frame now and again on the filtered one at its turn
     show(nv, 0, NULL, NULL, false, true);
 }
 
@@ -1528,7 +1534,7 @@ static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, 
     // genModel: the second generator works on a small copy of its own making, genSmall's is apple's fast path only
     static int genM;
     int gm = framegen::model();
-    int sm = !gm && pw == 1920 && ph == 1080 ? gSet.genSmall.load() : 0; // the one size the shrinks in toNV are written for
+    int sm = effFrameGen() && !gm && pw == 1920 && ph == 1080 ? gSet.genSmall.load() : 0; // the one size the shrinks in toNV are written for
     if (genM != gm) { framegen::cancel(); dropHeld(); genM = gm; } // a pair is made by one generator
     if (early != ew || deep != dw || gSmall != sm) { // the schedules keep different promises: start clean. genSmall: both frames of a pair must be the same size
         framegen::cancel();
@@ -1557,7 +1563,7 @@ static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, 
         // timing wobbled (the counts looked perfect, the picture looked choppy); shown, each one stays exactly two.
         // the catch: at a 60 hz screen frames then go in exactly as fast as they come out, and a backlog (from start-up,
         // from a stall) never clears: measured 75 ms to the screen instead of 21. so when the display's queue has
-        // backed up, one repeat is left out to drain a place. passthrough leaves nothing out at all
+        // backed up, one repeat is left out to drain a place. passthrough too (gDrain), see below
         static double lastSkip;
         double now = CACurrentMediaTime();
         bool backed = gQueueLag > 2.0 * gFrameDur && now - lastSkip > 0.25;
@@ -1757,7 +1763,7 @@ static cadence::PtsClock gClock; // ptsTime. capture thread only
 
 void submit(CVPixelBufferRef pb, double arrival, double captured, bool late, double pts) {
     Luma l;
-    bool repeat = false, changed = false, tol = gSet.repeatTol;
+    bool repeat = false, changed = false, tol = gSet.repeatTol && !gSet.passthrough; // passthrough: only an exact copy is a repeat
     int darkest = 255, over = -1; float shift = 0;
     // ptsTime: every callback is a sample for the clock, repeats too. a source without timestamps: as without the switch
     double when = arrival;
@@ -1815,6 +1821,7 @@ void noSignalFrame() { bump(&Stats::nosignal); }
 
 void beginSource(double frameDur, bool sameSource) {
     gHaveSig = gHaveProf = gHaveTol = false;
+    gClock = cadence::PtsClock(); // the old source has stopped, the new one has not started
     if (!sameSource) { gFullSeen = false; gDarkFrames = 0; }
     setFrameDur(frameDur);
     os_unfair_lock_lock(&gLock);

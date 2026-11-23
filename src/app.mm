@@ -62,7 +62,7 @@ struct Preset { const char *name, *what; NSDictionary *set; NSArray<NSString *> 
 static const std::vector<Preset> &presets() {
     static const std::vector<Preset> p = {
         {"standard", "dither removal, metalfx, medium sharpening, apple's frame generation on the tick. every experiment off", @{}, nil},
-        {"untouched", "plain passthrough: every frame as it came, nothing processed, nothing generated", @{@"passthrough": @YES}, nil},
+        {"untouched", "plain passthrough: the frames as they came, nothing processed, nothing generated", @{@"passthrough": @YES}, nil},
         {"fastest", "no generated frames, light sharpening: the least delay, for when reaction time matters", @{@"frameGen": @NO, @"sharpen": @0.3}, nil},
         {"smooth", "frame generation with the soft still rule, hud lock and the better cut test: steadier huds", @{@"genStill": @1, @"hudLock": @YES, @"cutTest": @YES}, nil},
         {"smooth, less delay", "the same on the early schedule: frames a few ms sooner, motion a little less even", @{@"early": @YES, @"genStill": @1, @"hudLock": @YES, @"cutTest": @YES}, nil},
@@ -113,6 +113,7 @@ static void saveNetName() {
 static void restoreNet() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     if ([d volatileDomainForName:NSArgumentDomain][@"enhance"]) return; // a test run names its net by number
+    for (auto &kv : gArgs.set) if (kv.first == "enhance") { saveNetName(); return; } // --set enhance=N: that number, and its name from now on
     NSString *name = [d stringForKey:@"enhanceNet"];
     if (!name.length) return; // saved before names were kept: the number as it is
     for (int i = 1; i <= nets::count(); i++) if ([name isEqual:@(nets::name(i))]) { gSet.enhance = i; settingsSave("enhance"); return; }
@@ -122,15 +123,15 @@ static NSString *enhanceText() {
     int n = gSet.enhance;
     if (!n || n > nets::count()) return @"off";
     static NSString *const kAt[] = {@"after dither removal", @"before dither removal", @"after the upscaler"};
-    NSString *t = [NSString stringWithFormat:@"%s, %@, %@ to smaller windows", nets::name(n), kAt[gSet.enhanceAt % 3], gSet.enhanceDown ? @"lanczos" : @"area"];
+    NSString *t = [NSString stringWithFormat:@"%@, %@, %@ to smaller windows", @(nets::name(n)), kAt[gSet.enhanceAt % 3], gSet.enhanceDown ? @"lanczos" : @"area"];
     if (gSet.passthrough) return [t stringByAppendingString:@" (off in passthrough)"];
-    return *nets::status(n) ? [t stringByAppendingFormat:@" (%s)", nets::status(n)] : t;
+    return *nets::status(n) ? [t stringByAppendingFormat:@" (%@)", @(nets::status(n))] : t;
 }
 
 // which upscaler ran this second, and why it is not the chosen one when it is not
 static NSString *upscalerText(int up, const renderer::Stats &s, const superres::Stats &r) {
     if (int n = renderer::enhanceRan()) { // the net made the larger picture, or (placed after the upscaler) worked on the upscaler's
-        NSString *t = [NSString stringWithFormat:@"enhance %s", nets::name(n)];
+        NSString *t = [NSString stringWithFormat:@"enhance %@", @(nets::name(n))];
         return up == 1 ? [@"MetalFX + " stringByAppendingString:t] : up == 3 ? [@"edge-aware FSR 1 + " stringByAppendingString:t] : up == 4 ? [@"edge-aware SGSR 1 + " stringByAppendingString:t] : t;
     }
     NSString *t = s.sr ? [NSString stringWithFormat:@"Apple SR %.1f avg %.1f max ms", r.n ? r.sumMs / r.n : 0, r.maxMs] : up == 1 ? @"MetalFX" : up == 3 ? @"edge-aware FSR 1" : up == 4 ? @"edge-aware SGSR 1" : @"plain";
@@ -176,7 +177,7 @@ static const Tip kTips[] = {
     {"genstill:3", 0, "by motion against contrast, more forgiving. steadiest of all, can erase thin moving things"},
     {"genstill:4", 0, "for tests: generated frames are shown as guessed, nothing is taken from the real frames"},
     {"genstill", "still areas", "pixels that did not change between two real frames are taken from the real frames in generated ones, so huds and backgrounds do not shimmer. the rules differ in what counts as unchanged"},
-    {"passthrough", "plain passthrough", "all processing off, every frame shown as it came, repeats included. the other settings are kept"},
+    {"passthrough", "plain passthrough", "all processing off, frames shown as they came, repeats included (one is left out when the screen's queue has backed up). the other settings are kept"},
     {"levels:0", 0, "the range is told from the darkest values the source sends"},
     {"levels:1", 0, "the source's black is 16 and its white 235. pick it when blacks look grey"},
     {"levels:2", 0, "the source's black is 0 and its white 255. pick it when shadows look crushed"},
@@ -269,6 +270,8 @@ static const Tip kTips[] = {
     {"@performMiniaturize:", 0, "the window goes to the dock. macos stops updating it there"},
     {"@performZoom:", 0, "the window as large as the screen lets it be"},
     {"@arrangeInFront:", 0, "meyra's windows in front of the other apps'"},
+    {"#Compare", 0, "the original against the finished picture, or every stage of the chain, on the picture"},
+    {"#Presets", 0, "ten sets of switches on the number keys. shift + a number saves the switches as they are now on that key"},
     {"#Meyra", 0, "the app itself: vsync, game mode, updates"},
     {"#Source", 0, "which device or recording is shown, its format and sound, snapshots"},
     {"#Picture", 0, "what is done to every frame: levels, colour, dither removal, upscaling, enhance, sharpening"},
@@ -494,9 +497,10 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     // which is the audio trim key, and a plain press must not save
     else if (ev.keyCode == 49) { if (!ev.isARepeat) [gApp command:@"freeze"]; } // space
     else if ((ev.keyCode == 36 || ev.keyCode == 76) && gSet.genModel && framegen::available() && !flyhigh::complete()) { if (!ev.isARepeat) [gApp command:[NSString stringWithFormat:@"genget:%d", gSet.genModel.load()]]; } // return: while the second generator is chosen and missing
-    else if (ev.keyCode == 44 || ev.keyCode == 75) [gApp command:(ev.modifierFlags & NSEventModifierFlagShift) ? @"compare-" : @"compare+"]; // slash by where it is, and the number pad's: shift + 7 on some keyboards
     else if (digit >= 0) [gApp command:[NSString stringWithFormat:(ev.modifierFlags & NSEventModifierFlagShift) ? @"presetsave:%d" : @"preset:%d", digit ? digit : 10]];
-    else if (map[k]) [gApp command:map[k]];
+    else if (ev.keyCode == 39 && !map[k]) [gApp command:@"trim+"]; // the apostrophe's place: a french keyboard has the apostrophe on the 4, which is a preset
+    else if (map[k]) [gApp command:map[k]]; // before the slash's place: dvorak types z there, turkish and russian a full stop
+    else if (ev.keyCode == 44 || ev.keyCode == 75 || [k isEqual:@"/"] || [k isEqual:@"?"]) [gApp command:(ev.modifierFlags & NSEventModifierFlagShift) ? @"compare-" : @"compare+"]; // slash by what the key types or where it is, and the number pad's
     else if (k.length == 1 && [k characterAtIndex:0] >= '0' && [k characterAtIndex:0] <= '9') [gApp command:[NSString stringWithFormat:@"preset:%d", k.intValue ? k.intValue : 10]]; // the number pad
     else if (ev.keyCode == 53 && (self.window.styleMask & NSWindowStyleMaskFullScreen)) [self.window toggleFullScreen:nil];
     else [super keyDown:ev];
@@ -528,6 +532,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     NSString *_lastCmd;            // the command last run, its row is marked in the overlay
     int _presetWas;                // the preset the switches came from before one was changed by hand
     int _preset;                   // the preset last chosen (1..), 0 once a switch was changed by hand
+    int _genWant;                  // the generator to switch to when its download ends, 0 once something else was chosen
     NSString *_hint;               // what the last command set and what that does, shown until _hintUntil
     double _hintUntil;
     double _videoDelay, _noiseMs;
@@ -783,6 +788,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
 // once a second: stats, log, overlay, messages
 
 - (void)second {
+    flyhigh::installed(); // the look at the disk happens here, on the main thread
     renderer::Stats s = renderer::takeStats();
     framegen::Stats g = framegen::takeStats();
     superres::Stats r = superres::takeStats();
@@ -917,7 +923,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     auto did = [&](int i) { return s.did[i] > 0; };
     if (!s.in && !s.drawn) return @[@"no picture yet"];
     [o addObject:h ? [NSString stringWithFormat:@"input %dp%@", h, gSet.repeatTol && !pass ? @" (tolerant repeats)" : @""] : @"input"];
-    if (gSet.denoise && !pass) [o addObject:_noiseN ? @"noise filter" : *noise::status() ? [NSString stringWithFormat:@"noise filter idle: %s", noise::status()] : @"noise filter idle"];
+    if (effNoise() || (gSet.denoise && !pass && !(gSet.chain & kChainSet))) [o addObject:_noiseN ? @"noise filter" : *noise::status() ? [NSString stringWithFormat:@"noise filter idle: %s", noise::status()] : @"noise filter idle"];
     int en = gSet.enhance, ran = renderer::enhanceRan();
     NSString *net = [NSString stringWithFormat:@"enhance (%@%@%@%@)", @(nets::name(ran ?: en)).lowercaseString, gSet.enhanceReal ? @", real frames only" : @"", gSet.enhanceHold ? @", steady" : @"", nets::half(ran ?: en) ? @", half" : @""];
     if (did(kDidPreD)) [o addObject:@"dither removal"];
@@ -940,7 +946,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     if (did(kDidE0)) [o addObject:net];
     if (en && !pass && !anyNet) {
         const char *st = en > nets::count() ? "no such net" : nets::status(en);
-        [o addObject:!strcmp(st, "starting") ? @"enhance starting" : *st ? [NSString stringWithFormat:@"enhance idle: %s", st] : @"enhance idle"];
+        [o addObject:!strcmp(st, "starting") ? @"enhance starting" : *st ? [NSString stringWithFormat:@"enhance idle: %@", @(st)] : @"enhance idle"];
     }
     NSString *sharp = [NSString stringWithFormat:@"sharpen %.1f", effSharpen()];
     if (did(kDidSharpFirst)) [o addObject:sharp];
@@ -1127,7 +1133,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
         int en = gSet.enhance;
         bool enOn = en && en <= nets::count() && !gSet.passthrough;
         NSString *enName = enOn ? [@(nets::name(en)).lowercaseString stringByReplacingOccurrencesOfString:@"-" withString:@" "] : @"off";
-        int noiseSt = !gSet.denoise ? kOff : effNoise() && !*noise::status() ? kOn : kIdle;
+        int noiseSt = !(gSet.chain & kChainSet ? effNoise() : (int)gSet.denoise) ? kOff : effNoise() && !*noise::status() ? kOn : kIdle;
         int genSt = !gSet.frameGen ? kOff : why ? kIdle : kOn;
         int e0 = ex(0), e1 = ex(1), e2 = ex(2);
         int smallSt = !gSet.genSmall ? kOff : renderer::genSmallNow() ? kOn : kIdle, hudN = gSet.hudN;
@@ -1298,6 +1304,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     if ([c isEqual:@"presetreset"]) {
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
         if (_preset && [d dictionaryForKey:[NSString stringWithFormat:@"customPreset%d", _preset]]) _preset = 0; // what runs is no longer what that number holds
+        if (_presetWas && [d dictionaryForKey:[NSString stringWithFormat:@"customPreset%d", _presetWas]]) _presetWas = 0; // nor what the changed switches came from
         for (int i = 1; i <= (int)presets().size(); i++) [d removeObjectForKey:[NSString stringWithFormat:@"customPreset%d", i]];
         [self say:@"the built-in presets are back on every number"];
         return;
@@ -1307,7 +1314,8 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     if (![c isEqual:@"overlay"]) _lastCmd = [c hasPrefix:@"trim"] ? @"trim" : c;
     if ([c isEqual:@"fullscreen"]) [_win toggleFullScreen:nil];
     else if ([c isEqual:@"overlay"]) { // off -> compact -> every switch -> off
-        if (!gSet.overlay) { gSet.overlay = true; gSet.overlayFull = false; }
+        if (arg) { gSet.overlay = !gSet.overlay; gSet.overlayFull = false; } // the menu item: on or off
+        else if (!gSet.overlay) { gSet.overlay = true; gSet.overlayFull = false; }
         else if (!gSet.overlayFull) gSet.overlayFull = true;
         else { gSet.overlay = false; gSet.overlayFull = false; }
         settingsSave("overlay"); settingsSave("overlayFull");
@@ -1325,6 +1333,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     else if ([c isEqual:@"genmodel"] || [c isEqual:@"genmodel+"]) { // choosing it again looks at the files again
         bool missing = !flyhigh::complete();
         if (missing && arg.intValue > 0) { [self command:[NSString stringWithFormat:@"genget:%d", arg.intValue]]; return; } // picked in the menu: ask. the key only hints
+        _genWant = 0;
         gSet.genModel = [c hasSuffix:@"+"] ? (missing ? !gSet.genModel : (gSet.genModel + 1) % 3) : // without its files one stop, not two
                          ((arg.intValue % 3) + 3) % 3;
         flyhigh::retry();
@@ -1336,9 +1345,12 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
         int want = arg.intValue;
         void (^get)(void) = ^{
           [self say:@"second generator — downloading its files"];
+          self->_genWant = want;
           flyhigh::download(^(const std::string &err) {
-            if (err.empty() && want) [self command:[NSString stringWithFormat:@"genmodel:%d", want]]; // by the command, so the presets know
-            [self say:err.empty() ? @"second generator — downloaded, chosen now" : [NSString stringWithFormat:@"second generator — not downloaded: %@", ns(err)]];
+            int now = self->_genWant; // 0: a preset or another generator was chosen while it ran, that choice stands
+            self->_genWant = 0;
+            if (err.empty() && now) [self command:[NSString stringWithFormat:@"genmodel:%d", now]]; // by the command, so the presets know
+            [self say:!err.empty() ? [NSString stringWithFormat:@"second generator — not downloaded: %@", ns(err)] : now ? @"second generator — downloaded, chosen now" : @"second generator — downloaded"];
           });
         };
         if (gArgs.test && [arg hasSuffix:@"go"] && [[[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain][@"genModelDir"] description] length]) { get(); return; } // a test folder only
@@ -1357,13 +1369,13 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
         else answer([a runModal]);
         return;
     }
-    else if ([c isEqual:@"genstill"]) { gSet.genStill = arg.intValue % 5; settingsSave("genStill"); }
+    else if ([c isEqual:@"genstill"]) { gSet.genStill = ((arg.intValue % 5) + 5) % 5; settingsSave("genStill"); }
     else if ([c isEqual:@"genstill+"]) { gSet.genStill = (gSet.genStill + 1) % 4; settingsSave("genStill"); }
     else if ([c isEqual:@"passthrough"]) { gSet.passthrough = !gSet.passthrough; settingsSave("passthrough"); }
-    else if ([c isEqual:@"levels"]) { gSet.levels = arg.intValue % 3; settingsSave("levels"); }
+    else if ([c isEqual:@"levels"]) { gSet.levels = ((arg.intValue % 3) + 3) % 3; settingsSave("levels"); }
     else if ([c isEqual:@"levels+"]) { gSet.levels = (gSet.levels + 1) % 3; settingsSave("levels"); }
     else if ([c isEqual:@"colour"] || [c isEqual:@"colour+"]) {
-        gSet.colour = ([c isEqual:@"colour"] ? arg.intValue : gSet.colour + 1) % 3;
+        gSet.colour = ((([c isEqual:@"colour"] ? arg.intValue : gSet.colour + 1) % 3) + 3) % 3;
         settingsSave("colour");
         renderer::applyColour();
     }
@@ -1373,6 +1385,8 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     else if ([c isEqual:@"hudmark"]) { // again, or esc: not after all
         int w, h, fw, fh, up;
         renderer::lastSize(w, h, fw, fh, up);
+        int cm = gSet.passthrough ? 0 : gSet.compare.load();
+        if (!_view.marking && (cm == 4 || cm == 5 || cm == 7)) { [self say:@"hud areas — not while the compare view shows the picture twice or in strips: the drag would land elsewhere. / changes the view"]; return; }
         _view.marking = !_view.marking && gSet.hudN < kHudMax && w > 0;
     }
     else if ([c isEqual:@"hudclear"]) { gSet.hudN = 0; settingsSave("hudRects"); _view.marking = NO; logLine("hud areas: none"); }
@@ -1390,18 +1404,18 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     else if ([c isEqual:@"enhance+"]) { int n = gSet.enhance;
         do n = (n + 1) % (nets::count() + 1); while (n && nets::passes(n) > 64); // the still-picture net takes far too long to land on by key, the menu has it
         gSet.enhance = n; settingsSave("enhance"); saveNetName(); }
-    else if ([c isEqual:@"enhanceat"]) { gSet.enhanceAt = arg.intValue % 3; settingsSave("enhanceAt"); }
-    else if ([c isEqual:@"enhancedown"]) { gSet.enhanceDown = arg.intValue % 2; settingsSave("enhanceDown"); }
-    else if ([c isEqual:@"upscale"]) { gSet.upscale = arg.intValue % 5; settingsSave("upscale"); }
+    else if ([c isEqual:@"enhanceat"]) { gSet.enhanceAt = ((arg.intValue % 3) + 3) % 3; settingsSave("enhanceAt"); }
+    else if ([c isEqual:@"enhancedown"]) { gSet.enhanceDown = ((arg.intValue % 2) + 2) % 2; settingsSave("enhanceDown"); }
+    else if ([c isEqual:@"upscale"]) { gSet.upscale = ((arg.intValue % 5) + 5) % 5; settingsSave("upscale"); }
     else if ([c isEqual:@"upscale+"]) { int n = (gSet.upscale + 1) % 5; gSet.upscale = n == 2 && !superres::available() ? 3 : n; settingsSave("upscale"); }
-    else if ([c isEqual:@"sharp"]) { gSet.sharpen = arg.floatValue; settingsSave("sharpen"); }
+    else if ([c isEqual:@"sharp"]) { gSet.sharpen = fminf(1, fmaxf(0, arg.floatValue)); settingsSave("sharpen"); }
     else if ([c isEqual:@"sharp+"]) { gSet.sharpen = fminf(1, roundf(gSet.sharpen * 10 + 1) / 10); settingsSave("sharpen"); }
     else if ([c isEqual:@"sharp-"]) { gSet.sharpen = fmaxf(0, roundf(gSet.sharpen * 10 - 1) / 10); settingsSave("sharpen"); }
     else if ([c isEqual:@"audio"]) { gSet.audio = !gSet.audio; settingsSave("audio"); [self audioToggled]; }
     else if ([c isEqual:@"trim+"]) { gSet.audioTrim = gSet.audioTrim + 0.005; settingsSave("audioTrimMs"); }
     else if ([c isEqual:@"trim-"]) { gSet.audioTrim = gSet.audioTrim - 0.005; settingsSave("audioTrimMs"); }
     else if ([c isEqual:@"trim0"]) { gSet.audioTrim = 0; settingsSave("audioTrimMs"); }
-    else if ([c isEqual:@"refresh"]) { gSet.refresh = arg.intValue % 3; settingsSave("refresh"); [self applyRefresh]; }
+    else if ([c isEqual:@"refresh"]) { gSet.refresh = ((arg.intValue % 3) + 3) % 3; settingsSave("refresh"); [self applyRefresh]; }
     else if ([c isEqual:@"source"]) [self startSource:arg.UTF8String persist:YES];
     else if ([c isEqual:@"format"]) [self setPerSource:@"formats" value:arg];
     else if ([c isEqual:@"ain"]) [self setPerSource:@"audioInputs" value:arg];
@@ -1420,7 +1434,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     else if ([c isEqual:@"updates"]) [self checkForUpdates:NO];
     else if ([c isEqual:@"keepres"]) { gSet.keepRes = !gSet.keepRes; settingsSave("keepRes"); [_view fit]; }
     else if ([c isEqual:@"freeze"]) gSet.freeze = !gSet.freeze;
-    else if ([c isEqual:@"compare"] || [c isEqual:@"compare+"] || [c isEqual:@"compare-"]) { gSet.compare = ([c isEqual:@"compare"] ? arg.intValue : gSet.compare + ([c hasSuffix:@"-"] ? 7 : 1)) & 7; settingsSave("compare"); }
+    else if ([c isEqual:@"compare"] || [c isEqual:@"compare+"] || [c isEqual:@"compare-"]) { gSet.compare = ([c isEqual:@"compare"] ? arg.intValue : gSet.compare + ([c hasSuffix:@"-"] ? 7 : 1)) & 7; settingsSave("compare"); _view.marking = NO; } // a drag is mapped by the view it started in
     else if ([c isEqual:@"vsync"]) { gSet.vsync = !gSet.vsync; settingsSave("vsync"); renderer::layer().displaySyncEnabled = gSet.vsync; }
     else if ([c isEqual:@"gamemode"]) {
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -1484,7 +1498,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
 
 static NSArray<NSString *> *presetKeys() {
     return @[@"passthrough", @"deband", @"upscale", @"sharpen", @"enhance", @"enhanceAt", @"enhanceReal", @"enhanceHold", @"superSample", @"denoise", @"frameGen", @"early",
-             @"genSmall", @"genStill", @"genModel", @"hudLock", @"cutTest", @"repeatTol", @"ptsTime", @"vsync", @"netHalf", @"genDeadline", @"genLateNext", @"look"];
+             @"genSmall", @"genStill", @"genModel", @"hudLock", @"cutTest", @"repeatTol", @"ptsTime", @"vsync", @"netHalf", @"genDeadline", @"genLateNext", @"look", @"enhanceDown", @"srWithGen", @"srPad"];
 }
 // what those are set to right now, as the running state has them (a command line's -key value included)
 static NSDictionary *presetNow() {
@@ -1493,7 +1507,8 @@ static NSDictionary *presetNow() {
              @"superSample": @((bool)gSet.superSample), @"denoise": @((bool)gSet.denoise), @"frameGen": @((bool)gSet.frameGen), @"early": @((bool)gSet.early),
              @"genSmall": @(gSet.genSmall.load()), @"genStill": @(gSet.genStill.load()), @"genModel": @(gSet.genModel.load()), @"hudLock": @((bool)gSet.hudLock),
              @"cutTest": @((bool)gSet.cutTest), @"repeatTol": @((bool)gSet.repeatTol), @"ptsTime": @((bool)gSet.ptsTime), @"vsync": @((bool)gSet.vsync),
-             @"netHalf": @((bool)gSet.netHalf), @"genDeadline": @(gSet.genDeadline.load()), @"genLateNext": @((bool)gSet.genLateNext), @"look": @(gSet.look.load())};
+             @"netHalf": @((bool)gSet.netHalf), @"genDeadline": @(gSet.genDeadline.load()), @"genLateNext": @((bool)gSet.genLateNext), @"look": @(gSet.look.load()),
+             @"enhanceDown": @(gSet.enhanceDown.load()), @"srWithGen": @((bool)gSet.srWithGen), @"srPad": @((bool)gSet.srPad)};
 }
 static void logPreset(const char *what, int n) {
     NSDictionary *v = presetNow();
@@ -1520,7 +1535,7 @@ static void logPreset(const char *what, int n) {
     NSDictionary *own = [d dictionaryForKey:[NSString stringWithFormat:@"customPreset%d", n]]; // saved over this slot with shift + the number
     NSMutableDictionary *v = [@{@"passthrough": @NO, @"deband": @YES, @"upscale": @1, @"sharpen": @0.6, @"enhance": @0, @"enhanceAt": @0, @"enhanceReal": @NO, @"enhanceHold": @NO,
                                @"superSample": @NO, @"denoise": @NO, @"frameGen": @YES, @"early": @NO, @"genSmall": @0, @"genStill": @0, @"genModel": @0, @"hudLock": @NO,
-                               @"cutTest": @NO, @"repeatTol": @NO, @"ptsTime": @NO, @"vsync": @YES, @"netHalf": @NO, @"genDeadline": @0, @"genLateNext": @NO, @"look": @0} mutableCopy];
+                               @"cutTest": @NO, @"repeatTol": @NO, @"ptsTime": @NO, @"vsync": @YES, @"netHalf": @NO, @"genDeadline": @0, @"genLateNext": @NO, @"look": @0, @"enhanceDown": @0, @"srWithGen": @YES, @"srPad": @YES} mutableCopy];
     [v addEntriesFromDictionary:own ?: p.set];
     NSString *netNote = @"";
     if (NSString *name = v[@"enhanceName"]) { // your own: the net by its name
@@ -1548,7 +1563,7 @@ static void logPreset(const char *what, int n) {
         flyhigh::retry();
         if (!framegen::model()) netNote = [netNote stringByAppendingFormat:@" (second generator: %s, apple's stays in use)", !flyhigh::complete() ? "not installed, return downloads it, 1.6 mb" : *framegen::modelNote() ? framegen::modelNote() : "not in use"];
     }
-    _preset = n; _presetWas = 0;
+    _preset = n; _presetWas = 0; _genWant = 0;
     logPreset("applied", n);
     // a command line's -key value outranks what a preset stores: say so, a test run would look like a broken preset
     NSMutableArray<NSString *> *kept = [NSMutableArray new];
@@ -1961,7 +1976,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     NSMenu *ws = submenu(wm, @"Window Size");
     [ws addItem:item(@"Next Size", @"winsize+", @"w", 0)];
     for (int z : {720, 900, 1080, 1440, 2160}) [ws addItem:item([NSString stringWithFormat:@"%dp", z], [NSString stringWithFormat:@"winsize:%d", z], nil)];
-    [wm addItem:item(@"Show Status Overlay", @"overlay", @"i")];
+    [wm addItem:item(@"Show Status Overlay", @"overlay:menu", @"i")];
     NSMenu *cv = submenu(wm, @"Compare");
     [cv addItem:item(@"Freeze Picture (Space)", @"freeze", nil)];
     [cv addItem:NSMenuItem.separatorItem];
@@ -2100,7 +2115,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
         on = gSet.enhance == arg.intValue;
         enabled = !pass;
         const char *st = nets::status(arg.intValue);
-        if (arg.intValue) mi.title = on && *st ? [NSString stringWithFormat:@"%s (%s)", nets::name(arg.intValue), st] : ns(nets::name(arg.intValue));
+        if (arg.intValue) mi.title = on && *st ? [NSString stringWithFormat:@"%@ (%@)", @(nets::name(arg.intValue)), @(st)] : ns(nets::name(arg.intValue));
     }
     else if ([c isEqual:@"enhanceat"]) { on = gSet.enhanceAt == arg.intValue; enabled = !pass && gSet.enhance; }
     else if ([c isEqual:@"enhancedown"]) { on = gSet.enhanceDown == arg.intValue; enabled = !pass && gSet.enhance; }

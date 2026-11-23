@@ -1,5 +1,42 @@
 # changelog
 
+## v0.3.1
+
+fixes: two picture faults in generated frames, and what a review of v0.3.0 found.
+
+- generated frames: the green line along the bottom (and top) edge is gone. the interpolator's colour collapses only
+  part of the way in the outermost rows, above the limit of the repair that was there; those rows now take the real
+  frame's colour where both channels are clearly under it. last two rows green: 7.6% of pixels before, 0 after.
+- generated frames with the still rule "by motion against contrast, allows for dither" (the gta6 everything preset):
+  no more specks. single pixels of moving things passed for still and took the real frame's pixel. 336 a frame
+  before, 10 after.
+- the audio trim key also works by its place, for keyboards whose apostrophe sits on a number.
+- keys: the letter a key types comes before the slash's place, so z is passthrough again on dvorak and the full stop is look
+  on turkish and russian keyboards. / also works by the character.
+- a stored setting below zero (upscale -1) no longer crashes the app a second after the first frame. every numbered
+  setting wraps the same way, sharpen is kept between 0 and 1.
+- the second generator: a download that ends after something else was chosen no longer switches to it. a bad offset in
+  its json is refused instead of read. frames that keep failing stop it after three new sessions (it restarted for ever).
+  a start that failed is tried again after the next gap, not only when it is chosen again.
+- presets also hold the shrink method, apple sr with frame generation and its edge padding: a preset gives the same
+  picture every time, and changing one of the three shows as (changed). presets saved before get the defaults for them.
+- hud areas cannot be marked while the compare view shows the picture twice or in strips: the area landed elsewhere.
+- tolerant repeats does nothing in passthrough, as the menu says.
+- with the noise filter and real frames only, the net no longer runs on the raw frame ahead of a filter that is not
+  through. the interpolator is not handed a noise filter buffer that is still being written.
+- no dither removal pass on the run ahead with the net first, no shrink for the generator while frame generation is off.
+- chain E:SU with a 2x net: the upscaler runs when sharpen-first has brought the picture back to the source size.
+- a net file with a weight below 1.2e-38 loads.
+- window > show status overlay hides the overlay again (h still goes off, compact, every switch).
+- a frozen frame under a chain goes through the chain as it is now. the order line names the shrink with a look on, the
+  compare strips call it shrink. the generator's peak time starts over with another generator or size.
+- net names with umlauts read right in the menu and the log. --set enhance=N holds. restore built-in presets clears the
+  (changed) mark. compare and presets have their own tooltips. the passthrough texts say that one repeat is left out
+  when the screen's queue has backed up.
+- under a chain the overlay and order line follow the chain for the noise filter. a new source starts the capture clock
+  over. the hud area count does not drop to zero while a preset loads. the render thread no longer looks at the disk.
+- tools/mpv2net.py reads e+ and E exponents and checks how many numbers a constructor holds.
+
 ## v0.3.0 (dev release)
 
 - the gta6 enhance nets ship with meyra (24 more), and realesr-general-x4v3 for still pictures. the readme says what each was

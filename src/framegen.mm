@@ -150,6 +150,7 @@ static void loop() {
             }
             gState = 0; gReadyW = gReadyH = 0; // also after a failed start, so the next use tries again
             fails = restarts = 0;
+            flyhigh::retry(); // a start can fail over a busy gpu, not only over its files: the next use looks again
             usleep(20000);
             continue;
         }
@@ -170,9 +171,9 @@ static void loop() {
                     ok = dstPool != NULL;
                 }
                 gReadyW = ww; gReadyH = wh; gReadyM = wm;
-                os_unfair_lock_lock(&gLock); gRingN = gRingAt = 0; os_unfair_lock_unlock(&gLock); // another generator or size: its times are its own
+                os_unfair_lock_lock(&gLock); gRingN = gRingAt = 0; os_unfair_lock_unlock(&gLock); gPeak = 0; // another generator or size: its times are its own
                 gState = ok ? 2 : 3;
-                fails = restarts = 0;
+                fails = 0; // not restarts: this is also where a session is started again after 30 failed frames
                 logLine("frame generation %s for %dx%d, second generator at %d lines (%.0f ms)%s%s", ok ? "ready" : "unavailable", ww, wh, wm == 2 ? 720 : 480,
                         (nowSec() - t0) * 1000, ok ? "" : ": ", ok ? "" : flyhigh::note());
             }
@@ -197,7 +198,7 @@ static void loop() {
                     ok = dstPool != NULL;
                 }
                 gReadyW = ww; gReadyH = wh;
-                os_unfair_lock_lock(&gLock); gRingN = gRingAt = 0; os_unfair_lock_unlock(&gLock);
+                os_unfair_lock_lock(&gLock); gRingN = gRingAt = 0; os_unfair_lock_unlock(&gLock); gPeak = 0;
                 gState = ok ? 2 : 3;
                 if (!ok) proc = nil;
                 logLine("frame generation %s for %dx%d (%.0f ms)%s%s", ok ? "ready" : "unavailable", ww, wh, (nowSec() - t0) * 1000,
