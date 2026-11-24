@@ -1,5 +1,20 @@
 # changelog
 
+## v0.4.0
+
+recording, and a switch that turns meyra off without closing it.
+
+- recording (tab): what is on screen goes to a .mov in movies/meyra, hevc from the mac's video encoder, with the sound
+  as it is played. the screen never waits for it: when the encoder or the disk fall behind, the file loses a frame, the
+  screen does not. a red dot and a counter sit in the corner meanwhile and are never in the file.
+- keep the last 30 seconds (shift + tab): held in memory all the time, already encoded, and tab writes them to a file:
+  for what just happened. an amber dot in the corner, white for a moment after a save.
+- recording menu: size (at most 1080p unless set otherwise, a bigger picture is scaled down on the gpu first), bitrate
+  (by size, or 10 to 100 mbit), overlay and hint lines in the file or not, open recordings folder.
+- the file carries the tone curve of the colour setting, so a player shows it the way the window did.
+- meyra menu > turn meyra off: the capture device is let go and nothing is drawn, generated or played. the window and
+  the settings stay, the same item turns it on again.
+
 ## v0.3.1
 
 fixes: two picture faults in generated frames, and what a review of v0.3.0 found.

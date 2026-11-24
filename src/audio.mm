@@ -10,6 +10,7 @@
 #import <Foundation/Foundation.h>
 #include "audio.h"
 #include "common.h"
+#include "record.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -40,6 +41,7 @@ static Stats gS; // frames, packets, jitter under gLock
 static std::atomic<int> gUnder{0}, gOver{0}, gResync{0}, gBuf{0};
 static std::atomic<double> gLead{0}, gDelayNow{0};
 static std::atomic<double> gInLag{0};     // how long after its timestamp a chunk arrives, decaying peak. ~0 when timestamps are arrival times
+static std::atomic<double> gDevLat{0};  // output device latency after the render timestamp, seconds
 static std::atomic<float> gOutPeak{0};     // what actually went to the speakers, render thread
 static int64_t wNext = -1;                 // decklink packet time expected next, capture thread
 static std::string gLine = "off"; // main thread
@@ -66,6 +68,7 @@ static OSStatus render(void *, AudioUnitRenderActionFlags *, const AudioTimeStam
     else if (ok(want + 48)) { pos = want; playing = true; g = 0; gStep = 1.0f / n; } // (re)start with a fade in, 1 ms spare
     if (!playing || !ok(pos)) {
         memset(out, 0, n * 2 * sizeof(float));
+        record::sound(out, n, th + gDevLat.load(std::memory_order_relaxed));
         if (playing) { if (pos + n * (1 + kSlew) + 2 < w) gOver++; else gUnder++; } // lapped by the writer, or ran dry
         playing = false;
         return noErr;
@@ -90,6 +93,7 @@ static OSStatus render(void *, AudioUnitRenderActionFlags *, const AudioTimeStam
     gBuf = n;
     pos = p;
     if (leave) { playing = false; gResync++; }
+    record::sound(out, n, th + gDevLat.load(std::memory_order_relaxed)); // a copy into a ring, nothing more
     return noErr;
 }
 
@@ -247,6 +251,7 @@ void retarget(double videoDelay, double trim, bool mute) {
     Dev d = devInfo(outDevice());
     // the render timestamp already includes the io buffer and safety offset, only latency + stream come after it
     double dev = d.rate > 0 ? (d.latency + d.stream) / d.rate : 0;
+    gDevLat = dev;
     // lowest delay that still has audio to read: how far ahead the device asks, one callback's worth, a late packet
     double floor = gLead.load() + gBuf.load() / (double)kRate + kMargin;
     if (floor < 0.004 || floor > 0.06) floor = 0.025; // output not running yet, or something odd

@@ -16,6 +16,7 @@
 #include "superres.h"
 #include "nets.h"
 #include "noise.h"
+#include "record.h"
 #include "renderer.h"
 #include "source.h"
 #include "update.h"
@@ -249,6 +250,12 @@ static const Tip kTips[] = {
     {"updates", 0, "asks github whether there is a newer meyra"},
     {"updatesAtLaunch", "check for updates at launch", "asks once at every start, quiet unless there is something newer"},
     {"revertUpdate", 0, "back to the version that was installed before the last update"},
+    {"record", "recording", "what is on screen goes to a .mov in the movies folder (meyra), encoded by the mac's video encoder, with the sound. the picture on screen never waits for it. while the last seconds are kept, this saves them instead"},
+    {"reckeep", "keep the last seconds", "the last 30 seconds are held in memory all the time, already encoded, and tab writes them to a file: for what just happened. an amber dot in the corner shows it is on"},
+    {"recoverlay", "overlay in recordings", "the status overlay and the hint lines are part of the file. off: the picture only, the mark in the corner is never in it"},
+    {"recsize", "recording size", "how high the file is at most. a bigger picture is scaled down on the gpu before it is encoded: smaller files, less work for the encoder. as shown: every pixel the window draws"},
+    {"recrate", "recording bitrate", "megabits a second of video. more: a bigger file, less lost in fast motion"},
+    {"recfolder", 0, "opens the folder the recordings go to"},
     {"freeze", "freeze the picture", "the newest real frame stays up and every switch but the noise filter still acts on it, to compare without it moving. the sound and the source run on"},
     {"compare:0", "compare view", "off: the finished picture alone"},
     {"compare:1", 0, "cut: the original left, the finished picture right. the original's half keeps the game's own frame rate"},
@@ -260,6 +267,7 @@ static const Tip kTips[] = {
     {"compare:7", 0, "the same middle strip of the picture from every stage, side by side: what each stage does to the same thing"},
     {"compare", "compare view", "the original against the finished picture, or every stage of the chain, on the picture"},
     {"keepres", "full screen keeps the window's resolution", "renders at the window's size and stretches that to the screen, instead of rendering at the screen's size. lighter on the gpu"},
+    {"power", 0, "off: the capture device is let go and nothing is drawn, generated or played, as if meyra were closed. the window, the settings and what the last seconds kept stay. on: the same source starts again"},
     {"vsync", "vsync", "frames wait for the display. off shows them a few ms sooner and can tear"},
     {"gamemode", "game mode", "meyra tells macos it is a game, so full screen gets game mode: more cpu and gpu priority. counts from the next start"},
     {"@orderFrontStandardAboutPanel:", 0, "version and licence"},
@@ -495,6 +503,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     if (ev.keyCode == 53 && _marking) [gApp command:@"hudmark"]; // esc: not this time
     // the number row by where the keys are, and before the letters: on a french keyboard the 4 key types an apostrophe,
     // which is the audio trim key, and a plain press must not save
+    else if (ev.keyCode == 48) { if (!ev.isARepeat) [gApp command:(ev.modifierFlags & NSEventModifierFlagShift) ? @"reckeep" : @"record"]; } // tab
     else if (ev.keyCode == 49) { if (!ev.isARepeat) [gApp command:@"freeze"]; } // space
     else if ((ev.keyCode == 36 || ev.keyCode == 76) && gSet.genModel && framegen::available() && !flyhigh::complete()) { if (!ev.isARepeat) [gApp command:[NSString stringWithFormat:@"genget:%d", gSet.genModel.load()]]; } // return: while the second generator is chosen and missing
     else if (digit >= 0) [gApp command:[NSString stringWithFormat:(ev.modifierFlags & NSEventModifierFlagShift) ? @"presetsave:%d" : @"preset:%d", digit ? digit : 10]];
@@ -508,6 +517,17 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
 @end
 
 
+// held while a source may run: the activity ends when it is given back. display sleep off too: a controller is no
+// input to the mac, the screen would dim mid-game
+static void liveActivity(bool on) {
+    static id act;
+    if (on == (act != nil)) return;
+    if (on) act = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical | NSActivityIdleDisplaySleepDisabled reason:@"live video"];
+    else { [NSProcessInfo.processInfo endActivity:act]; act = nil; }
+}
+
+static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:@"recMaxHeight"]; return v ? [v intValue] : 1080; } // as shown: 0
+
 @implementation AppDelegate {
     NSWindow *_win;
     MeyraView *_view;
@@ -517,6 +537,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     bool _sourceAudio;
     bool _hadFrames;
     bool _goingFull; // entering full screen, or in it
+    bool _off;       // turned off by hand: no source runs, the window stays
     int _framesLastSecond;
     double _fps;
     int _aspectW, _aspectH;
@@ -560,6 +581,10 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
         [NSApp terminate:nil];
         return;
     }
+    record::init(renderer::layer().device, ^(NSString *t) { [self say:t]; });
+    record::overlay([NSUserDefaults.standardUserDefaults boolForKey:@"recOverlay"]);
+    record::limit(recMaxH());
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"recKeep"]) { renderer::layer().framebufferOnly = NO; record::keep(true); }
     renderer::startThread();
     framegen::startThread();
     superres::startThread();
@@ -597,11 +622,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"gpuAwakeBack"]) awake::setFront(true);
     if (gArgs.fullscreen) { _goingFull = true; [_win toggleFullScreen:nil]; } // the will-enter callback can come after the first frame
 
-    // kept for the life of the app: the activity ends when its token goes away. display sleep off too: a controller
-    // is no input to the mac, the screen would dim mid-game
-    static id act;
-    act = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical | NSActivityIdleDisplaySleepDisabled reason:@"live video"];
-    (void)act;
+    liveActivity(true);
     [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *) { [self second]; }];
     watchDevices([self] { [self devicesChanged]; });
     [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidChangeScreenNotification object:_win queue:nil usingBlock:^(NSNotification *) { [self applyRefresh]; }];
@@ -656,6 +677,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     awake::stop();
     [self stopSource];
     renderer::stopThread();
+    record::finish(); // closes the file
     framegen::stopThread();
     superres::stopThread();
     noise::stopThread();
@@ -710,6 +732,8 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
 - (void)startSource:(const std::string &)id persist:(BOOL)persist {
     [self stopSource];
     _missingId.clear();
+    _off = false;
+    liveActivity(true);
     bool same = id == _sourceId;
     _sourceId = id;
     _sourceName = id.rfind("replay:", 0) == 0 ? "Replay" : id;
@@ -820,7 +844,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     }
 
     // what to tell the user when there is no picture
-    if (s.in > 0) {
+    if (s.in > 0 && _source) { // not the last frames of a source that was just stopped: its message stays
         if (!_hadFrames) { _hadFrames = true; [self applyRefresh]; }
         [self showMessage:nil];
     } else if (_source) {
@@ -1285,11 +1309,52 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
 
 - (void)menuAction:(NSMenuItem *)item { [self command:item.representedObject]; }
 
+// the drawn picture has to be readable to be copied, and only then: switching costs a hitch of a few frames
+static void recReadable(bool on) { renderer::layer().framebufferOnly = !on; }
+static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:@"recKeepSeconds"]; return v ? (int)fmin(300, fmax(5, [v doubleValue])) : 30; } // hidden
+
+// tab records, or saves the last seconds while those are kept. shift + tab switches between the two
+- (void)record:(NSString *)c arg:(NSString *)arg {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    int st = record::state();
+    if ([c isEqual:@"recfolder"]) {
+        [NSFileManager.defaultManager createDirectoryAtPath:record::folder() withIntermediateDirectories:YES attributes:nil error:nil];
+        [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:record::folder()]];
+    } else if ([c isEqual:@"recsize"] || [c isEqual:@"recrate"]) { // while a file is open: it ends and the next one has the new values
+        bool size = [c isEqual:@"recsize"];
+        int v = std::max(0, arg.intValue);
+        bool same = v == (size ? recMaxH() : (int)[d integerForKey:@"recMbit"]); // the one that is ticked: no new file for it
+        [d setInteger:v forKey:size ? @"recMaxHeight" : @"recMbit"];
+        if (!same) record::limit(recMaxH());
+        [self say:size ? (v ? [NSString stringWithFormat:@"recordings: at most %dp", v] : @"recordings: every pixel shown")
+                       : (v ? [NSString stringWithFormat:@"recordings: %d mbit", v] : @"recordings: bitrate by size")];
+    } else if ([c isEqual:@"recoverlay"]) {
+        BOOL on = arg.length ? arg.boolValue : ![d boolForKey:@"recOverlay"];
+        [d setBool:on forKey:@"recOverlay"];
+        record::overlay(on);
+        [self say:on ? @"recordings: with the overlay and the hint lines" : @"recordings: the picture only"];
+    } else if ([c isEqual:@"reckeep"]) {
+        BOOL on = arg.length ? arg.boolValue : st != 1;
+        [d setBool:on forKey:@"recKeep"];
+        recReadable(on);
+        record::keep(on);
+        [self say:on ? [NSString stringWithFormat:@"%@keeping the last %d s  (tab saves them, shift + tab turns this off)", st == 2 ? @"recording stopped. " : @"", recSecs()]
+                     : @"keeping the last seconds: off  (tab starts a recording)"];
+    } else if (st == 1) record::save(); // says what it saved
+    else {
+        if (st == 0 && !_source) { [self say:@"recording: no source is running"]; return; }
+        recReadable(st == 0);
+        record::toggle();
+        if (st == 0) [self say:@"recording  (tab stops it)"];
+    }
+}
+
 - (void)command:(NSString *)c {
     NSString *arg = nil;
     NSRange colon = [c rangeOfString:@":"];
     if (colon.location != NSNotFound) { arg = [c substringFromIndex:colon.location + 1]; c = [c substringToIndex:colon.location]; }
     if ([c isEqual:@"preset"]) { [self applyPreset:arg.intValue]; return; }
+    if ([c hasPrefix:@"rec"]) { [self record:c arg:arg]; return; }
     if ([c isEqual:@"presetsave"]) { [self savePreset:arg.intValue]; return; }
     if ([c isEqual:@"presetremove"]) {
         NSString *k = [NSString stringWithFormat:@"customPreset%d", arg.intValue];
@@ -1435,6 +1500,22 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     else if ([c isEqual:@"keepres"]) { gSet.keepRes = !gSet.keepRes; settingsSave("keepRes"); [_view fit]; }
     else if ([c isEqual:@"freeze"]) gSet.freeze = !gSet.freeze;
     else if ([c isEqual:@"compare"] || [c isEqual:@"compare+"] || [c isEqual:@"compare-"]) { gSet.compare = ([c isEqual:@"compare"] ? arg.intValue : gSet.compare + ([c hasSuffix:@"-"] ? 7 : 1)) & 7; settingsSave("compare"); _view.marking = NO; } // a drag is mapped by the view it started in
+    else if ([c isEqual:@"power"]) { // off: the capture device is let go, nothing is drawn, generated or played. the window and the settings stay
+        if (_off) { if (!_sourceId.empty()) [self startSource:_sourceId persist:NO]; else { _off = false; [self showMessage:@"Choose a source from the Source menu."]; } }
+        else {
+            if (record::state() == 2) [self record:@"record" arg:nil]; // closes the file
+            [self stopSource];
+            audio::stop();
+            liveActivity(false); // the mac may sleep its display again
+            _missingId.clear();
+            _off = true;
+            _fps = 0; _hadFrames = false; // the display gets its own mode back
+            gSet.freeze = false;
+            renderer::clear();
+            [self showMessage:@"Meyra is off.\nTurn it on again in the Meyra menu."];
+            [self applyRefresh];
+        }
+    }
     else if ([c isEqual:@"vsync"]) { gSet.vsync = !gSet.vsync; settingsSave("vsync"); renderer::layer().displaySyncEnabled = gSet.vsync; }
     else if ([c isEqual:@"gamemode"]) {
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -1795,6 +1876,8 @@ static void logPreset(const char *what, int n) {
                          "return  download the second generator, while it is chosen and missing\n"
                          "O  enhance on real frames only   Y  steady enhance   U  supersample\n"
                          "space  freeze the picture\n"
+                         "tab  record what is on screen: start, stop. the file goes to movies/meyra\n"
+                         "shift + tab  keep the last 30 s instead: tab then saves them\n"
                          "/  compare: original against final (cut, side by side), every stage, off   shift: back\n"
                          ".  look: off, mild, middle, strong\n"
                          "L  hud lock   K  better cut test   P  tolerant repeats   J  capture clock\n"
@@ -1826,6 +1909,8 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     NSMenu *bar = [NSMenu new];
     NSMenu *app = submenu(bar, @"Meyra");
     [app addItemWithTitle:@"About Meyra" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
+    [app addItem:item(@"Turn Meyra Off", @"power", nil)];
+    [app addItem:NSMenuItem.separatorItem];
     [app addItem:item(@"VSync", @"vsync", @"v", 0)];
     [app addItem:item(@"Game Mode in Full Screen", @"gamemode", nil)];
     [app addItem:item(@"Keep the GPU Awake (uses more power)", @"gpuawake", nil)];
@@ -1968,6 +2053,23 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     NSMenuItem *pr = item(@"Restore Built-in Presets", @"presetreset", nil);
     pr.toolTip = @"forgets the presets you saved, the built-in ones are back on every number";
     [pm addItem:pr];
+    NSMenu *rc = submenu(bar, @"Recording");
+    [rc addItem:item(@"Start Recording (Tab)", @"record", nil)];
+    [rc addItem:item(@"Keep The Last 30 Seconds (Shift + Tab)", @"reckeep", nil)];
+    [rc addItem:NSMenuItem.separatorItem];
+    NSMenu *rs = [[NSMenu alloc] initWithTitle:@"Size"], *rb = [[NSMenu alloc] initWithTitle:@"Bitrate"];
+    [rs addItem:item(@"As Shown", @"recsize:0", nil)];
+    for (NSString *h in @[@"2160", @"1440", @"1080", @"720"]) [rs addItem:item([NSString stringWithFormat:@"At Most %@p", h], [@"recsize:" stringByAppendingString:h], nil)];
+    [rb addItem:item(@"Automatic: By Size (17 Mbit/s At 720p, 37 At 1080p, 66 At 1440p)", @"recrate:0", nil)];
+    // what they look like at 1080p: a bigger picture wants more for the same
+    NSArray *rates = @[@[@"10", @"Small File, Soft In Fast Motion"], @[@"20", @"Good, Fine For Sharing"], @[@"40", @"Very Good, For Uploads"],
+                       @[@"60", @"Excellent"], @[@"100", @"Close To Lossless, Large File"]];
+    for (NSArray *m in rates) [rb addItem:item([NSString stringWithFormat:@"%@ Mbit/s: %@ (%d MB A Minute)", m[0], m[1], (int)lround([m[0] intValue] * 7.5)], [@"recrate:" stringByAppendingString:m[0]], nil)];
+    [[rc addItemWithTitle:@"Size" action:nil keyEquivalent:@""] setSubmenu:rs];
+    [[rc addItemWithTitle:@"Bitrate" action:nil keyEquivalent:@""] setSubmenu:rb];
+    [rc addItem:item(@"Include Overlay In Recordings", @"recoverlay", nil)];
+    [rc addItem:NSMenuItem.separatorItem];
+    [rc addItem:item(@"Open Recordings Folder", @"recfolder", nil)];
     NSMenu *wm = submenu(bar, @"Window");
     NSMenuItem *fs = [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
     fs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
@@ -2172,8 +2274,14 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     else if ([c isEqual:@"updates"]) enabled = !_updating;
     else if ([c isEqual:@"updatesAtLaunch"]) on = [d boolForKey:@"checkUpdatesAtLaunch"];
     else if ([c isEqual:@"vsync"]) on = gSet.vsync;
+    else if ([c isEqual:@"power"]) mi.title = _off ? @"Turn Meyra On" : @"Turn Meyra Off";
     else if ([c isEqual:@"keepres"]) on = gSet.keepRes;
     else if ([c isEqual:@"freeze"]) on = gSet.freeze;
+    else if ([c isEqual:@"record"]) { int st = record::state(); on = st == 2; mi.title = st == 1 ? [NSString stringWithFormat:@"Save The Last %d Seconds (Tab)", recSecs()] : st == 2 ? @"Stop Recording (Tab)" : @"Start Recording (Tab)"; }
+    else if ([c isEqual:@"reckeep"]) { on = record::state() == 1; mi.title = [NSString stringWithFormat:@"Keep The Last %d Seconds (Shift + Tab)", recSecs()]; }
+    else if ([c isEqual:@"recoverlay"]) on = [d boolForKey:@"recOverlay"];
+    else if ([c isEqual:@"recsize"]) on = recMaxH() == arg.intValue;
+    else if ([c isEqual:@"recrate"]) on = (int)[d integerForKey:@"recMbit"] == arg.intValue;
     else if ([c isEqual:@"compare"]) { on = gSet.compare == arg.intValue; enabled = !pass; }
     else if ([c isEqual:@"gamemode"]) {
         on = [d boolForKey:@"gameMode"];

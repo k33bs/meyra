@@ -152,6 +152,7 @@ source and all settings. everything is in the menu bar, the single keys work whi
 | window | full screen keeps the window's resolution (scaled to the screen, the ratio stays) | X | off |
 | window | freeze picture | space | off |
 | window | compare: off, original against final (left / right, above / below, diagonal, side by side, stacked), every stage | / | off |
+| recording | record what is on screen to a .mov, or keep the last 30 seconds and save them when asked | tab, shift + tab | off |
 | presets | ten sets of switches, save the current ones over one, remove one of yours, restore the built-in ones | 1 … 9, 0 | |
 | meyra | vsync | V | on |
 | meyra | game mode in full screen | | on |
@@ -195,6 +196,8 @@ work while the picture has focus. the overlay shows them too, next to what each 
 | key | comparing, presets, window, sound |
 |---|---|
 | space | freeze the picture on the newest real frame, every switch but the noise filter still acts on it |
+| tab | record what is on screen: start, stop. while the last 30 seconds are kept: save them |
+| shift + tab | keep the last 30 seconds instead of recording from start to stop, and back |
 | / | compare: original against final cut left / right, above / below, diagonal, side by side, stacked, then every stage, off (shift + / goes back) |
 | 1 … 9, 0 | presets: a whole set of picture and motion switches at once |
 | shift + number | save the switches as they are now over that preset (again to overwrite, presets > remove my preset undoes it) |
@@ -357,6 +360,21 @@ work while the picture has focus. the overlay shows them too, next to what each 
   original), and **side by side** or **stacked**, which show the same middle half of the picture twice. then every stage of
   the chain (as it came, dither removal, enhance, upscaler, look, the result) as strips, each its own part or the same part
   of the picture, named at the bottom. it draws over the finished frame, so snapshots never have it.
+- **recording** (tab): what is on screen, generated frames, compare view and all, goes to a .mov in movies/meyra: hevc from
+  the mac's video encoder, with the sound as it is played. at most 1080p high unless the recording menu says otherwise
+  (as shown, 2160p, 1440p, 720p): a bigger picture is scaled down on the gpu first. bitrate by size (37 mbit at 1080p,
+  66 at 1440p) or one picked in the menu. the file carries the tone curve the colour setting shows the window with. a red
+  dot sits in the corner meanwhile, which is never in the file, and neither are the overlay and the hint lines unless
+  the recording menu says so. the screen never waits for it: each frame is copied on the gpu and handed on, and when
+  the encoder or the disk fall behind the file loses a frame, the screen does not. measured on an m4 max, windowed
+  and full screen, standard and the heaviest preset: generated frames, late frames and generation time the same with
+  it as without, within what runs differ by anyway. starting and stopping hitches for a few frames. a change of the
+  picture's size (window size, full screen), of the size, bitrate or colour setting ends the file and goes on in a new one. it stops itself under 2 gb of
+  free disk, and a quit closes the file.
+- **keep the last 30 seconds** (shift + tab): the same, but encoded into memory all the time (about 140 mb at 1080p)
+  and written only when tab is pressed: for what just happened. an amber dot in the corner shows it is on, it turns
+  white for a moment at a save. the choice is remembered. `-recKeepSeconds N` for another length, `-recMbit N` for
+  another bitrate, `-recDir PATH` for another folder.
 - **freeze** (space): the newest real frame stays up, and every switch but the noise filter (as it was then) still acts on it: for comparing strips, nets
   or the look without the game moving. generated frames are not frozen, only real ones. sound and source run on, a
   new source lets go of it. not saved.

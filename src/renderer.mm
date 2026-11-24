@@ -12,6 +12,7 @@
 #include "framegen.h"
 #include "nets.h"
 #include "noise.h"
+#include "record.h"
 #include "superres.h"
 #include <algorithm>
 #include <array>
@@ -216,6 +217,7 @@ void applyColour() {
     CGColorSpaceRef cs = c == 2 ? NULL : CGColorSpaceCreateWithName(c == 1 ? kCGColorSpaceSRGB : kCGColorSpaceITUR_709);
     gLayer.colorspace = cs;
     if (cs) CGColorSpaceRelease(cs);
+    record::colour(c != 0);
 }
 
 void setFrameDur(double s) { if (s > 0.001 && s < 1) gFrameDur = s; }
@@ -1087,11 +1089,22 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         fin = [gDev newTextureWithDescriptor:d];
         if (fin) pass(cb, gPipeOut, src, nil, fin, (MTLViewport){0, 0, (double)fw, (double)fh, 0, 1}, u);
     }
+    // a recording takes the picture here, before the overlay, unless the overlay is wanted in it
+    bool recHud = record::withOverlay();
+    if (!recHud) record::copy(cb, dr, (int)vp.originX, (int)vp.originY, (int)fw, (int)fh);
     if (hud) {
         double m = 12 * gScale;
         double hw = fmin((double)hud.width, fw - m), hh = fmin((double)hud.height, fh - m);
         if (hw > 0 && hh > 0)
             pass(cb, gPipeHud, hud, nil, dr.texture, (MTLViewport){vp.originX + m, vp.originY + m, (double)hud.width, (double)hud.height, 0, 1}, NULL, true);
+    }
+    if (recHud) record::copy(cb, dr, (int)vp.originX, (int)vp.originY, (int)fw, (int)fh);
+    if (id<MTLTexture> mark = record::light()) { // top right, after the copy: on the screen only
+        double s = round(12 * gScale), m = round(9 * gScale), mx = round(8 * gScale); // from the top, from the right
+        if (fw > s + 2 * mx && fh > s + 2 * m) pass(cb, gPipeHud, mark, nil, dr.texture, (MTLViewport){vp.originX + fw - mx - s, vp.originY + m, s, s, 0, 1}, NULL, true);
+        id<MTLTexture> ct = record::counter(gScale); // at its own size
+        double cx = ct ? fw - mx - s - round(6 * gScale) - ct.width : 0;
+        if (ct && cx > mx && fh > ct.height + 2 * m) pass(cb, gPipeHud, ct, nil, dr.texture, (MTLViewport){vp.originX + cx, vp.originY + m + floor((s - ct.height) / 2), (double)ct.width, (double)ct.height, 0, 1}, NULL, true);
     }
 
     // every frame: when did it really reach the screen. counts alone can look perfect while the spacing is not
