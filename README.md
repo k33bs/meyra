@@ -312,7 +312,7 @@ work while the picture has focus. the overlay shows them too, next to what each 
   rectangle on the picture. inside it every generated frame takes the newer real frame's pixels, with three
   pixels of soft edge. up to 8, kept in the setting `hudRects` as parts of the picture
   (`x,y,w,h;x,y,w,h`, from the top left), so they fit any window size and full screen. clear hud areas forgets
-  them all, show hud areas outlines them (they are also outlined while marking and for a moment after). works
+  them all, show hud areas outlines them while the status overlay is on (they are also outlined while marking and for a moment after). works
   with every still-area rule, hud lock, both generators and generate at 720p; the overlay says how many are
   set. what it costs: whatever moves inside a rectangle moves at the game's own 30 there, half a step ahead of
   the picture around it, so mark tight. measured on a 60 fps clip with a burned-in overlay: see the numbers in

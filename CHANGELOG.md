@@ -1,5 +1,10 @@
 # changelog
 
+## v0.4.1
+
+- show hud areas: the outlines are only on the picture while the status overlay is on, compact or with every switch.
+  with the overlay off the picture is clean. they still show while marking and for a moment after.
+
 ## v0.4.0
 
 recording, and a switch that turns meyra off without closing it.

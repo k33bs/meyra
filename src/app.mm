@@ -192,7 +192,7 @@ static const Tip kTips[] = {
     {"hudlock", "hud lock", "pixels that stood still for over a second are taken from the real frame in generated ones, so a hud stays put (experimental)"},
     {"hudmark", "mark hud area", "the next drag on the picture marks a rectangle that always comes from the real frame in generated ones: a minimap, a health bar, subtitles. up to 8, kept as parts of the picture so they fit any window size. esc cancels"},
     {"hudclear", "hud areas", "forgets every marked rectangle"},
-    {"hudshow", "show hud areas", "outlines the marked rectangles on the picture"},
+    {"hudshow", "show hud areas", "outlines the marked rectangles on the picture while the status overlay is on, compact or with every switch. with the overlay off the picture is clean"},
     {"cuttest", "cut test", "a closer look at whether two frames are a scene cut, so no frame is generated across one. a flash does not count as a cut (experimental)"},
     {"repeattol", "tolerant repeats", "a repeated frame may differ by a few levels and still count as a repeat. for capture devices with a noisy signal (experimental)"},
     {"ptstime", "capture clock", "frames are timed by the capture device's clock instead of by when they arrived (experimental)"},
@@ -439,7 +439,7 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     }
     NSRect pr = self.pictureRect;
     CGMutablePathRef path = CGPathCreateMutable();
-    if (pr.size.width > 0 && (_marking || gSet.hudShow || nowSec() < _areasUntil))
+    if (pr.size.width > 0 && (_marking || (gSet.hudShow && gSet.overlay) || nowSec() < _areasUntil)) // shown: only with the overlay
         for (int i = 0, n = gSet.hudN; i < n; i++) {
             double x = gSet.hudRect[4 * i], y = gSet.hudRect[4 * i + 1], rw = gSet.hudRect[4 * i + 2], rh = gSet.hudRect[4 * i + 3];
             CGPathAddRect(path, NULL, CGRectMake(pr.origin.x + x * pr.size.width, NSMaxY(pr) - (y + rh) * pr.size.height, rw * pr.size.width, rh * pr.size.height));
@@ -1384,6 +1384,7 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         else if (!gSet.overlayFull) gSet.overlayFull = true;
         else { gSet.overlay = false; gSet.overlayFull = false; }
         settingsSave("overlay"); settingsSave("overlayFull");
+        [_view showAreas:0]; // the hud areas' outlines go with the overlay
     }
     else if ([c isEqual:@"framegen"]) { gSet.frameGen = !gSet.frameGen; settingsSave("frameGen"); }
     else if ([c isEqual:@"schedule"]) { gSet.early = arg ? arg.intValue != 0 : !gSet.early; settingsSave("early"); }
