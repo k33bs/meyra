@@ -138,7 +138,7 @@ void settingsLoad() {
                           @"genSmall": @NO, @"genStill": @0, @"denoise": @NO, @"noise": @0.5}];
     gSet.levels = (int)((([d integerForKey:@"levels"] % 3) + 3) % 3); // a negative number stays a place in the list
     gSet.deband = [d boolForKey:@"deband"];
-    gSet.upscale = (int)((([d integerForKey:@"upscale"] % 5) + 5) % 5);
+    { int u = (int)[d integerForKey:@"upscale"]; gSet.upscale = u == 5 ? 5 : ((u % 5) + 5) % 5; } // anything else out of range wraps as it always did
     gSet.enhance = (int)MAX(0, [d integerForKey:@"enhance"]); // a number with no net behind it counts as off
     gSet.enhanceAt = (int)((([d integerForKey:@"enhanceAt"] % 3) + 3) % 3);
     gSet.enhanceDown = (int)((([d integerForKey:@"enhanceDown"] % 2) + 2) % 2);
@@ -164,7 +164,7 @@ void settingsLoad() {
     gSet.genLateNext = [d boolForKey:@"genLateNext"];
     gSet.gpuAwake = [d boolForKey:@"gpuAwake"];
     gSet.genStill = (int)((([d integerForKey:@"genStill"] % 5) + 5) % 5);
-    gSet.genModel = (int)(([d integerForKey:@"genModel"] % 3 + 3) % 3);
+    { int g = (int)[d integerForKey:@"genModel"]; gSet.genModel = g == 3 ? 3 : (g % 3 + 3) % 3; }
     gSet.srWithGen = [d boolForKey:@"srWithGen"];
     gSet.srPad = [d boolForKey:@"srPad"];
     gSet.vsync = [d boolForKey:@"vsync"];
@@ -178,6 +178,13 @@ void settingsLoad() {
     gSet.enhanceReal = [d boolForKey:@"enhanceReal"];
     gSet.enhanceHold = [d boolForKey:@"enhanceHold"];
     gSet.superSample = [d boolForKey:@"superSample"];
+    gSet.genShift = [d boolForKey:@"genShift"];
+    gSet.genDoubt = [d boolForKey:@"genDoubt"];
+    gSet.repeatRoll = [d boolForKey:@"repeatRoll"];
+    gSet.grain = (float)fmin(1, fmax(0, [d doubleForKey:@"grain"]));
+    gSet.stabilise = [d boolForKey:@"stabilise"];
+    gSet.lateDrawable = [d boolForKey:@"lateDrawable"];
+    gSet.drawables = [d integerForKey:@"drawables"] == 2 ? 2 : 3;
     gSet.noise = fminf(1, fmaxf(0, [d floatForKey:@"noise"]));
     hudRectsParse([[d objectForKey:@"hudRects"] description].UTF8String);
     gSet.hudShow = [d boolForKey:@"hudShow"];
@@ -227,6 +234,13 @@ void settingsSave(const char *key) {
     else if ([k isEqual:@"enhanceReal"]) [d setBool:gSet.enhanceReal forKey:k];
     else if ([k isEqual:@"enhanceHold"]) [d setBool:gSet.enhanceHold forKey:k];
     else if ([k isEqual:@"superSample"]) [d setBool:gSet.superSample forKey:k];
+    else if ([k isEqual:@"genShift"]) [d setBool:gSet.genShift forKey:k];
+    else if ([k isEqual:@"genDoubt"]) [d setBool:gSet.genDoubt forKey:k];
+    else if ([k isEqual:@"repeatRoll"]) [d setBool:gSet.repeatRoll forKey:k];
+    else if ([k isEqual:@"grain"]) [d setDouble:gSet.grain forKey:k];
+    else if ([k isEqual:@"stabilise"]) [d setBool:gSet.stabilise forKey:k];
+    else if ([k isEqual:@"lateDrawable"]) [d setBool:gSet.lateDrawable forKey:k];
+    else if ([k isEqual:@"drawables"]) [d setInteger:gSet.drawables forKey:k];
     else if ([k isEqual:@"passthrough"]) [d setBool:gSet.passthrough forKey:k];
     else if ([k isEqual:@"audio"]) [d setBool:gSet.audio forKey:k];
     else if ([k isEqual:@"audioTrimMs"]) [d setDouble:round(gSet.audioTrim * 1000) forKey:k];

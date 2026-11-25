@@ -11,7 +11,7 @@
 # overridden, e.g. make SIGN="Developer ID Application: ..." for a distributable build, or make OUT=/tmp/x for a
 # second build next to one that is running.
 
-VERSION   = 0.4.1
+VERSION   = 0.5.0
 BUILD     = 1
 BUNDLE_ID = io.github.k33bs.meyra
 MIN_MACOS = 14.0
@@ -52,11 +52,11 @@ $(BIN): $(OBJ)
 	@mkdir -p $(APP)/Contents/MacOS
 	$(CXX) $(ARCH) $(OBJ) $(FW) -o $@
 
-$(APP): $(BIN) resources/Info.plist resources/Shaders.metal resources/Meyra.entitlements resources/Meyra.icns $(NETS) Makefile
+$(APP): $(BIN) resources/Info.plist resources/Shaders.metal resources/Meyra.entitlements resources/Meyra.icns resources/ravu-lite-r3.txt $(NETS) Makefile
 	@mkdir -p $(APP)/Contents/Resources
 	sed -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/' -e 's/@VERSION@/$(VERSION)/' -e 's/@BUILD@/$(BUILD)/' -e 's/@MIN_MACOS@/$(MIN_MACOS)/' \
 		resources/Info.plist > $(APP)/Contents/Info.plist
-	cp resources/Shaders.metal resources/Meyra.icns $(APP)/Contents/Resources/
+	cp resources/Shaders.metal resources/Meyra.icns resources/ravu-lite-r3.txt $(APP)/Contents/Resources/
 	@mkdir -p $(APP)/Contents/Resources/nets && rm -f $(APP)/Contents/Resources/nets/*.net
 	cp $(NETS) $(APP)/Contents/Resources/nets/
 	codesign --force --options runtime --entitlements resources/Meyra.entitlements --sign "$(SIGN)" $(APP)

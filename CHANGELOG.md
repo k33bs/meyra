@@ -1,5 +1,34 @@
 # changelog
 
+## v0.5.0
+
+a third frame generator, a sixth upscaler and a few more switches to try. all experimental and off unless you turn
+them on.
+
+- motion > frame generator > block matching: a third generator, no files to install, picked in the menu (the I key
+  still goes round apple's and the second one). blocks are matched on the gpu from coarse to fine and the two real
+  frames are moved and mixed along the vectors. edges of moving things can tear. when it cannot start, apple's takes
+  over.
+- two switches for it, under motion > frame generator: find the whole picture's shift first, for faster pans, and take
+  one side where the frames disagree, instead of a double image.
+- picture > upscaling > hashed filters: a sixth upscaler, menu only. per pixel one small trained filter from
+  ravu-lite's table, picked by the edge under it, makes the picture at twice the size, which is then brought to the
+  window. can look softer than metalfx. without a usable table it scales plain and says so in the log.
+- picture > stabilise: the frame before, moved along the picture's motion, is mixed in a little. meant to steady
+  edges, the effect is small. it steps aside while frames are generated.
+- picture > grain: fine grain in the last pass, strongest in dark and mid tones, light to full. meant to cover the
+  plastic look of areas that were cleaned out.
+- motion > skip only after a lasting backlog: without generated frames, a repeat is left out to catch up only once the
+  screen has been behind for half a second, not after one slow frame.
+- meyra menu > take the screen buffer late: the screen's buffer is asked for after the frame's gpu work is written
+  down. costs gpu time (about twice the work in one test), whether it buys delay is not measured yet.
+- meyra menu > two screen buffers instead of three: one frame less can queue before the screen. can stall when a frame
+  takes long.
+- the status overlay lists the new switches with the others, and stabilise has its own gpu time on the stages line.
+  presets turn the new picture and motion switches off.
+- the readme is a short one now, to get going. the full reference, every switch with its numbers and caveats, moved to
+  MANUAL.md.
+
 ## v0.4.1
 
 - show hud areas: the outlines are only on the picture while the status overlay is on, compact or with every switch.

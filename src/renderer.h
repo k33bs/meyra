@@ -45,9 +45,10 @@ struct Stats {
 // a generated frame, dither removal and the enhance net before the interpolator, dither removal, the net after dither
 // removal / before it / after the upscaler, sharpening before the upscaler, upscalers by lastSize's numbers
 // (kDidUp + 1 = metalfx ...), the net's picture filtered down to the window, sharpening
-enum { kDidGen, kDidPreD, kDidPreE, kDidD, kDidE0, kDidE1, kDidE2, kDidSharpFirst, kDidUp, kDidDown = kDidUp + 5, kDidSharp, kDidN };
+enum { kDidGen, kDidPreD, kDidPreE, kDidD, kDidE0, kDidE1, kDidE2, kDidSharpFirst, kDidUp, kDidDown = kDidUp + 6, kDidSharp, kDidN };
 // kStBetween: what was encoded between two of our passes without being one, the enhance net and / or metalfx
-enum { kStConvert, kStDither, kStEnhance, kStUpscale, kStBetween, kStShrink, kStSharpen, kStOverlay, kStN };
+enum { kStConvert, kStDither, kStEnhance, kStUpscale, kStBetween, kStShrink, kStSharpen, kStOverlay, kStStab, kStN };
+static_assert(kStN <= 9, "Stats::stage holds 9");
 
 bool init(NSString *shaderSource, std::string &err);
 CAMetalLayer *layer();
@@ -59,6 +60,7 @@ void setScale(double backingScale);  // main thread, for the overlay size
 void beginSource(double frameDur, bool sameSource); // before a source starts: forget the previous one (levels survive a restart of the same source)
 void setFrameDur(double sec);
 void applyColour();                  // main thread: gSet.colour changed
+void applyDrawables();               // main thread: gSet.drawables changed
 void signalChanged();                // the source's signal changed format: levels detection starts over
 // capture thread, takes over the caller's +1. pts: the frame's timestamp on the capture device's own clock in seconds
 // (any start, only its steps count), -1 without one
@@ -78,7 +80,7 @@ int snapsLeft();                     // numbered snapshots still to be saved, -1
 int chainNow();                      // the chain as it runs right now (common.h), which a schedule or a missing part can make another than the one asked for
 Stats takeStats();
 bool fullRange();
-void lastSize(int &w, int &h, int &fitW, int &fitH, int &upscaler); // upscaler that ran last: 0 none or plain, 1 metalfx, 2 apple super resolution, 3 fsr 1, 4 sgsr 1
+void lastSize(int &w, int &h, int &fitW, int &fitH, int &upscaler); // upscaler that ran last: 0 none or plain, 1 metalfx, 2 apple super resolution, 3 fsr 1, 4 sgsr 1, 5 hashed filters
 std::string extraText(int which, const Stats &s); // enhanceReal (0), enhanceHold (1), superSample (2): "off", "acting: ..." or "idle: why"
 int enhanceRan();                   // the enhance net the last frame went through, 0 = none (off, still starting, cannot run)
 double genBudgetMs();  // early schedule: how long after its real frame arrived a generated frame is due, as last planned

@@ -236,6 +236,32 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+## RAVU-Lite filter table
+
+`resources/ravu-lite-r3.txt` holds the trained filter table of RAVU-Lite r3, taken from
+`weights/ravu-lite_weights-r3.py` on the `source` branch of https://github.com/bjin/mpv-prescalers (commit
+6b9ba842a05a113a75e5a2ac3d0a7f00f21ffbae) and rewritten as plain numbers in another order by
+`tools/ravu2hash.py`. The shader that uses it (`fsHashY` in `resources/Shaders.metal`, upscale 5) is Meyra's own,
+written from the published method (RAISR, Romano, Isidoro and Milanfar, arXiv 1606.01299, and RAVU-Lite's
+bucket layout); no shader code from that repository is included. The weights file carries no notice of its own;
+the repository is licensed under the LGPL 3.0, and its generator `ravu-lite.py` carries this notice, which the
+table file keeps:
+
+Copyright (C) 2017 Bin Jin <bjin@ctrl-d.org>
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General
+Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for
+more details.
+
+The GNU Lesser General Public License version 3 consists of the GNU General Public License version 3 (see
+`LICENSE`) and the additional permissions at https://www.gnu.org/licenses/lgpl-3.0.html.
+
+SPDX-License-Identifier: LGPL-3.0-or-later
+
 ## Methods (no third-party code included)
 
 - **Sharpening** (`fsOut` in `resources/Shaders.metal`) follows the method of AMD FidelityFX Contrast Adaptive
@@ -246,8 +272,27 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   taps on rings around the pixel and keeping the average only where it is close to the pixel). No libplacebo
   code is included.
 - **Frame generation** uses Apple's VideoToolbox low latency frame interpolation, a system framework.
+- **Stabilise** (`fsStab` and the passes before it) follows the history reprojection with a neighbourhood clamp
+  of temporal anti-aliasing as described by Brian Karis (High Quality Temporal Supersampling, SIGGRAPH 2014), with
+  motion from Meyra's own block search. No code from any implementation is included.
 - **Cut test, tolerant repeats, capture clock** (`src/cadence.h`) follow methods described for Veyra
   (https://github.com/Likely7/Veyra-NRVideo, GPL-3.0): scene cuts from a 64x36 luma grid and a histogram,
   repeated frames compared within a band of 3 levels against the last new frame, and presents timed from the
   capture timestamp plus a tracked clock offset. Meyra's code is its own implementation with its own tests and
   thresholds; no Veyra code is included.
+- **Block frame generator** (`src/blocks.mm`) follows the method of the Metal shader generator in MacFrameGen
+  (https://github.com/PabloVSouza/MacFrameGen, GPL-3.0), and the order of its stages: a luma pyramid, block matching
+  on the frame in between from coarse to fine, a 3x3 vector medoid, and a per-pixel choice among a few vectors
+  including zero. It was written after reading that project's source. The kernels, the cost (the mean difference
+  taken out), the candidates, the choice rule and the numbers are Meyra's own.
+- **Picture shift and doubt in the block generator** (`src/blocks.mm`) follow methods of ZeroFG
+  (https://github.com/hy300leosquizz-ctrl/ZeroFG, Apache-2.0 or GPL-2.0-or-later): the whole picture's shift,
+  searched on the coarsest level, as a start vector for fast pans, and, per pixel, a check of whether the frame
+  before and the one after agree on what moves there, the side that does not counting less. No ZeroFG code is
+  included.
+- **Skip only after a lasting backlog** (`src/renderer.mm`) follows the idea of the frame pacer in Moonlight
+  (https://github.com/moonlight-stream/moonlight-qt, GPL-3.0): a frame is dropped to catch up only when the queue
+  has stayed behind over a window of time, not at the first late frame. No Moonlight code is included.
+- **Grain** (`grainOn` in `resources/Shaders.metal`) follows the idea of film grain synthesis as libplacebo applies
+  it (https://github.com/haasn/libplacebo, LGPL-2.1-or-later): noise added to the luma with a strength that depends
+  on the brightness. The noise and the curve are Meyra's own; no libplacebo code is included.

@@ -7,6 +7,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #include "framegen.h"
 #include "flyhigh.h"
+#include "blocks.h"
 #include "common.h"
 #include <algorithm>
 #include <atomic>
@@ -35,6 +36,7 @@ static int gRingN, gRingAt;
 static std::atomic<bool> gQuit{false};
 static dispatch_semaphore_t gStopped;
 static const double kIdleEnd = 3;         // seconds nobody asked before the session (and the neural engine) is let go
+static void ownStop() { flyhigh::stop(); blocks::stop(); } // the generators of our own, either may be up
 
 bool available() {
     static int v = -1;
@@ -47,10 +49,10 @@ bool available() {
 
 int model() {
     int m = gSet.genModel;
-    return m && flyhigh::installed() ? m : 0;
+    return m == 3 ? (blocks::refused() ? 0 : 3) : m && flyhigh::installed() ? m : 0; // 3 needs no files, only a start that worked
 }
 
-const char *modelNote() { return gSet.genModel ? flyhigh::note() : ""; }
+const char *modelNote() { return gSet.genModel == 3 ? blocks::note() : gSet.genModel ? flyhigh::note() : ""; }
 
 bool ready(int w, int h, int model) {
     gLastAsk = nowSec();
@@ -142,7 +144,7 @@ static void loop() {
         double idle = nowSec() - gLastAsk.load();
         int ww = gWantW, wh = gWantH, wm = gWantM;
         if (idle > kIdleEnd) {
-            if (gReadyM) { flyhigh::stop(); gReadyM = 0; if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; } }
+            if (gReadyM) { ownStop(); gReadyM = 0; if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; } }
             if (proc) {
                 [proc endSession];
                 proc = nil;
@@ -151,37 +153,40 @@ static void loop() {
             gState = 0; gReadyW = gReadyH = 0; // also after a failed start, so the next use tries again
             fails = restarts = 0;
             flyhigh::retry(); // a start can fail over a busy gpu, not only over its files: the next use looks again
+            blocks::retry();
             usleep(20000);
             continue;
         }
         bool other = ww != gReadyW || wh != gReadyH || wm != gReadyM;
         if (ww > 0 && other && wm) {
             // the second generator. files that turn out unusable are refused in there, model() is then 0 and the
-            // render thread asks for apple's on its next frame
+            // render thread asks for apple's on its next frame. 3: the block generator, refused when it cannot start
             @autoreleasepool {
                 if (proc) { [proc endSession]; proc = nil; }
                 if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; }
                 gState = 1;
                 double t0 = nowSec();
-                bool ok = flyhigh::start(ww, wh, wm == 2 ? 720 : 480);
+                ownStop();
+                bool ok = wm == 3 ? blocks::start(ww, wh) : flyhigh::start(ww, wh, wm == 2 ? 720 : 480);
                 if (ok) {
                     NSDictionary *a = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange), (id)kCVPixelBufferWidthKey: @(ww),
                                         (id)kCVPixelBufferHeightKey: @(wh), (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES};
                     CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)a, &dstPool);
-                    ok = dstPool != NULL;
+                    ok = dstPool != NULL || (wm == 3 && blocks::refuse("no output buffers")); // 3: apple's takes over
                 }
                 gReadyW = ww; gReadyH = wh; gReadyM = wm;
                 os_unfair_lock_lock(&gLock); gRingN = gRingAt = 0; os_unfair_lock_unlock(&gLock); gPeak = 0; // another generator or size: its times are its own
                 gState = ok ? 2 : 3;
                 fails = 0; // not restarts: this is also where a session is started again after 30 failed frames
-                logLine("frame generation %s for %dx%d, second generator at %d lines (%.0f ms)%s%s", ok ? "ready" : "unavailable", ww, wh, wm == 2 ? 720 : 480,
-                        (nowSec() - t0) * 1000, ok ? "" : ": ", ok ? "" : flyhigh::note());
+                const char *why = ok ? "" : wm == 3 ? blocks::note() : flyhigh::note();
+                logLine("frame generation %s for %dx%d, %s (%.0f ms)%s%s", ok ? "ready" : "unavailable", ww, wh, wm == 3 ? "block generator" : wm == 2 ? "second generator at 720 lines" : "second generator at 480 lines",
+                        (nowSec() - t0) * 1000, *why ? ": " : "", why);
             }
             continue;
         }
         if (ww > 0 && other && !(gState == 3 && ww == gReadyW && wh == gReadyH && wm == gReadyM)) {
             @autoreleasepool {
-                if (gReadyM) { flyhigh::stop(); gReadyM = 0; }
+                if (gReadyM) { ownStop(); gReadyM = 0; }
                 if (proc) { [proc endSession]; proc = nil; }
                 if (dstPool) { CVPixelBufferPoolRelease(dstPool); dstPool = NULL; }
                 gState = 1;
@@ -229,8 +234,8 @@ static void loop() {
             if (sizeOk && gReadyM && gWanted == r.ticket && CVPixelBufferPoolCreatePixelBuffer(NULL, dstPool, &dst) == kCVReturnSuccess) {
                 tag709(dst);
                 tried = true;
-                ok = flyhigh::generate(r.prev, r.cur, dst, r.full, r.sd);
-                if (!ok && fails == 0) logLine("frame generation: a frame failed (second generator)");
+                ok = gReadyM == 3 ? blocks::generate(r.prev, r.cur, dst, r.full, r.sd) : flyhigh::generate(r.prev, r.cur, dst, r.full, r.sd);
+                if (!ok && fails == 0) logLine("frame generation: a frame failed (%s)", gReadyM == 3 ? "block generator" : "second generator");
             } else if (sizeOk && gWanted == r.ticket && CVPixelBufferPoolCreatePixelBuffer(NULL, dstPool, &dst) == kCVReturnSuccess) {
                 tag709(dst);
                 VTFrameProcessorFrame *fp = [[VTFrameProcessorFrame alloc] initWithBuffer:r.prev presentationTimeStamp:CMTimeMake(0, 30000)];
@@ -269,7 +274,7 @@ static void loop() {
             dispatch_semaphore_signal(gDone);
         }
     }
-    if (gReadyM) flyhigh::stop();
+    if (gReadyM) ownStop();
     if (proc) [proc endSession];
     if (dstPool) CVPixelBufferPoolRelease(dstPool);
     os_unfair_lock_lock(&gLock);

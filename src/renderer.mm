@@ -72,6 +72,8 @@ static const int kDarkLuma = 10, kDarkSamples = 3, kDarkFrames = 5; // of the 20
 static std::atomic<bool> gFullSeen{false};
 static std::atomic<int> gDarkFrames{0};
 static std::atomic<double> gQueueLag{0};   // from handing a frame to the display to it being on screen, last frame
+static std::atomic<double> gLagSeen{0};   // when a present last reported
+static std::atomic<double> gLagSince{0};  // repeatRoll: when the display's queue went behind and has not been under two frame times since, 0 = not behind
 static std::atomic<int> gLagRun{0};        // frames in a row for which that was over two and a half frame times (up to two is normal, by where the refresh falls): the display's queue has backed up and stays so
 // drain (hidden, -drain NO: as before): plain passthrough sheds a backlog too, see tick. genDrain (hidden, off): frame
 // generation tries the same, see genDrain()
@@ -212,6 +214,7 @@ void setScale(double s) { gScale = s > 0 ? s : 1; }
 // the layer's colour space tells macos what the numbers mean. bt.709 is what the source says they are, but macos
 // reads its tone curve as a camera's and the picture comes out flatter than on a tv. srgb gives the contrast a tv
 // has. none at all leaves the numbers to the screen: most saturated, and different on every screen
+void applyDrawables() { gLayer.maximumDrawableCount = gSet.drawables == 2 ? 2 : 3; }
 void applyColour() {
     int c = gSet.colour;
     CGColorSpaceRef cs = c == 2 ? NULL : CGColorSpaceCreateWithName(c == 1 ? kCGColorSpaceSRGB : kCGColorSpaceITUR_709);
@@ -307,6 +310,7 @@ static void stInit() {
     logLine("stage times: %s", can ? "on" : "this gpu takes no timestamps at pass boundaries, off");
 }
 static void stSample(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> pipe, MTLRenderPassDescriptor *rp);
+static bool gStInStab; // stabilise's passes are being encoded: their own stage
 
 static void pass(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> pipe, id<MTLTexture> src, id<MTLTexture> src2, id<MTLTexture> dst, MTLViewport vp,
                  const void *u, bool keepDst = false, id<MTLTexture> src3 = nil, id<MTLTexture> src4 = nil, id<MTLTexture> src5 = nil, id<MTLTexture> src6 = nil,
@@ -368,7 +372,7 @@ static void stSample(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> pipe, M
     }
     StCtx *c = gStCtx.get();
     if (!c || c->n >= kStPasses) return;
-    c->st[c->n] = pipe == gPipeDeband ? kStDither : pipe == gPipeOut || pipe == gPipeLook ? kStSharpen : pipe == gPipeHud || pipe == gPipeCut ? kStOverlay : pipe == gPipeDown ? kStShrink
+    c->st[c->n] = gStInStab ? kStStab : pipe == gPipeDeband ? kStDither : pipe == gPipeOut || pipe == gPipeLook ? kStSharpen : pipe == gPipeHud || pipe == gPipeCut ? kStOverlay : pipe == gPipeDown ? kStShrink
                 : pipe == gPipeYuv || pipe == gPipeNv || pipe == gPipeNvFix || pipe == gPipeNvFixLock || pipe == gPipeNvFixHud || pipe == gPipeNvFixLockHud || pipe == gPipeBackY || pipe == gPipeBackC ? kStConvert : kStUpscale; // easu, sgsr, apple's tiles
     MTLRenderPassSampleBufferAttachmentDescriptor *a = rp.sampleBufferAttachments[0];
     a.sampleBuffer = c->buf;
@@ -491,7 +495,7 @@ static id<MTLFXSpatialScaler> gSsScaler;
 static id<MTLTexture> gSsBig, gSsOut;
 static size_t gSsFor[4];
 static bool gSsFxTried;
-enum { kSsOff = 0, kSsOn, kSsSmall, kSsNet, kSsPlain, kSsApple, kSsTooBig, kSsNoFx, kSsNoMem };
+enum { kSsOff = 0, kSsOn, kSsSmall, kSsNet, kSsPlain, kSsApple, kSsTooBig, kSsNoFx, kSsNoMem, kSsHash };
 // ready to scale W x H to twice fw x fh with upscaler `up` (1 metalfx, 3 fsr 1, 4 sgsr 1)? else why not
 static int ssReady(size_t W, size_t H, size_t fw, size_t fh, int up) {
     if (2 * fw > 16384 || 2 * fh > 16384) return kSsTooBig; // the largest texture there is
@@ -537,7 +541,7 @@ std::string extraText(int which, const Stats &s) {
     } else if (which == 2 && gSet.superSample) {
         static const char *const kWhy[] = {"idle: no picture yet", "", "idle: the picture is not larger than the source", "idle: the enhance net makes the picture", "idle: plain scaling has nothing to gain",
                                            "idle: apple super resolution already scales past the window", "idle: twice the window is more than a texture holds",
-                                           "idle: metalfx cannot scale to twice the window", "idle: no memory for twice the window"};
+                                           "idle: metalfx cannot scale to twice the window", "idle: no memory for twice the window", "idle: the hashed filters make their own 2x picture"};
         int why = gSsWhy;
         if (gSet.passthrough) snprintf(b, sizeof b, "idle: passthrough");
         else if (why == kSsOn) snprintf(b, sizeof b, "acting: %dx%d -> %dx%d", gSsW.load(), gSsH.load(), gSsW / 2, gSsH / 2);
@@ -741,6 +745,173 @@ static const float kLook[3][34] = {
 static CVPixelBufferRef gFrozen; // render thread: the frame a freeze holds
 static void thaw() { if (gFrozen) CVPixelBufferRelease(gFrozen); gFrozen = NULL; }
 
+// upscale 5 and stabilise: their shaders are in src/hashstab.mm and built the first time one of them is used, not at
+// start. if that fails it is logged once and both stay off for the session
+extern NSString *const kHashStabKernels;
+static id<MTLRenderPipelineState> gPipeHashY, gPipeHashUp, gPipeStabQ, gPipeStabC, gPipeStabCPick, gPipeStabF, gPipeStabPick, gPipeStab;
+static int gHashStabOk; // 0 not tried yet, 1 ready, -1 failed
+static bool hashStabPipes() {
+    if (gHashStabOk) return gHashStabOk > 0;
+    gHashStabOk = -1;
+    NSError *e = nil;
+    id<MTLLibrary> lib = [gDev newLibraryWithSource:kHashStabKernels options:nil error:&e];
+    if (!lib) { logLine("hashed filters, stabilise: shaders did not compile, off for this session: %s", e.localizedDescription.UTF8String ?: "?"); return false; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+    id<MTLRenderPipelineState> __strong *p[] = {&gPipeHashY, &gPipeHashUp, &gPipeStabQ, &gPipeStabC, &gPipeStabCPick, &gPipeStabF, &gPipeStabPick, &gPipeStab};
+    NSString *n[] = {@"fsHashY", @"fsHashUp", @"fsStabQ", @"fsStabCoarse", @"fsStabCoarsePick", @"fsStabFine", @"fsStabPick", @"fsStab"};
+    MTLPixelFormat f[] = {MTLPixelFormatRGBA16Float, MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm, MTLPixelFormatR16Float, MTLPixelFormatBGRA8Unorm,
+                          MTLPixelFormatRGBA16Float, MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm};
+    for (int i = 0; i < 8; i++) {
+        pd.colorAttachments[0].pixelFormat = f[i];
+        pd.fragmentFunction = [lib newFunctionWithName:n[i]];
+        if (!(*p[i] = [gDev newRenderPipelineStateWithDescriptor:pd error:&e])) { logLine("hashed filters, stabilise: no pipeline %s, off for this session", n[i].UTF8String); return false; }
+    }
+    gHashStabOk = 1;
+    return true;
+}
+
+// upscale 5, hashed filters (fsHashY): the table is read from Resources/ravu-lite-r3.txt (tools/ravu2hash.py) on first
+// use. the 2x picture goes to the window as a net's does (enhanceDown), or on through the last pass when the window is
+// larger still. nothing here is made while the setting is something else
+static id<MTLTexture> gHashLut, gHashY, gHash2, gHashDown;
+static bool gHashTried;
+static id<MTLTexture> hashLut() {
+    if (gHashTried) return gHashLut;
+    gHashTried = true;
+    NSString *f = [NSBundle.mainBundle pathForResource:@"ravu-lite-r3" ofType:@"txt"];
+    NSString *s = f ? [NSString stringWithContentsOfFile:f encoding:NSUTF8StringEncoding error:nil] : nil;
+    std::vector<float> v(13 * 289 * 4, 0.0f); // a row per bucket, the last: strength steps, coherence steps, gaussian rows
+    int rows = 0, bad = 0, head = 0, have = 0;
+    for (NSString *line in [s componentsSeparatedByString:@"\n"]) {
+        const char *p = line.UTF8String;
+        float *d = NULL;
+        int want = 0, stride = 1;
+        if (!strncmp(p, "meyra-hash ", 11)) head = strcmp(p + 11, "1") ? -1 : 1; // another version: not read
+        else if (!strncmp(p, "w ", 2)) { d = rows < 288 ? &v[rows * 52] : NULL; want = 52; rows++; }
+        else if (!strncmp(p, "strength ", 9)) { d = &v[288 * 52]; want = 3; have |= 1; }
+        else if (!strncmp(p, "coherence ", 10)) { d = &v[288 * 52 + 4]; want = 2; have |= 2; }
+        else if (!strncmp(p, "gauss ", 6)) { d = &v[288 * 52 + 8]; want = 9; stride = 4; have |= 4; } // three to a texel
+        if (!want) continue;
+        p = strchr(p, ' ');
+        int got = 0;
+        for (char *e; got < want; got++, p = e) {
+            float x = strtof(p, &e);
+            if (e == p) break;
+            if (d) d[stride == 4 ? got / 3 * 4 + got % 3 : got] = x;
+        }
+        if (got != want || !d) bad++;
+    }
+    if (head != 1 || rows != 288 || have != 7 || bad) { logLine("hashed filters: no usable table in Resources/ravu-lite-r3.txt, plain scaling instead"); return nil; } // without the steps every pixel would take one bucket
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:13 height:289 mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    gHashLut = [gDev newTextureWithDescriptor:d];
+    [gHashLut replaceRegion:MTLRegionMake2D(0, 0, 13, 289) mipmapLevel:0 withBytes:v.data() bytesPerRow:13 * 16];
+    return gHashLut;
+}
+// src (W x H) to fw x fh by way of the filters' 2x picture. nil without a table or its shaders
+static id<MTLTexture> hashUp(id<MTLCommandBuffer> cb, id<MTLTexture> src, size_t fw, size_t fh) {
+    size_t W = src.width, H = src.height;
+    if (!hashStabPipes() || !hashLut()) return nil;
+    if (!gHashY || gHashY.width != W || gHashY.height != H) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:W height:H mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        gHashY = [gDev newTextureWithDescriptor:d];
+        gHash2 = makeTex(2 * W, 2 * H, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    }
+    if (!gHashY || !gHash2) return nil;
+    pass(cb, gPipeHashY, src, gHashLut, gHashY, (MTLViewport){0, 0, (double)W, (double)H, 0, 1}, NULL);
+    pass(cb, gPipeHashUp, src, gHashY, gHash2, (MTLViewport){0, 0, 2.0 * W, 2.0 * H, 0, 1}, NULL);
+    if (fw >= 2 * W && fh >= 2 * H) return gHash2;
+    if (!gHashDown || gHashDown.width != fw || gHashDown.height != fh) gHashDown = makeTex(fw, fh, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead); // its own: a net after it shrinks into gDown
+    if (!gHashDown) return gHash2;
+    float du[4] = {0.5f / W, 0.5f / H, (float)gSet.enhanceDown, 0};
+    pass(cb, gPipeDown, gHash2, nil, gHashDown, (MTLViewport){0, 0, (double)fw, (double)fh, 0, 1}, du);
+    return gHashDown;
+}
+
+// stabilise (fsStab), real frames at source size after dither removal. the motion comes from a block search in the
+// shaders: there are no vectors on this path (vtme lives in the prediction prototype, ~2 ms of the encoder block). a
+// real frame shown again (a repeat, the held frame of a pair) takes its result as it was, a generated frame passes
+// untouched and leaves the history alone. the two results are kept with their frames: the run ahead for enhanceReal
+// can make the newer one before the older frame is shown (again). a frame is known by a number put on it, not by
+// holding it, so the source's pool stays whole. the render thread takes the number off every buffer that comes in
+// (startThread), and our own pools hand theirs out bare, so a number on a frame was put there during this stay, and a
+// match is the same picture shown again. numbers only grow, a dropped history never matches an old one
+static const CFStringRef kStabKey = CFSTR("MeyraStab");
+static id<MTLTexture> gStabQ[2], gStabH[2], gStabC, gStabF, gStabV; // quarter size luma and results, newest at gStabCur. the search's steps, block moves
+static int gStabCur;
+static long gStabNo, gStabOf[2]; // the numbers of the frames the results are of, 0 none
+static bool gStabHad[2];         // the result had a frame before to go with
+static double gStabAt;
+static size_t gStabNoW, gStabNoH; // its textures could not be had at this size: not tried again until the size or the switch changes
+static const float kStabW = 0.3f; // the most the frame before may have of a pixel
+static void stabDrop() {
+    gStabOf[0] = gStabOf[1] = 0;
+    gStabNoW = gStabNoH = 0;
+    gStabQ[0] = gStabQ[1] = gStabH[0] = gStabH[1] = gStabC = gStabF = gStabV = nil;
+}
+static id<MTLTexture> stabilise(id<MTLCommandBuffer> cb, id<MTLTexture> src, CVPixelBufferRef key) {
+    size_t W = src.width, H = src.height;
+    if (!hashStabPipes() || (W == gStabNoW && H == gStabNoH)) return src;
+    if (gStabH[0] && (gStabH[0].width != W || gStabH[0].height != H || (gStabH[0].usage & gInUse) != gInUse)) stabDrop();
+    long no = 0;
+    if (CFTypeRef a = CVBufferCopyAttachment(key, kStabKey, NULL)) {
+        if (CFGetTypeID(a) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)a, kCFNumberLongType, &no);
+        CFRelease(a);
+    }
+    // frozen: the chain runs every time so that changes show, the frame's result is made again from the same frame before
+    bool again = gSet.freeze && no && no == gStabOf[gStabCur];
+    if (!gSet.freeze) for (int i = 0; i < 2; i++) if (gStabOf[i] && (no == gStabOf[i] || (gRepeatNow && i == gStabCur))) return gStabH[i];
+    if (!gStabH[0]) {
+        for (int i = 0; i < 2; i++) {
+            gStabH[i] = makeTex(W, H, gInUse); // can be metalfx's input
+            gStabQ[i] = makeTex(W / 4, H / 4, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+        }
+        size_t bw = (W + 15) / 16, bh = (H + 15) / 16;
+        MTLPixelFormat cf[2] = {MTLPixelFormatR16Float, MTLPixelFormatRGBA16Float};
+        for (int i = 0; i < 2; i++) {
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:cf[i] width:bw * (i ? 6 : 13) height:bh * (i ? 5 : 13) mipmapped:NO];
+            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            d.storageMode = MTLStorageModePrivate;
+            (i ? gStabF : gStabC) = [gDev newTextureWithDescriptor:d];
+        }
+        gStabV = makeTex(bw, bh, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+        if (!gStabH[0] || !gStabH[1] || !gStabQ[0] || !gStabQ[1] || !gStabC || !gStabF || !gStabV) {
+            stabDrop();
+            gStabNoW = W; gStabNoH = H;
+            logLine("stabilise: no memory for %zux%zu, off at this size", W, H);
+            return src;
+        }
+    }
+    int n = again ? gStabCur : gStabCur ^ 1, o = n ^ 1;
+    bool had = again ? gStabHad[n] : gStabOf[o] && nowSec() - gStabAt < 0.25; // not after a pause: that history is of something else
+    id<MTLTexture> h = had ? gStabH[o] : src;
+    gStInStab = true;
+    pass(cb, gPipeStabQ, src, nil, gStabQ[n], (MTLViewport){0, 0, (double)(W / 4), (double)(H / 4), 0, 1}, NULL);
+    if (had) {
+        pass(cb, gPipeStabC, gStabQ[n], gStabQ[o], gStabC, (MTLViewport){0, 0, (double)gStabC.width, (double)gStabC.height, 0, 1}, NULL);
+        pass(cb, gPipeStabCPick, gStabC, nil, gStabV, (MTLViewport){0, 0, (double)gStabV.width, (double)gStabV.height, 0, 1}, NULL);
+        pass(cb, gPipeStabF, gStabV, src, gStabF, (MTLViewport){0, 0, (double)gStabF.width, (double)gStabF.height, 0, 1}, NULL, false, h);
+        pass(cb, gPipeStabPick, gStabF, nil, gStabV, (MTLViewport){0, 0, (double)gStabV.width, (double)gStabV.height, 0, 1}, NULL);
+    }
+    float su[4] = {1.0f / W, 1.0f / H, had ? kStabW : 0, 0};
+    pass(cb, gPipeStab, src, h, gStabH[n], (MTLViewport){0, 0, (double)W, (double)H, 0, 1}, su, false, gStabV);
+    gStInStab = false;
+    if (again) return gStabH[n];
+    if (!no) {
+        no = ++gStabNo;
+        CFNumberRef c = CFNumberCreate(NULL, kCFNumberLongType, &no);
+        CVBufferSetAttachment(key, kStabKey, c, kCVAttachmentMode_ShouldNotPropagate);
+        CFRelease(c);
+    }
+    gStabOf[n] = no; gStabHad[n] = had;
+    gStabAt = nowSec();
+    gStabCur = n;
+    return gStabH[n];
+}
+
 static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NULL, CVPixelBufferRef prevReal = NULL, bool onlyScale = false, bool onlyNet = false) {
     // freeze: whatever is due, the same real frame goes through the chain and up. the source and the timing run on
     if (gSet.freeze) {
@@ -778,7 +949,9 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     auto drop = [&] { if (t0) CFRelease(t0); if (t1) CFRelease(t1); if (r0) CFRelease(r0); if (r1) CFRelease(r1); if (p0) CFRelease(p0); };
     if (!t0 || (nv && !t1)) { drop(); return; }
     double tdr = nowSec();
-    id<CAMetalDrawable> dr = onlyScale || onlyNet ? nil : [gLayer nextDrawable]; // may block, fine on this thread
+    // lateDrawable: the screen's buffer is asked for further down, when the chain's gpu work is already on its way
+    bool late = gSet.lateDrawable && !onlyScale && !onlyNet;
+    id<CAMetalDrawable> dr = onlyScale || onlyNet || late ? nil : [gLayer nextDrawable]; // may block, fine on this thread
     tdr = (nowSec() - tdr) * 1000;
     os_unfair_lock_lock(&gLock);
     if (tdr > gS.drawableMax) gS.drawableMax = tdr;
@@ -795,11 +968,12 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         for (size_t i = 0; i < gSnapWant.size(); i++) if (gSnapWant[i].first == snapNo && gSnapWant[i].second == (real != NULL)) snapAt = (int)i;
     }
     os_unfair_lock_unlock(&gLock);
-    if (!dr && !((onlyScale || onlyNet) && gFitW)) { drop(); return; }
+    if (!dr && !late && !((onlyScale || onlyNet) && gFitW)) { drop(); return; }
 
-    size_t dw = dr ? dr.texture.width : gFitW, dh = dr ? dr.texture.height : gFitH;
+    CGSize ls = late ? gLayer.drawableSize : CGSizeZero; // what the buffer will measure, a resize in between is caught below
+    size_t dw = dr ? dr.texture.width : late ? (size_t)ls.width : gFitW, dh = dr ? dr.texture.height : late ? (size_t)ls.height : gFitH;
     size_t fw = dw, fh = dh;
-    if (dr) fitSize(dw, dh, W, H, fw, fh); // without a drawable the size is the last fit as it is: fitting it again shifts it by a pixel or two and every call would rebuild the pipeline
+    if (dr || late) fitSize(dw, dh, W, H, fw, fh); // without a drawable the size is the last fit as it is: fitting it again shifts it by a pixel or two and every call would rebuild the pipeline
     if (fw < 2 || fh < 2) { drop(); return; }
     prepare(W, H, fw, fh);
     if (!gRgb || !gFlat) { drop(); return; }
@@ -889,6 +1063,13 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         id<MTLTexture> flat = big ? gFlat2 : gFlat;
         if (flat) { pass(cb, gPipeDeband, src, nil, flat, (MTLViewport){0, 0, (double)flat.width, (double)flat.height, 0, 1}, db); src = flat; cmp.push_back({"dither removal", src}); }
     }
+    // not while frames are generated: only the real ones would be steadied, and the picture would change between
+    // steadied and not at the screen's rate
+    static double genAt;
+    if (real) genAt = nowSec();
+    bool stabNow = gSet.stabilise && !gSet.passthrough && nowSec() - genAt > 0.25;
+    if (stabNow && !real && src.width == W && src.height == H && !(onlyNet && net)) { id<MTLTexture> t = stabilise(cb, src, raw); if (t != src) cmp.push_back({"stabilise", src = t}); }
+    else if ((gStabH[0] || gStabNoW) && !stabNow) stabDrop();
     if (en && at == 0 && (net = runNet(src))) { src = net; cmp.push_back({"enhance", src}); }
     if (!onlyNet) {
     if ((ch & kSharpFirst) && effSharpen() > 0) { // chain SU: sharpen what the upscaler is given, the last pass then only resamples
@@ -933,7 +1114,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     // and is filtered down (fsTiles), a 2x net's picture is not the upscaler's
     int ss = kSsOff;
     if (gSet.superSample && !gSet.passthrough)
-        ss = !(fw > W && fh > H) ? kSsSmall : net && net.width > W ? kSsNet : up == 0 ? kSsPlain : up == 2 || ran == 2 ? kSsApple : ssReady(W, H, fw, fh, up);
+        ss = !(fw > W && fh > H) ? kSsSmall : net && net.width > W ? kSsNet : up == 5 ? kSsHash : up == 0 ? kSsPlain : up == 2 || ran == 2 ? kSsApple : ssReady(W, H, fw, fh, up);
     if (gSsBig && ss != kSsOn) { gSsScaler = nil; gSsBig = nil; gSsOut = nil; gSsFor[0] = 0; }
     gSsWhy = ss; gSsW = (int)(2 * fw); gSsH = (int)(2 * fh);
     if (ss == kSsOn) {
@@ -955,6 +1136,9 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         float eu[4] = {1.0f / W, 1.0f / H, 0, 0};
         if (gEdge) { pass(cb, up == 3 ? gPipeEasu : gPipeSgsr, src, nil, gEdge, (MTLViewport){0, 0, (double)fw, (double)fh, 0, 1}, eu); src = gEdge; ran = up; }
     }
+    if (up == 5 && fw > W && fh > H) {
+        if (id<MTLTexture> t = hashUp(cb, src, fw, fh)) { if (t == gHashDown) { cmp.push_back({"hashed 2x", gHash2}); did |= 1u << kDidDown; } src = t; ran = 5; }
+    } else if (gHash2) gHashY = gHash2 = gHashDown = nil;
     if (up >= 1 && up <= 2 && !ran && gScaler) { // also the fallback while super resolution starts, cannot take the size or runs late
         gScaler.colorTexture = src;
         gScaler.outputTexture = gUp;
@@ -962,7 +1146,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         src = gUp;
         ran = 1;
     }
-    static const char *const kUpN[] = {"", "metalfx", "apple sr", "fsr 1", "sgsr 1"};
+    static const char *const kUpN[] = {"", "metalfx", "apple sr", "fsr 1", "sgsr 1", "hashed"};
     gInfoUp = ran;
     if (en && at == 2 && (net = runNet(src))) {
         if (!cmp.empty() && cmp.back().second != src) cmp.push_back({ran ? kUpN[ran] : "resized", src});
@@ -992,8 +1176,26 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
             if (!cmp.empty()) cmp.push_back({"look", src});
         }
     }
-    MTLViewport vp = {(double)((dw - fw) / 2), (double)((dh - fh) / 2), (double)fw, (double)fh, 0, 1};
+    if (late) {
+        timed(cb);
+        [cb commit];
+        id<MTLCommandBuffer> first = cb;
+        double t = nowSec();
+        dr = [gLayer nextDrawable];
+        t = (nowSec() - t) * 1000;
+        os_unfair_lock_lock(&gLock);
+        if (t > gS.drawableMax) gS.drawableMax = t;
+        os_unfair_lock_unlock(&gLock);
+        if (!dr) { [first waitUntilCompleted]; drop(); return; } // the frames are in use until then
+        dw = dr.texture.width; dh = dr.texture.height; // resized in between: this one frame is squeezed into what there is
+        if (fw > dw) fw = dw;
+        if (fh > dh) fh = dh;
+        cb = [gQueue commandBuffer];
+    }
+    MTLViewport vp = {(double)((dw > fw ? dw - fw : 0) / 2), (double)((dh > fh ? dh - fh : 0) / 2), (double)fw, (double)fh, 0, 1};
     float u[4] = {1.0f / src.width, 1.0f / src.height, (ch & kPostS) && !(ch & kSharpFirst) ? effSharpen() : 0, 0};
+    float grain = gSet.passthrough ? 0 : gSet.grain.load();
+    if (grain > 0) { static uint32_t n; u[3] = (float)(n++ & 1023) + fminf(grain, 0.999f); } // frame number and strength in one float, see grainOn
     pass(cb, gPipeOut, src, nil, dr.texture, vp, u);
     // compare view. 1 to 5: the original against the result, see below. 6 and 7: the picture in strips, left to right as
     // the chain goes, each from one stage further on. 6: every strip its own part of the picture. 7: the middle strip of
@@ -1012,7 +1214,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
             MTLViewport v = vp;
             if (cm == 7) v.originX = round(vp.originX + i * sw - (fw - sw) / 2); // the picture's middle strip lands in this one
             id<MTLTexture> t = cmp[i].second;
-            float cu[4] = {1.0f / t.width, 1.0f / t.height, i + 1 == n ? u[2] : 0, 0};
+            float cu[4] = {1.0f / t.width, 1.0f / t.height, i + 1 == n ? u[2] : 0, i + 1 == n ? u[3] : 0}; // the result with its grain
             pass(cb, gPipeOut, t, nil, dr.texture, v, cu, true);
             gScOn = false;
             names += (i ? "|" : ""); names += cmp[i].first;
@@ -1036,7 +1238,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
                 MTLViewport v = vp;
                 double off = round((across ? fh : fw) / 4.0) * (second ? 1 : -1);
                 if (twice) { if (across) v.originY += off; else v.originX += off; }
-                float cu[4] = {1.0f / t.width, 1.0f / t.height, sharp, 0};
+                float cu[4] = {1.0f / t.width, 1.0f / t.height, sharp, second ? u[3] : 0};
                 pass(cb, gPipeOut, t, nil, dr.texture, v, cu, true);
                 gScOn = false;
             };
@@ -1075,7 +1277,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     // not while apple super resolution is asked for and something else scaled this frame (still starting, late): the
     // snapshot waits for the frame's next time round
     if (snapAt >= 0 && !(up == 2 && ran != 2 && fw > W && fh > H && !srYields() && superres::available() && !gInfoNet)) {
-        static const char *const kRan[] = {"plain", "metalfx", "apple sr", "edge-aware fsr 1", "edge-aware sgsr 1"};
+        static const char *const kRan[] = {"plain", "metalfx", "apple sr", "edge-aware fsr 1", "edge-aware sgsr 1", "hashed filters"};
         NSString *name = [NSString stringWithFormat:@"f%03d%s", snapNo, real ? "g" : ""];
         os_unfair_lock_lock(&gLock);
         if (snapAt < (int)gSnapWant.size()) gSnapWant.erase(gSnapWant.begin() + snapAt);
@@ -1087,7 +1289,8 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:fw height:fh mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         fin = [gDev newTextureWithDescriptor:d];
-        if (fin) pass(cb, gPipeOut, src, nil, fin, (MTLViewport){0, 0, (double)fw, (double)fh, 0, 1}, u);
+        float su[4] = {u[0], u[1], u[2], 0}; // without the grain: a snapshot is the same every time
+        if (fin) pass(cb, gPipeOut, src, nil, fin, (MTLViewport){0, 0, (double)fw, (double)fh, 0, 1}, su);
     }
     // a recording takes the picture here, before the overlay, unless the overlay is wanted in it
     bool recHud = record::withOverlay();
@@ -1118,6 +1321,10 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         if (lr && pt > 0) lr->presented = sinceStart(pt);
         if (pt > 0) { gQueueLag = pt - handed; if (pt - handed > 2.5 * dur) gLagRun++; else gLagRun = 0; }
         else gLagRun = 0; // not on a screen: nothing known
+        // behind from two frame times on, no longer behind under one and a half: a queue that sits at the line must not start the clock again at every frame
+        double ls = gLagSince, lag = pt > 0 ? pt - handed : 0;
+        gLagSince = lag > 2.0 * dur ? (ls > 0 ? ls : pt) : lag > 1.5 * dur ? ls : 0;
+        gLagSeen = nowSec();
         os_unfair_lock_lock(&gLock);
         if (pt <= 0) gS.notShown++;
         else {
@@ -1579,11 +1786,13 @@ static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, 
         // backed up, one repeat is left out to drain a place. passthrough too (gDrain), see below
         static double lastSkip;
         double now = CACurrentMediaTime();
-        bool backed = gQueueLag > 2.0 * gFrameDur && now - lastSkip > 0.25;
+        // repeatRoll: not at the first late frame, only when it has been behind for half a second without once coming back
+        double ls = gLagSince; // once: the handler may clear it in between. not on old news: presents that stopped say nothing
+        bool backed = (gSet.repeatRoll ? ls > 0 && now - ls > 0.5 && now - gLagSeen < 0.25 : gQueueLag > 2.0 * gFrameDur) && now - lastSkip > 0.25;
         // passthrough used to be exempt, and sat on a backlog for good: 57 to 80 ms to the screen where the picture chain
         // had 25, and 8 to 17 ms of every frame spent waiting for a drawable. the repeat left out is the frame already
         // on screen, so it now drains too (-drain NO: as before)
-        if ((!gSet.passthrough || gDrain) && repeat && !changed && !display::variable() && backed) { lastSkip = now; if (gSet.passthrough) bump(&Stats::drained); CFRelease(pb); return; }
+        if ((!gSet.passthrough || gDrain) && repeat && !changed && !display::variable() && backed) { lastSkip = now; if (gSet.passthrough || gSet.repeatRoll) bump(&Stats::drained); CFRelease(pb); return; }
         // noise filter: the frame goes the 420v way and show() waits for the filter (~10 ms later on screen). its
         // repeats show the same filtered frame again, the raw one next to it would flicker
         if (ch & (kPreN | kPreNSide)) {
@@ -1870,6 +2079,7 @@ void startThread() {
                 os_unfair_lock_unlock(&gLock);
                 if (gClearReq.exchange(false) && !pb) { framegen::cancel(); dropHeld(); clearNow(); }
                 double t = nowSec();
+                if (pb && gStabNo) CVBufferRemoveAttachment(pb, kStabKey); // stabilise: a buffer the source hands out again starts without its old number
                 if (pb) tick(pb, arrival, when, repeat, changed);
                 if (gAheadWait && framegen::done()) { gAheadWait = false; if (curNv) netAhead(curNv); }
                 if (gNextDue > 0) runDue();
@@ -2001,7 +2211,7 @@ bool init(NSString *shaderSource, std::string &err) {
     gLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     gLayer.framebufferOnly = YES;
     gLayer.opaque = YES;
-    gLayer.maximumDrawableCount = 3;
+    gLayer.maximumDrawableCount = gSet.drawables == 2 ? 2 : 3;
     gLayer.displaySyncEnabled = gSet.vsync; // off is ~5 ms faster but tears
     gLayer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
     applyColour();

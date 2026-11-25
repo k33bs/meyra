@@ -286,13 +286,29 @@ fragment float4 fsLook(V in [[stage_in]], texture2d<float> t [[texture(0)]], con
     return float4(saturate(mix(g[i], g[i + 1], x - i) + g[33] * (c - y)), 1);
 }
 
+// grain, the last thing done to the picture. code (u.pad): 0 off, else the frame number in the whole part and the strength
+// (0..1) in the fraction. luma only, from two hashed draws (triangular, zero mean) per pixel, new for every frame. scaled by the
+// pixel's own brightness like av1 grain: nothing at black, full from the shadows through the mids, fading out towards white
+static float3 grainOn(float3 c, float2 p, float code) {
+    if (code <= 0) return c;
+    uint2 q = uint2(p);
+    uint h = uint(code) * 0x9e3779b1u + q.x * 0x85ebca6bu + q.y * 0xc2b2ae35u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    uint h2 = h * 0x2c1b3c6du + 0x297a2d39u;
+    h2 ^= h2 >> 15; h2 *= 0x2c1b3c6du; h2 ^= h2 >> 12;
+    float n = float(h >> 8) * (1.0 / 16777216.0) + float(h2 >> 8) * (1.0 / 16777216.0) - 1.0;
+    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float s = smoothstep(0.0, 0.12, y) * (1.0 - smoothstep(0.55, 1.0, y));
+    return saturate(c + n * s * fract(code) * 0.05);
+}
+
 // last pass: plain copy / bilinear scale when amount is 0, otherwise contrast adaptive sharpening on luma only
 // (no colour fringes), eased off on isolated noisy pixels so grain is not amplified, and clamped to the
 // neighbourhood so it cannot ring
 fragment float4 fsOut(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant U &u [[buffer(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float3 e = t.sample(s, in.uv).rgb;
-    if (u.amount <= 0) return float4(e, 1);
+    if (u.amount <= 0) return float4(grainOn(e, in.pos.xy, u.pad), 1);
     float3 b = t.sample(s, in.uv + float2(0, -u.texel.y)).rgb;
     float3 d = t.sample(s, in.uv + float2(-u.texel.x, 0)).rgb;
     float3 f = t.sample(s, in.uv + float2(u.texel.x, 0)).rgb;
@@ -306,7 +322,7 @@ fragment float4 fsOut(V in [[stage_in]], texture2d<float> t [[texture(0)]], cons
     float noise = saturate(abs(0.25 * (lb + ld + lf + lh) - le) / max(lmx - lmn, 1e-4));
     float w = amp * (-1.0 / mix(8.0, 5.0, u.amount)) * (1 - 0.5 * noise);
     float lo = (lb * w + ld * w + lf * w + lh * w + le) / (1 + 4 * w);
-    return float4(clamp(e + (lo - le), mn, mx), 1);
+    return float4(grainOn(clamp(e + (lo - le), mn, mx), in.pos.xy, u.pad), 1);
 }
 
 // compare view, diagonal cut: the original below a line from the top left to the bottom right corner, over the finished

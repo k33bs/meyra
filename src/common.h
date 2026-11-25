@@ -30,7 +30,7 @@ std::string chainText(int bits);
 struct Settings {
     std::atomic<int> levels{0};          // 0 auto, 1 video range, 2 full range
     std::atomic<bool> deband{true};      // dither removal
-    std::atomic<int> upscale{1};         // 0 plain (bilinear), 1 metalfx, 2 apple super resolution (metalfx until it is up), 3 edge-aware (fsr 1 easu), 4 edge-aware (sgsr 1)
+    std::atomic<int> upscale{1};         // 0 plain (bilinear), 1 metalfx, 2 apple super resolution (metalfx until it is up), 3 edge-aware (fsr 1 easu), 4 edge-aware (sgsr 1), 5 hashed filters (ravu-lite kind: a small filter per pixel picked by the edge under it, 2x, then brought to size)
     std::atomic<int> enhance{0};         // 0 off, n = the nth net in Resources/nets, run on every frame at any window size. takes the upscaler's place
     std::atomic<int> enhanceAt{0};       // where the net sits: 0 after dither removal, 1 before it, 2 after the upscaler (on the picture at window size)
     std::atomic<float> sharpen{0.6f};    // 0 = off
@@ -57,7 +57,7 @@ struct Settings {
     std::atomic<int> genDeadline{0};     // early schedule, how long a generated frame is waited for: 0 by the slowest recent one (decaying peak + 2.5 ms, never under genFloor), 1 by the usual (95th percentile of the last 120 + a margin, no floor)
     std::atomic<bool> genLateNext{false};// a generated frame that is not ready when due is still shown when it comes, while a refresh of the screen lies between it and its real frame. else dropped
     std::atomic<bool> gpuAwake{false};   // a tiny job keeps the gpu from clocking down between frames while a net or the second generator is in use. costs power
-    std::atomic<int> genModel{0};        // who makes the generated frames: 0 apple's interpolator, 1 the second generator (flyhigh.h) working at 480 lines, 2 at 720. 1 and 2 need the user's files
+    std::atomic<int> genModel{0};        // who makes the generated frames: 0 apple's interpolator, 1 the second generator (flyhigh.h) working at 480 lines, 2 at 720. 1 and 2 need the user's files. 3 block matching (blocks.h), no files
     std::atomic<int> genStill{0};        // how generated frames take the real frame's pixel where nothing moved: 0 hard limit (as always), 1 soft with dither allowed for, 2 metalgoose's rule, 3 the same with dither allowed for, 4 none (tests only, not in the menu)
     std::atomic<bool> srWithGen{true};   // run apple super resolution next to frame generation too, one after the other: ~9 ms more delay
     std::atomic<bool> denoise{false};    // apple's temporal noise filter on real frames, first in the chain. ~10 ms per frame on the video encoder block
@@ -77,6 +77,14 @@ struct Settings {
     std::atomic<int> hudN{0};
     std::atomic<float> hudRect[32] = {};
     std::atomic<bool> hudShow{false};     // outline them on the picture
+    // 2026-11-25 batch, all off = as before
+    std::atomic<bool> genShift{false};    // block generator (genModel 3): the whole picture's shift is searched first and offered as a start vector (big pans)
+    std::atomic<bool> genDoubt{false};    // block generator: where the warp from the frame before and the one from the frame after disagree, the side that fits its surroundings is taken
+    std::atomic<bool> repeatRoll{false};  // a late frame is only skipped when frames have been queuing for half a second, not at the first one
+    std::atomic<float> grain{0};          // fine grain added in the last pass, stronger in the dark and mid tones: 0 off .. 1
+    std::atomic<bool> stabilise{false};   // the frame before, moved along the picture's motion and limited to what is around now, is mixed in: steadier edges
+    std::atomic<bool> lateDrawable{false};// the screen's buffer is asked for after the gpu work is written down, not before
+    std::atomic<int> drawables{3};        // buffers the layer cycles through: 3, or 2 (a frame less queued, can stall)
 };
 static const int kHudMax = 8;
 void hudRectsParse(const char *s);       // the setting's text into gSet, what does not read as a rectangle is left out

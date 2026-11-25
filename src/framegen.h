@@ -6,13 +6,13 @@
 #include <cstdint>
 
 // 30 -> 60 frame generation: one middle frame per real pair. by apple's low latency interpolator (macos 26+), or
-// by the second generator (genModel, flyhigh.h) when the user has its files
+// by the second generator (genModel 1, 2, flyhigh.h) when the user has its files, or by block matching (3, blocks.h)
 namespace framegen {
 
 bool available();                // os and hardware support it at all
 void startThread();
 void stopThread();                // at quit, after the render thread
-int model();                     // the generator in use: gSet.genModel, or 0 (apple's) while the other one's files are missing
+int model();                     // the generator in use: gSet.genModel, or 0 (apple's) while the second one's files are missing or the block generator is refused
 const char *modelNote();         // "" or why the chosen generator is not the one in use
 bool ready(int w, int h, int model = 0); // session up for this size and generator. asking starts (or restarts) the session
 // 420v, both retained by us while needed. ready: the frames are still being written (gpu work, the noise filter),
