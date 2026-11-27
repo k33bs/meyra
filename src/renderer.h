@@ -110,6 +110,7 @@ bool cropOn(); // the letterbox crop holds a band now (cropRects is also set by 
 void lastSize(int &w, int &h, int &fitW, int &fitH, int &upscaler); // upscaler that ran last: 0 none or plain, 1 metalfx, 2 apple super resolution, 3 fsr 1, 4 sgsr 1, 5 hashed filters
 std::string extraText(int which, const Stats &s); // enhanceReal (0), enhanceHold (1), superSample (2): "off", "acting: ..." or "idle: why"
 int enhanceRan();                   // the enhance net the last frame went through, 0 = none (off, still starting, cannot run)
+bool stabRan();                     // stabilise steadied a frame in the last half second (it steps aside while frames are made)
 double genBudgetMs();  // early schedule: how long after its real frame arrived a generated frame is due, as last planned
 bool genLateRoom();    // genLateNext has room to act on this screen and schedule
 int genSmallNow();    // the smaller size frames are being generated at (genSmall's number, with a 1080p source), 0 = full size

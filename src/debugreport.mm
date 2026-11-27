@@ -9,6 +9,7 @@
 #include "debugreport.h"
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <algorithm>
 #include <vector>
 
 namespace debugreport {
@@ -88,8 +89,37 @@ NSRegularExpression *rx(NSString *p) {
     return [NSRegularExpression regularExpressionWithPattern:p options:0 error:nil];
 }
 
-// rules in the order they must run
-const std::vector<Rule> &rules() {
+// the parts of a device name around an owner. an apple device word is kept, and so is what kind of part it is
+// (camera, microphone, in a few languages); a name is a capitalised word that is neither, with "de la", "van der" in it
+#define MODEL_RE "(?:iPhone|iPad|iPod|iMac|MacBook|Mac|AirPods|HomePod|Apple|Beats|Vision)(?!\\p{Ll})"
+#define ROLE_RE "(?i:camera|kamera|caméra|cámara|câmera|fotocamera|microphone|mikrofon|micro|micrófono|microfono|microfone|microfoon)(?!\\p{L})"
+#define WORD_RE "(?!" MODEL_RE ")(?!" ROLE_RE ")\\p{Lu}[\\p{L}\\p{M}'’.-]*"
+#define PART_RE "(?:de|da|do|dos|das|del|della|di|van|von|der|den|la|le|du|y|e|zu)"
+#define PREP_RE "(?:von|van|de|di|da|do|dos|das)"
+#define OWNER_RE WORD_RE "(?:(?: " PART_RE ")* " WORD_RE "){0,3}"
+// a personal apple device in a name: then the name is rebuilt from the device words, the words right after them that
+// say which one (pro, max, 15) and the kind words, and everything else goes, whatever the order or the owner's script
+// ("alex iphone", "alexin iphone", "アレックスのiphone", "iphone (alex)", "alex's iphone" in capitals, "alex mac"). "apple" alone or a
+// screen ("apple cinema display") is not one, nor a card made "for mac" or "(for ipad)": its own name stays
+#define DEVW_RE "(?:(?<!\\p{Latin})(?i:iPhone|iPad|iPod|iMac|MacBook|AirPods|HomePod)(?!\\p{Latin})|(?<!\\p{Latin})Mac(?!\\p{Latin})|(?:Apple (?:Watch|TV|Vision)|Vision Pro)(?!\\p{Ll}))"
+#define BEATS_RE "(?:Beats|Powerbeats)(?!\\p{Ll})"
+#define NOTFOR_RE "(?<![Ff]or )(?<![Ff]or \\()"
+#define TRIG_RE NOTFOR_RE "(?:" DEVW_RE "|" BEATS_RE ")"
+#define QUAL_RE "(?:Pro|Max|Air|mini|Studio|Plus|Ultra|SE|touch|Watch|TV|Vision|\\d+(?:\\.\\d+)?)(?![\\p{L}\\p{N}])"
+#define BQUAL_RE "(?:Fit|Flex|Studio|Solo\\d*|Buds\\+?|Pill\\+?|Pro|Plus|Max|X|\\d+)(?![\\p{L}\\p{N}])" // beats models: fit pro, studio buds+, solo3
+#define KEEP_RE NOTFOR_RE "(?:" BEATS_RE "(?: +" BQUAL_RE ")*|" DEVW_RE "(?: +" QUAL_RE ")*)|(?<!\\p{L})(?:" ROLE_RE "|Desk View(?!\\p{L})|Sidecar(?: Display)?(?!\\p{L})|\\(\\d+\\))"
+// a localised built-in or other device as macos names its parts: "câmera do studio display", "micrófono de logitech
+// brio". what follows is kept as a device only when it looks like one (a digit, two capitals in a row, or a screen
+// or camera word); else it is taken as an owner ("kamera von alex", "câmera do joão" lose it)
+#define ROLEOF_RE "^" ROLE_RE " (?:de|da|do|dos|das|del|della|di|du|des|von|van|of) (?=\\p{Lu})"
+#define PRODUCT_RE "\\p{N}|\\p{Lu}{2}|(?<!\\p{L})(?i:display|studio|webcam|facecam|capture|retina|facetime|monitor)(?!\\p{L})"
+// an owner behind a device: words without digits up to the end, a closing quote or bracket, or a kind word ("bose qc35
+// ii von alex"; "philips de luxe 4k" stays, a name has no 4k after it)
+#define NAMEW_RE "[^\\s„“”\"«»()\\[\\]\\p{N}]+"
+#define TAIL_RE NAMEW_RE "(?: (?!" ROLE_RE ")" NAMEW_RE "){0,5}(?: \\d{1,2})?(?=$| ?[”\"»’)\\]]| \\(| " ROLE_RE ")" // "von alex 2" too
+
+// what this mac knows about its owner: home folder, host name, full name
+const std::vector<Rule> &machineRules() {
     static std::vector<Rule> r;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -108,8 +138,28 @@ const std::vector<Rule> &rules() {
         if (full.length >= 3)
             r.push_back({rx([NSString stringWithFormat:@"(?<![\\p{L}\\p{N}_])%@(?![\\p{L}\\p{N}_])",
                                                        [NSRegularExpression escapedPatternForString:full]]), @"(name)"});
-        // an owner's name in front of a device, "alex's iphone camera", "alex smith’s airpods pro": the owner goes
-        r.push_back({rx(@"(?<![\\p{L}\\p{N}])(?:\\p{Lu}[\\p{L}.-]* )?\\p{Lu}[\\p{L}\\p{N}._-]*['’]s (?=\\p{Lu}|\\p{Ll}*[A-Z])"), @""});
+    });
+    return r;
+}
+
+// the same on every mac, in the order they must run
+// an owner's name in front of a device, "alex's iphone camera", "alex smith’s airpods pro", "james’ ipad": the owner
+// goes. without the apostrophe ("alexs ipad", swedish too) only in front of an apple device word
+const std::vector<Rule> &frontRules() {
+    static std::vector<Rule> r;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        r.push_back({rx(@"(?<![\\p{L}\\p{N}])(?:\\p{Lu}[\\p{L}.-]* )?\\p{Lu}[\\p{L}\\p{N}._-]*(?:['’]s|s['’]) (?=\\p{Lu}|\\p{Ll}*[A-Z])"), @""});
+        r.push_back({rx(@"(?<![\\p{L}\\p{N}])(?:\\p{Lu}[\\p{L}.-]* )?\\p{Lu}[\\p{L}\\p{N}._-]*s (?=" MODEL_RE ")"), @""});
+    });
+    return r;
+}
+
+// usb serials, mac addresses and other long ids
+const std::vector<Rule> &idRules() {
+    static std::vector<Rule> r;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         r.push_back({rx(@"(?<![0-9a-fA-F])[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}(?![0-9a-fA-F])"), @"(id)"}); // a mac address (bluetooth audio ids)
         r.push_back({rx(@"0x[0-9a-fA-F]{8}([0-9a-fA-F]{4})([0-9a-fA-F]{4})(?![0-9a-fA-F])"), @"usb $1:$2"});
         r.push_back({rx(@"0x[0-9a-fA-F]{12,}"), @"(id)"});
@@ -118,14 +168,175 @@ const std::vector<Rule> &rules() {
     });
     return r;
 }
+
+// running text: owner in front, then behind ("iphone von alex", "iphone de alex", "iphone d’alex", "ipad van jan de
+// vries", "iphone di marco"; only a capitalised name, and not a device word: "microfone do macbook pro" stays), then ids
+const std::vector<Rule> &rules() {
+    static std::vector<Rule> r;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        r = frontRules();
+        r.push_back({rx(@"(?<=[\\p{L}\\p{N}\\p{Pf}\\p{Pe}\"'’]) " PREP_RE " [„“\"«]?" OWNER_RE), @""});
+        r.push_back({rx(@"(?<=[\\p{L}\\p{N}]) d['’]" OWNER_RE), @""});
+        r.insert(r.end(), idRules().begin(), idRules().end());
+    });
+    return r;
+}
+
+// a bare device name, nothing after it: the owner behind it goes, lower case too ("iphone von alex", "kamera von „iphone
+// von alex“" keeps "kamera von „iphone“"), in front with an apostrophe, capitals too ("jean’s bose"), and before a
+// chinese, japanese or korean possessive ("张伟的galaxy buds", "알렉스의 galaxy buds")
+const std::vector<Rule> &nameRules() {
+    static std::vector<Rule> r;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        r.push_back({rx(@"(?<=[\\p{L}\\p{N}\\p{Pf}\\p{Pe}\"'’]) " PREP_RE " (?:[„“\"«‘] ?)?(?!" MODEL_RE ")" TAIL_RE "(?: ?[”\"»’])?"), @""});
+        r.push_back({rx(@"(?<=[\\p{L}\\p{N}]) d['’](?!" MODEL_RE ")" TAIL_RE), @""});
+        r.push_back({rx(@"^(?:[\\p{L}\\p{N}._-]+ )?[\\p{L}\\p{N}._-]+(?:['’][sS]|[sS]['’]) (?=\\p{Lu}|\\p{Ll}*[A-Z])"), @""});
+        r.push_back({rx(@"^(?:[\\p{L}\\p{N}._-]+ )?[\\p{L}\\p{N}._-]+s (?=" MODEL_RE ")"), @""});
+        r.push_back({rx(@"^[^A-Za-z0-9]{1,40}?(?:的|の|의) ?(?=[A-Za-z0-9])"), @""});
+        r.push_back({rx(@"  +"), @" "});
+    });
+    return r;
+}
+
+void apply(NSMutableString *m, const std::vector<Rule> &rs) {
+    for (auto &r : rs)
+        if (r.re) [r.re replaceMatchesInString:m options:0 range:NSMakeRange(0, m.length) withTemplate:r.tpl];
+}
 }
 
 std::string scrub(const std::string &s) {
     NSMutableString *m = [ns(s) mutableCopy];
     if (!m) return s;
-    for (auto &r : rules())
-        if (r.re) [r.re replaceMatchesInString:m options:0 range:NSMakeRange(0, m.length) withTemplate:r.tpl];
+    apply(m, machineRules());
+    apply(m, rules());
     return str(m);
+}
+
+// the name rules alone, without this mac's own: for the self-test
+static NSString *nameOnly(NSMutableString *m) {
+    static NSRegularExpression *trig = rx(@TRIG_RE), *keep = rx(@KEEP_RE), *roleOf = rx(@ROLEOF_RE), *product = rx(@PRODUCT_RE);
+    if (trig && keep && [trig firstMatchInString:m options:0 range:NSMakeRange(0, m.length)]) {
+        NSMutableArray<NSString *> *kept = [NSMutableArray new];
+        for (NSTextCheckingResult *r in [keep matchesInString:m options:0 range:NSMakeRange(0, m.length)]) [kept addObject:[m substringWithRange:r.range]];
+        if (kept.count) return [kept componentsJoinedByString:@" "];
+    }
+    NSTextCheckingResult *r = [roleOf firstMatchInString:m options:0 range:NSMakeRange(0, m.length)];
+    if (r && [product firstMatchInString:m options:0 range:NSMakeRange(NSMaxRange(r.range), m.length - NSMaxRange(r.range))]) { // "câmera do " + the device's own rules
+        NSString *rest = nameOnly([[m substringFromIndex:NSMaxRange(r.range)] mutableCopy]);
+        if (rest.length) return [[m substringToIndex:NSMaxRange(r.range)] stringByAppendingString:rest];
+    }
+    apply(m, frontRules());
+    apply(m, idRules());
+    apply(m, nameRules());
+    return [m stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+}
+
+std::string scrubName(const std::string &s) {
+    NSMutableString *m = [ns(s) mutableCopy];
+    if (!m) return s;
+    apply(m, machineRules());
+    return str(nameOnly(m));
+}
+
+// each known name is held out of the running-text rules by a private-use mark while they run, then put back as its
+// scrubName: so "câmera do studio display" is not cut by the rule for "iphone do alex"
+std::string scrubKnown(const std::string &s, std::vector<std::string> names) {
+    NSMutableString *m = [ns(s) mutableCopy];
+    if (!m) return scrub(s);
+    std::sort(names.begin(), names.end(), [](const std::string &a, const std::string &b) { return a.size() > b.size(); }); // "iphone von alex kamera" before "iphone von alex"
+    NSMutableArray<NSString *> *marks = [NSMutableArray new], *clean = [NSMutableArray new];
+    for (auto &n : names) {
+        NSString *raw = ns(n);
+        if (n.size() < 3 || !raw || marks.count >= 0x1000 || ![m containsString:raw]) continue;
+        unichar u = 0xE000 + marks.count;
+        NSString *mark = [NSString stringWithCharacters:&u length:1];
+        [m replaceOccurrencesOfString:raw withString:mark options:0 range:NSMakeRange(0, m.length)];
+        [marks addObject:mark];
+        [clean addObject:ns(scrubName(n)) ?: @""];
+    }
+    apply(m, machineRules());
+    apply(m, rules());
+    for (NSUInteger i = 0; i < marks.count; i++) [m replaceOccurrencesOfString:marks[i] withString:clean[i] options:0 range:NSMakeRange(0, m.length)];
+    return str(m);
+}
+
+// --self-test: the rules alone (not this mac's own name) on names as macos makes them in a few languages
+int scrubTest() {
+    struct Case { const char *in, *want; bool name; };
+    static const Case cases[] = {
+        {"Alex's iPhone Camera", "iPhone Camera", true}, {"Alex Smith’s AirPods Pro", "AirPods Pro", true},
+        {"Alexs iPad", "iPad", true}, {"James’ iPhone", "iPhone", true}, {"alex's iPhone", "iPhone", true},
+        {"iPhone von Alex", "iPhone", true}, {"iPhone von alex", "iPhone", true}, {"MacBook Pro von Alex Müller", "MacBook Pro", true},
+        {"Kamera von „iPhone von Alex“", "Kamera iPhone", true}, {"iPhone de Alex", "iPhone", true},
+        {"iPhone d’Alex", "iPhone", true}, {"iPhone d'Émilie", "iPhone", true}, {"iPhone di Marco", "iPhone", true},
+        {"iPad van Jan de Vries", "iPad", true}, {"iPhone de Ana de la Cruz", "iPhone", true}, {"Câmera do iPhone de Ana Souza", "Câmera iPhone", true},
+        {"iPhone von Alex Kamera", "iPhone Kamera", true}, {"Microfone do MacBook Pro", "Microfone MacBook Pro", true},
+        {"USB Video", "USB Video", true}, {"Cam Link 4K", "Cam Link 4K", true}, {"Elgato HD60 X", "Elgato HD60 X", true},
+        {"FaceTime HD Camera", "FaceTime HD Camera", true}, {"MacBook Pro Microphone", "MacBook Pro Microphone", true},
+        {"Mac mini", "Mac mini", true}, {"Studio Display Camera", "Studio Display Camera", true},
+        {"UltraStudio Recorder 3G", "UltraStudio Recorder 3G", true}, {"Game Capture HD60 S+", "Game Capture HD60 S+", true},
+        {"Alex iPhone", "iPhone", true}, {"Alex’ iPhone", "iPhone", true}, {"Alexin iPhone", "iPhone", true},
+        {"Alex’in iPhone’u", "iPhone", true}, {"アレックスのiPhone", "iPhone", true}, {"iPhone (Alex)", "iPhone", true},
+        {"iPhone d’alex", "iPhone", true}, {"alexs iPad", "iPad", true}, {"Apple TV von Alex", "Apple TV", true},
+        {"iPhone 15 Pro Max de Alex", "iPhone 15 Pro Max", true}, {"iPhone von Max", "iPhone", true},
+        {"Kamera von alex", "Kamera", true}, {"Caméra d’alex", "Caméra", true}, {"alexs Mac", "Mac", true}, {"alex's Mac", "Mac", true},
+        {"Apple Cinema Display", "Apple Cinema Display", true}, {"Pro Display XDR", "Pro Display XDR", true},
+        {"Built-in Retina Display", "Built-in Retina Display", true}, {"AVerMedia Live Gamer EXTREME 3", "AVerMedia Live Gamer EXTREME 3", true},
+        // 0.6.1 review: owner in any script or case, plain mac, other makes' devices; and names that must stay usable
+        {"Alexin iPhone Camera", "iPhone Camera", true}, {"アレックスのiPhoneのカメラ", "iPhone", true}, {"张伟的iPhone相机", "iPhone", true},
+        {"Alex iPhone-kamera", "iPhone kamera", true}, {"iPhone (Алекс) Camera", "iPhone Camera", true}, {"ALEX'S IPHONE", "IPHONE", true},
+        {"alex iphone", "iphone", true}, {"アレックスのMac", "Mac", true}, {"Alexin Mac", "Mac", true}, {"Mac (Alex)", "Mac", true},
+        {"Alex Mac", "Mac", true}, {"张伟的Galaxy Buds", "Galaxy Buds", true}, {"알렉스의 Galaxy Buds", "Galaxy Buds", true},
+        {"アレックスのWH-1000XM4", "WH-1000XM4", true}, {"JEAN’S BOSE QC35", "BOSE QC35", true}, {"Bose QC35 II von Alex", "Bose QC35 II", true},
+        {"Câmera de “Alex”", "Câmera", true}, {"Samsung Q80 de la sala", "Samsung Q80", true}, {"iPhone von Alex (2)", "iPhone (2)", true},
+        {"Alex’s iPhone Desk View Camera", "iPhone Desk View Camera", true}, {"Beats Fit Pro", "Beats Fit Pro", true},
+        {"Alex’s Beats Flex", "Beats Flex", true}, {"Beats Studio Buds", "Beats Studio Buds", true},
+        {"Câmera do Studio Display", "Câmera do Studio Display", true}, {"Cámara de Studio Display", "Cámara de Studio Display", true},
+        {"Micrófono de Logitech BRIO", "Micrófono de Logitech BRIO", true}, {"Philips de Luxe 4K", "Philips de Luxe 4K", true},
+        {"Studio Displayのカメラ", "Studio Displayのカメラ", true}, {"HDMI Capture for iPad Pro", "HDMI Capture for iPad Pro", true},
+        {"Cam Link 4K (for Mac mini)", "Cam Link 4K (for Mac mini)", true}, {"MacroSilicon USB Video", "MacroSilicon USB Video", true},
+        {"MACROSILICON USB VIDEO", "MACROSILICON USB VIDEO", true}, {"Kamera von Alex", "Kamera", true}, {"Câmera do João", "Câmera", true},
+        {"Cámara de Ana Souza", "Cámara", true}, {"Mikrofon von Alex Müller", "Mikrofon", true}, {"Bose QC35 II von Alex 2", "Bose QC35 II", true},
+        {"Cámara de Elgato Facecam", "Cámara de Elgato Facecam", true}, {"Câmera do LG UltraFine", "Câmera do LG UltraFine", true},
+        {"source iPhone von Alex [avf #1a2b], system capture", "source iPhone [avf #1a2b], system capture", false},
+        {"audio input Alex’s AirPods Pro, state 2 \"running\"", "audio input AirPods Pro, state 2 \"running\"", false},
+        {"order input 1080p -> dither removal -> metalfx 3840×2160 -> screen", "order input 1080p -> dither removal -> metalfx 3840×2160 -> screen", false},
+    };
+    int bad = 0;
+    for (auto *rs : {&machineRules(), &rules(), &nameRules()}) // a pattern that does not compile is left out silently in use
+        for (auto &r : *rs) if (!r.re) { printf("FAIL a scrub rule does not compile\n"); bad++; }
+    if (!rx(@TRIG_RE) || !rx(@KEEP_RE) || !rx(@ROLEOF_RE) || !rx(@PRODUCT_RE)) { printf("FAIL the device word rule does not compile\n"); bad++; }
+    for (auto &c : cases) {
+        NSMutableString *m = [@(c.in) mutableCopy];
+        std::string got;
+        if (c.name) got = str(nameOnly(m));
+        else { apply(m, rules()); got = str([m stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]); }
+        bool ok = got == c.want;
+        bad += !ok;
+        printf("%s scrub%s \"%s\" -> \"%s\"%s\n", ok ? "ok  " : "FAIL", c.name ? "Name" : "", c.in, got.c_str(), ok ? "" : (" (want \"" + std::string(c.want) + "\")").c_str());
+    }
+    // a line with a name known at report time (a log line, the last message, macos' error text) gets the name's own
+    // rule, and the running-text rules leave the cleaned name alone
+    struct Known { const char *in, *name, *want; };
+    static const Known known[] = {
+        {"source start: iPhone von alex, format default", "iPhone von alex", "source start: iPhone, format default"},
+        {"last message: Alexin iPhone Camera was disconnected.", "Alexin iPhone Camera", "last message: iPhone Camera was disconnected."},
+        {"last message: アレックスのiPhoneのカメラ was disconnected.", "アレックスのiPhoneのカメラ", "last message: iPhone was disconnected."},
+        {"last message: 张伟的iPhone相机 was disconnected.", "张伟的iPhone相机", "last message: iPhone was disconnected."},
+        {"last message: Alex iPhone-kamera was disconnected.", "Alex iPhone-kamera", "last message: iPhone kamera was disconnected."},
+        {"last message: iPhone (Алекс) Camera was disconnected.", "iPhone (Алекс) Camera", "last message: iPhone Camera was disconnected."},
+        {"last message: No picture from iPhone von alex (running).", "iPhone von alex", "last message: No picture from iPhone (running)."},
+        {"last error: Câmera do Studio Display is in use", "Câmera do Studio Display", "last error: Câmera do Studio Display is in use"},
+    };
+    for (auto &c : known) {
+        std::string got = scrubKnown(c.in, {c.name, "USB Video"});
+        bool ok = got == c.want;
+        bad += !ok;
+        printf("%s scrubKnown \"%s\" -> \"%s\"%s\n", ok ? "ok  " : "FAIL", c.in, got.c_str(), ok ? "" : (" (want \"" + std::string(c.want) + "\")").c_str());
+    }
+    return bad;
 }
 
 std::string machine() {
@@ -212,7 +423,7 @@ std::string displays(NSScreen *windowScreen) {
         double lo = s.minimumRefreshInterval, hi = s.maximumRefreshInterval;
         std::string vrr = "no";
         if (lo > 0 && hi - lo > 0.002) vrr = "yes, " + hz(1 / hi) + "-" + hz(1 / lo) + " Hz";
-        std::string l = scrub(str(s.localizedName)) + ": " + hz(w) + "x" + hz(h) + " pt, " + hz(w * scale) + "x" + hz(h * scale) +
+        std::string l = scrubName(str(s.localizedName)) + ": " + hz(w) + "x" + hz(h) + " pt, " + hz(w * scale) + "x" + hz(h * scale) +
                         " px, scale " + hz(scale) + ", refresh " + rate + ", max " + hz(mx) + " Hz, variable refresh " + vrr +
                         (CGDisplayIsBuiltin(did) ? ", built-in" : ", external") + (CGDisplayIsMain(did) ? ", main" : "");
         if (windowScreen && s == windowScreen) l += " <- window";
@@ -252,6 +463,7 @@ std::string settings() {
         for (NSString *k in [saved.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
             id o = saved[k];
             if (skipKey(k) || [o isEqual:reg[k]]) continue;
+            if ([k isEqual:@"muteOutput"] || [k isEqual:@"frameLog"]) continue; // saved by 0.6.0, no effect since: command line only
             std::string key = str(k);
             if ([k hasPrefix:@"customPreset"]) v.push_back(key + " = (saved)");
             else if ([idDicts containsObject:k] && [o isKindOfClass:NSDictionary.class]) {
@@ -267,7 +479,7 @@ std::string settings() {
                 }
             }
             else if ([k isEqual:@"source"] && [o isKindOfClass:NSString.class]) v.push_back(key + " = " + shortId(str(o)));
-            else if ([k isEqual:@"sourceName"] && [o isKindOfClass:NSString.class]) v.push_back(key + " = " + scrub(str(o)));
+            else if ([k isEqual:@"sourceName"] && [o isKindOfClass:NSString.class]) v.push_back(key + " = " + scrubName(str(o)));
             else v.push_back(key + " = " + valueText(o));
         }
         if (v.empty()) v.push_back("(all settings at default)");

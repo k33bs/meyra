@@ -87,7 +87,7 @@ work while the picture has focus. you do not have to read any further than this 
 
 | key | what it does | why you want it |
 |---|---|---|
-| H | status overlay: compact, every switch, off | says what is running, how late it is, and which key changes what |
+| H | status overlay: compact, with the switches, off | says what is running, how late it is, and which key changes what |
 | 1 … 9, 0 | presets | a whole set of picture and motion switches at once. 1 is standard, which is also how meyra starts out |
 | / | compare | the original against the finished picture, so you can see whether any of this does something |
 | Z | plain passthrough | all processing off, for when you just want the signal |
@@ -143,7 +143,7 @@ got a card from another maker with its own sdk? see
 [adding a driver for another maker](#adding-a-driver-for-another-maker).
 
 source > format lists what the device offers. meyra opens 1080p by itself even where the device offers more; that
-entry says (default), the larger ones sit above it.
+entry says (default) where system capture offers more than one format, the larger ones sit above it.
 
 ### too few frames from the card
 
@@ -182,7 +182,8 @@ the card)". it clears after 2 s back at the rate.
 ## presets
 
 ten sets of picture and motion switches on the number keys. each starts from the same plain base, so a key always
-gives the same thing; levels, colour, audio, window, display, gpu awake and the side bars are left alone. the output
+gives the same thing; levels, colour, audio, window, display, gpu awake and the side bars are left alone. vsync is
+part of a preset: every built-in one turns it on, one of your own sets it as you saved it. the output
 rate goes off, and its own switches (blend, real frames, ride out, even out, enhance made frames) and the six newer
 block matching switches go back to their defaults; a preset of your own saved before v0.6.0 does the same, as it did
 not know them. shift + number saves the switches as they are over that slot, and again overwrites what you saved there. presets > remove my preset brings
@@ -219,10 +220,10 @@ work while the picture has focus. the overlay shows them too, next to what each 
 | <kbd>C</kbd> | colour: bt.709, srgb, the screen's own |
 | <kbd>B</kbd> | dither removal |
 | <kbd>D</kbd> | noise filter |
-| <kbd>N</kbd> | next enhance net, then off |
+| <kbd>N</kbd> | next enhance net, then off. nets of over 64 passes (the still-picture one) are menu only |
 | <kbd>O</kbd> | enhance on real frames only (experimental) |
 | <kbd>Y</kbd> | steady enhance (experimental) |
-| <kbd>M</kbd> | next upscaler. hashed filters is picked in the menu |
+| <kbd>M</kbd> | next upscaler, hashed filters included. apple super resolution only where the mac has it |
 | <kbd>U</kbd> | supersample (experimental) |
 | <kbd>[</kbd> <kbd>]</kbd> | sharpening down / up |
 | <kbd>.</kbd> | look: off, mild, middle, strong (experimental) |
@@ -230,7 +231,7 @@ work while the picture has focus. the overlay shows them too, next to what each 
 | key | motion |
 |---|---|
 | <kbd>G</kbd> | frame generation |
-| <kbd>I</kbd> | next frame generator: apple's, second at 480 lines, second at 720 lines. block matching is picked in the menu |
+| <kbd>I</kbd> | next frame generator: apple's, second at 480 lines, second at 720 lines, block matching. without the second generator's files it is one stop, where return downloads them |
 | <kbd>return</kbd> | download the second generator, only while it is chosen and not installed |
 | <kbd>E</kbd> | frame schedule: early or on the tick |
 | <kbd>S</kbd> | next rule for still areas in generated frames |
@@ -250,7 +251,7 @@ work while the picture has focus. the overlay shows them too, next to what each 
 | <kbd>/</kbd> | compare: original against final cut left / right, above / below, diagonal, side by side, stacked, then every stage, off (shift + / goes back) |
 | <kbd>1</kbd> … <kbd>9</kbd>, <kbd>0</kbd> | presets: a whole set of picture and motion switches at once |
 | <kbd>shift</kbd> + number | save the switches as they are now over that preset (again to overwrite, presets > remove my preset undoes it) |
-| <kbd>H</kbd> | status overlay: compact, every switch, off |
+| <kbd>H</kbd> | status overlay: compact, with the switches, off |
 | <kbd>F</kbd> | full screen (esc leaves it) |
 | <kbd>W</kbd> | next window size, in full screen the next size the picture is made at |
 | <kbd>X</kbd> | full screen keeps the window's resolution |
@@ -275,7 +276,7 @@ menu only.
 | picture | noise filter (apple's temporal one, real frames only, ~10 ms a frame) | D | off |
 | picture | stabilise (experimental): the frame before mixed in along the motion, real frames only | | off |
 | picture | dither removal | B | on |
-| picture | upscaling: plain, metalfx, edge-aware (fsr 1 or sgsr 1), hashed filters (experimental, menu only), apple super resolution | M | metalfx |
+| picture | upscaling: plain, metalfx, edge-aware (fsr 1 or sgsr 1), hashed filters (experimental), apple super resolution | M | metalfx |
 | picture | enhance (experimental): off, or a small neural net on every frame at any window size | N | off |
 | picture | enhance: half precision (faster) | | off |
 | picture | sharpening: off, low, medium, high | ] [ | medium |
@@ -293,7 +294,7 @@ menu only.
 | motion | generate at: full size, 1536×864, 1344×768, 1280×720 (apple's interpolator: smaller is faster and softer) | T | full size |
 | motion | generated frame deadline: by the slowest, by the usual (early schedule) | | by the slowest |
 | motion | show late generated frames a refresh later | | off |
-| motion | frame generator (experimental): apple's interpolator, a second one from files you install, at 480 or 720 lines, or block matching (no files, menu only) | I | apple's |
+| motion | frame generator (experimental): apple's interpolator, a second one from files you install, at 480 or 720 lines, or block matching (no files) | I | apple's |
 | motion | frame generator > find the whole picture's shift first, take one side where the frames disagree (block matching, experimental) | | off |
 | motion | frame generator > find small fast things, go soft where the match is bad, take one side, steady, keep the followed character whole, show a real frame across a cut, made frames as sharp as real ones (block matching, experimental) | | off |
 | motion | output rate (experimental): off, every signal tick, every screen refresh, fixed 30 / 50 / 60 fps, times 2 / 3 / 4, times 2 following the gap, source rate (real frames only) | | off |
@@ -613,8 +614,7 @@ what the output rate does to the rest:
   and stabilise step aside, until made frames are under one in twenty-five for 3 s. source rate and all-real cases keep
   them.
 - the frame schedule, the generated frame deadline and late frames a refresh later decide nothing; their overlay rows
-  say "the output rate decides". the capture clock times the frames whatever its switch says ("on: the output rate uses
-  it").
+  say "by the output rate". the capture clock times the frames whatever its switch says ("used by the rate").
 - the delay rises at once when a frame comes later than it covers and gives back slowly (5 % of real time). made content
   never steps back on the glass: a made frame that is late is left out.
 - the still rule and hud lock take the nearer real frame of the pair. hud lock can flicker for a moment when the delay
@@ -640,7 +640,8 @@ character. three ways to keep those on the real frame, from automatic to "you sa
   - **soft**: allows the small differences dither makes. steadier huds and backgrounds, thin moving things
     mostly survive.
   - **by motion against contrast**: compares how much a pixel changed with how much contrast is around it.
-    steadiest backgrounds, can fade a thin line moving over a busy area.
+    steadiest backgrounds, can fade a thin line moving over a busy area. this and the next are ported from
+    metalgoose, see `THIRD_PARTY_NOTICES.md`.
   - **by motion against contrast, allows for dither**: the same, more forgiving. steadiest of all, and can
     erase thin moving things.
 - **hud lock** (experimental): the still-area rule looks at one pair of real frames. this one remembers: per
@@ -735,20 +736,22 @@ what meyra does with the display, and what it asks of macos and the gpu.
 
 ### window, overlay and comparing
 
-- **status overlay**: source, frame rate, delay, and every switch with its key and what it is set to. the
+- **status overlay**: source, frame rate, delay, and most switches with their key and what they are set to. the
   `order` line at the top is what the frames of the last second really went through, in the order it happened;
   a step that is switched on and did not run is named with the reason (`metalfx idle: window not larger than
   source`). `cadence` is new frames in the signal's frames, `30 in 60` for a 30 fps game. when frame generation
   is on and makes nothing, the motion line says why.
   H steps from off to compact to full. compact: the steps left to right as they ran, each with a dot (green it ran,
-  amber it is on but idle) and its key, one line of numbers and the presets. full: every switch in three columns,
+  amber it is on but idle) and its key, one line of numbers and the presets. full: the switches in three columns,
   picture, motion, and now (source, timing, gpu ms per stage, window and presets). the row changed last is lit.
   with an output rate the numbers line gets the delay held for drops and an `out` line (see
   [output rate](#output-rate)); a card that sends too few frames gets an amber line of its own (see
   [too few frames from the card](#too-few-frames-from-the-card)). the full overlay has rows for the side bars, the
   letterbox crop, the side stretch, the six newer block matching switches and every output rate switch, each with its
   reason when it is on and idle ("needs ride out drops", "the source's picture format is not one it takes", "canvas,
-  glow only").
+  glow only"); a long reason goes on over the next rows. not in it, menu only: match display refresh, super
+  resolution's pad edges and run with frame generation, where enhance runs and its smaller windows, side bar
+  softness and game mode.
 - **hints**: after a key or a menu command one line says what is set now and what that does. it stays until the
   next key while the overlay is up, 6 seconds otherwise. the menu items carry the same texts as tooltips.
 - **compare** (/, shift + / goes back): the original against the finished picture, with a caption on each. the original
@@ -763,7 +766,7 @@ what meyra does with the display, and what it asks of macos and the gpu.
 - **window size**: steps through 720p, 900p, 1080p, 1440p, 2160p and the largest that fits.
 - **full screen keeps the window's resolution**: renders at the window's size and scales that to the screen,
   instead of rendering at the screen's size. lighter on the gpu. the picture keeps its ratio, also on an
-  ultrawide. in full screen W steps through the size it renders at (720, 900, 1080 lines, the screen's own).
+  ultrawide. in full screen W steps through the size it renders at (720, 900, 1080, 1440, 2160 lines, those under the screen's, then the screen's own).
 - **streaming**: the window is titled "Meyra". keep it visible while another app captures it, macos stops
   updating covered or minimised windows.
 
@@ -908,9 +911,15 @@ without asking ten questions first.
 - **log, last lines**: the last 20 of the once-a-second lines and the source lines; the others carry device ids and
   folders, so they stay out.
 
-what is taken out: your home folder (as ~), the mac's name, your full name, an owner's name in front of a device
-("someone's iphone camera" becomes "iphone camera"), usb serials, mac addresses and other long ids (usb ids become
-vendor:product), audio input ids, and folders in values (only the last part stays). read it before you paste it anyway.
+what is taken out: your home folder (as ~), the mac's name, your full name, an owner's name in front of or behind a device
+("someone's iphone camera" becomes "iphone camera", "iphone von …", "iphone de …", "iphone d’…", "iphone di …",
+"ipad van …", "アレックスのiphone" become "iphone", "ipad": a name with an apple device in it, a plain mac too, keeps only the
+device, camera and microphone words, in any case or script; other names lose an owner behind von, de, di, van, d’ and
+the like, or in front of 's, 的, の, 의, and keep the rest, so a card or screen stays recognisable; every line of the
+report gets the same for the device names in it, the last message too), usb serials, mac addresses and other long
+ids (usb ids become vendor:product), audio input ids, and folders in values (only the last part stays). not caught: a
+name in front of another make's device with nothing between ("alex bose"), a device named only after its owner ("alex
+camera"). read it before you paste it anyway.
 
 `Meyra.app/Contents/MacOS/Meyra --debug-report` prints the same and quits, with no window, so without the source, now,
 capture start and log sections.
@@ -942,6 +951,9 @@ capture start and log sections.
     picture is still" though the rate is working.
   - leaving or entering full screen with a rate running costs a visible hitch, about half a second.
   - very uneven sources (4 to 20 new frames a second) swing the delay by tens of ms with ride out off.
+- capture clock drift on 30 fps content: the output rate follows a card clock that drifts against the screen on its
+  own slots, but not while a gap between two real frames is handed out, which is most of the time with a 30 fps game.
+  over many minutes at a fixed 60 the delay could walk up by a tick. not measured, open.
 - not new, there since v0.5.0: on a still picture with frame generation on, the sound can jump about 0.2 s late for a
   couple of seconds after a long-held frame.
 - recording while the letterbox crop or the side stretch fills the window keeps only the middle of the screen. side bars
@@ -1015,6 +1027,10 @@ only place the version lives. `OUT`, `BUNDLE_ID` and `SIGN` can be overridden, e
 | `-KEY VALUE` | override a setting for this run, e.g. `-frameGen NO` |
 | `--update-check [URL]` | run one update check and print the result |
 | `--update-test JSON ZIP APP KEPTDIR` | run the install path on local files, against a copy of the app |
+| `--update-revert-test APP KEPTDIR` | put a copy of the app back from the kept bundle (test) |
+| `--snapshot-at S`, `--capture-at S` | when `--snapshot` and `--capture-test` happen, in seconds (test) |
+| `--gamemode-test [on\|off\|-] [KEPT]` | the game mode launch step and switch on this bundle, prints and exits (test: it changes macos' per-app game mode flag) |
+| `--self-test` | checks that the I and M keys reach every choice and that the debug report's name rules hold, prints and exits |
 
 </details>
 
@@ -1022,7 +1038,7 @@ only place the version lives. `OUT`, `BUNDLE_ID` and `SIGN` can be overridden, e
 <summary>setting keys, for <code>--set KEY=VALUE</code> and <code>-KEY VALUE</code></summary>
 
 setting keys: `levels`, `deband`, `upscale`, `sharpen`, `frameGen`, `early`, `passthrough`, `audio`,
-`audioTrimMs`, `refresh`, `overlay`, `overlayFull`, `checkUpdatesAtLaunch`, `srWithGen`, `srPad`, `vsync`, `colour`, `keepRes`, `gameModeOff` (since v0.6.0; v0.5.0's `gameMode` is read once and removed), `muteOutput`, `enhance`, `enhanceAt`, `enhanceDown`, `enhanceReal`, `enhanceHold`, `superSample`, `look` (0 to 3), `compare` (0 to 7), `netHalf`, `genSmall` (0 off, 1 1280×720, 2 1344×768, 3 1536×864; a saved yes still means 1), `genDeadline` (0, 1), `genLateNext`, `gpuAwake`, `genStill`, `genModel`, `denoise`, `hudLock`, `cutTest`, `repeatTol`, `ptsTime`, `hudStill`, `hudRects`, `hudShow`, and the experimental `genShift`, `genDoubt`, `repeatRoll`, `grain` (0 to 1), `stabilise`, `lateDrawable`, `drawables` (2 or 3), and for recording `recMaxHeight` (the file at most this high, 0 as
+`audioTrimMs`, `refresh`, `overlay`, `overlayFull`, `checkUpdatesAtLaunch`, `srWithGen`, `srPad`, `vsync`, `colour`, `keepRes`, `gameModeOff` (since v0.6.0; v0.5.0's `gameMode` is read once and removed), `enhance`, `enhanceAt`, `enhanceDown`, `enhanceReal`, `enhanceHold`, `superSample`, `look` (0 to 3), `compare` (0 to 7), `netHalf`, `genSmall` (0 off, 1 1280×720, 2 1344×768, 3 1536×864; a saved yes still means 1), `genDeadline` (0, 1), `genLateNext`, `gpuAwake`, `genStill`, `genModel`, `denoise`, `hudLock`, `cutTest`, `repeatTol`, `ptsTime`, `hudStill`, `hudRects`, `hudShow`, and the experimental `genShift`, `genDoubt`, `repeatRoll`, `grain` (0 to 1), `stabilise`, `lateDrawable`, `drawables` (2 or 3), and for recording `recMaxHeight` (the file at most this high, 0 as
 shown, 1080), `recMbit` (bitrate in mbit, 0 by size), `recOverlay` (overlay and hint lines in the file), `recKeep`
 (keep the last 30 seconds). new in v0.6.0, all experimental: for block matching `genSmallFast`, `genFallback`,
 `genSides`, `genOutline`, `genCutGuard`, `genSharp`; for the output rate `rate` (0 off, 1 every signal tick, 2 every
@@ -1039,7 +1055,11 @@ with past picture), `sideDim` (0.3 to 0.95, 0.7), `sideBlur` (0.25 to 2, 1), `si
 <details>
 <summary>hidden switches, for tests</summary>
 
-hidden, for tests: `-netHalfMax N` (half precision up to layers of N features, 24), `-genSpinWait YES` (the
+hidden, for tests, on the command line only (a `--set` or `defaults write` of them is ignored): `-muteOutput YES`
+(mutes the output, the sound path still runs and is measured), `-frameLog FILE` (one row per drawn frame, kept in
+memory and written as csv at quit; also turns on the block generator's pair figures).
+
+more hidden switches, for tests: `-netHalfMax N` (half precision up to layers of N features, 24), `-genSpinWait YES` (the
 second generator's thread watches its command buffer instead of sleeping on it; measured no quicker, off),
 `-enhanceAhead 2` (with the second generator, enhance real frames only runs the net once the generated frame is
 made instead of next to it; 1 as it is, 0 not ahead at all), `-gpuAwakeBack YES` (keep the gpu awake also behind

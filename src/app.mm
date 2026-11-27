@@ -218,7 +218,7 @@ struct Tip { const char *key, *name, *what; };
 static const Tip kTips[] = {
     {"fullscreen", "full screen", "the picture fills the screen, esc leaves it. a screen with variable refresh then shows each frame as it comes, with much less delay"},
     {"@toggleFullScreen:", 0, "the picture fills the screen, esc leaves it. a screen with variable refresh then shows each frame as it comes, with much less delay"},
-    {"overlay", "status overlay", "source, frame rate, delay, the order things run in, and every switch with its key and what it is set to"},
+    {"overlay", "status overlay", "source, frame rate, delay, the order things run in, and most switches with their key and what they are set to"},
     {"framegen", "frame generation", "makes a frame between every two real ones when the source repeats frames (a 30 fps game in a 60 hz signal). 60 fps content is shown as it is. one cpu core stays busy"},
     {"schedule:1", 0, "generated and real frames go up a few ms sooner (about 3)"},
     {"schedule:0", 0, "frames go up on the capture tick: the steadiest motion"},
@@ -234,7 +234,7 @@ static const Tip kTips[] = {
     {"genoutline", "keep the followed character whole", "block matching: a still or slowly moving thing in front of moving scenery (the character the camera follows) keeps its outline, ground that only one of the two frames shows is filled from around it, and the picture's border is left alone. about 0.3 ms more a pair (experimental)"},
     {"gensharp", "made frames as sharp as real ones", "block matching: the fine detail the shift loses is given back, held inside what is around each pixel so nothing rings. a slightly wrong match gets sharper too. a made frame takes 0.16 ms more (experimental)"},
     {"gencutguard", "real frame across a cut", "block matching, output rate: when most of the picture fits no motion (a cut, a camera whip), the slots show the nearer real frame instead of a made one torn between two pictures, until most fits again (experimental)"},
-    {"gensides", "one side, steady", "block matching: where something covers or uncovers what is behind it, the side to show is chosen once for the pair and smoothed, so it does not turn into noise the way the older switch can. the search takes 0.4 to 0.5 ms longer a pair (experimental)"},
+    {"gensides", "one side, steady", "block matching: where something covers or uncovers what is behind it, the side to show is chosen once for the pair and smoothed, so it does not turn into noise the way \"one side where frames disagree\" can. the search takes 0.4 to 0.5 ms longer a pair (experimental)"},
     {"genfallback", "soft where the match is bad", "block matching with an output rate: where the frame before and the one after still disagree after both are moved into place, the made frame is a cross-fade of the two there. soft instead of torn edges around moving things. a made frame takes 0.65 to 0.73 ms (experimental)"},
     {"gendoubt", "one side where frames disagree", "block matching: where the frame before and the one after disagree about what moves where, the side that fits its surroundings is taken instead of a double image (experimental)"},
     {"gensmall:0", 0, "apple's interpolator gets the frames at full size: about 11 ms a frame, the sharpest generated frames"},
@@ -261,7 +261,7 @@ static const Tip kTips[] = {
     {"rate", "output rate", "how many frames a second go to the screen and when. the frames in between are made at any point between two real ones: block matching makes any, apple's and the second generator only the middle, the rest then show the nearer real frame. once made frames are more than one in ten, the enhance net after generation, apple super resolution and stabilise step aside until they are under one in twenty-five for 3 s (a made frame alone goes up without the net), the frame schedule switches (schedule, deadline, late frames) decide nothing, and the capture clock times the frames whatever its switch says (experimental)"},
     {"#Output Rate", 0, "how many frames a second go to the screen and when. the frames in between are made at any point between two real ones: block matching makes any, apple's and the second generator only the middle, the rest then show the nearer real frame. once made frames are more than one in ten, the enhance net after generation, apple super resolution and stabilise step aside until they are under one in twenty-five for 3 s (a made frame alone goes up without the net), the frame schedule switches (schedule, deadline, late frames) decide nothing, and the capture clock times the frames whatever its switch says (experimental)"},
     {"ratesnap:0.05", 0, "fewest real frames: a picture goes up as itself only where a slot comes within 5 % of a gap of it, its other slots are made. the evenest motion, a step at most 1.6 ms off its time (30 fps on 100 hz: 10 of the 30 real)"},
-    {"ratesnap:0.1", 0, "some real frames, as it always was: within 10 % of a gap. steps up to 3-4 ms off (30 fps on 100 hz: 20 of 30 real, 25 on 60: 12 of 25)"},
+    {"ratesnap:0.1", 0, "some real frames, the default: within 10 % of a gap. steps up to 3-4 ms off (30 fps on 100 hz: 20 of 30 real, 25 on 60: 12 of 25)"},
     {"ratesnap:0.15", 0, "more real frames: within 15 % of a gap. steps up to 4-6 ms off (30 fps on 100 hz: all 30, 40 on 100: 30 of 40, 25 on 60: 18 of 25)"},
     {"ratesnap:0.45", 0, "all real frames: every picture goes up as itself at the slot nearest to it. steps up to half a refresh off (5 ms at 100 hz, 8 at 60)"},
     {"ratecushion:0", 0, "off: delay only as the frames need it. a game frame that comes late holds the picture once and the delay rises, then falls back (a short speed-up)"},
@@ -273,7 +273,7 @@ static const Tip kTips[] = {
     {"rateenhancemade", "enhance made frames", "output rate: the enhance net keeps running while made frames go up, on every frame that goes up, made or real. without it the net steps aside as soon as more than one frame in ten is made, and with even out late frames nearly every frame is: the picture loses the net's sharpness. the net then runs on twice as many frames or more, a 6x16 net at 1080p costs several ms each; when the gpu cannot keep up (a frame's gpu time past nine tenths of a slot, or made frames coming late) it steps aside for 15 s on all frames and tries again, longer each time. with enhance real frames only, made frames get the net itself here, not the real frame's kept change. a net in the chain before frame generation needs none of this (experimental)"},
     {"ratecushion", "ride out dropped frames", "output rate: delay held on purpose so that a game frame that comes late (the game dropped one) is still in time: no hold and no catch-up, the longer gap is filled with made frames at even steps. the price is that delay all the time: +17 ms a tick at 60 hz, 20 ms at 50 hz (experimental)"},
     {"ratesnap", "real frames", "output rate, where the screen's rate is not a whole multiple of the source's (30 fps on 100 hz, 25 on 60): how many pictures go up as themselves instead of a made frame a little off their time. more real pictures: fewer made ones and their faults, a little less even motion, as a real one is shown up to a few ms from its own time. a whole multiple (30 on 60 or 120) shows them all whatever this says (experimental)"},
-    {"rateblend", "blend in-betweens", "output rate: the frames in between are a cross-fade of the two real frames by time, not generated. no motion to go wrong, softer, little gpu time. works whichever generator is chosen, needs the block generator to have started (experimental)"},
+    {"rateblend", "blend in-betweens", "output rate: the frames in between are a cross-fade of the two real frames by time, not generated. no motion to go wrong, softer, little gpu time. works whichever generator is chosen, but needs block matching to start on this mac (experimental)"},
     {"genlatenext", "late generated frames", "a generated frame that is not ready when due is shown when it comes, a refresh later, instead of being left out. only on a screen that refreshes faster than the source sends (100, 120 hz, variable): at 60 hz the next refresh is the real frame's"},
     {"nethalf", "half precision", "the enhance net does the sums of its layers of up to 24 features in half precision: about 1.2 times quicker on 4x8 and 8x24 nets, next to nothing on 6x16 ones, the picture differs by a level or two of 255 at most. nets of 32 features are slower that way and stay as they are"},
     {"gpuawake", "keep the gpu awake", "a tiny job keeps the gpu busy so it does not slow its clock between frames: the enhance net and the second generator then run about one and a half times as quick, unless something else already has the gpu full. it uses more power and makes more heat for as long as meyra is in front with a picture and one of the two is on"},
@@ -297,7 +297,7 @@ static const Tip kTips[] = {
     {"hudlock", "hud lock", "pixels that stood still for over a second are taken from the real frame in generated ones, so a hud stays put (experimental)"},
     {"hudmark", "mark hud area", "the next drag on the picture marks a rectangle that always comes from the real frame in generated ones: a minimap, a health bar, subtitles. up to 8, kept as parts of the picture so they fit any window size. esc cancels"},
     {"hudclear", "hud areas", "forgets every marked rectangle"},
-    {"hudshow", "show hud areas", "outlines the marked rectangles on the picture while the status overlay is on, compact or with every switch. with the overlay off the picture is clean"},
+    {"hudshow", "show hud areas", "outlines the marked rectangles on the picture while the status overlay is on, compact or with the switches. with the overlay off the picture is clean"},
     {"cuttest", "cut test", "a closer look at whether two frames are a scene cut, so no frame is generated across one. a flash does not count as a cut (experimental)"},
     {"repeattol", "tolerant repeats", "a repeated frame may differ by a few levels and still count as a repeat. for capture devices with a noisy signal (experimental)"},
     {"ptstime", "capture clock", "frames are timed by the capture device's clock instead of by when they arrived (experimental)"},
@@ -308,7 +308,7 @@ static const Tip kTips[] = {
     {"sidefill:0", 0, "black bars, as always"},
     {"sidefill:1", 0, "the bars are one flat dark grey instead of black, darker or lighter with the brightness steps below: easier on the eyes than black next to a bright picture. the picture itself is not touched, snapshots and recordings leave the bars out. next to no gpu (experimental)"},
     {"sidefill:2", 0, "the bars glow in the colours of the picture's edge next to them, softer and darker further out, and follow the picture a little late so a flash, even a long one, does not strobe there; a cut reaches them about an eighth of a second later. the picture itself is not touched, snapshots and recordings leave the bars out. the gpu work is done after the frame is handed to the screen, so the frame's own work is only the bars (about 0.02 to 0.04 ms) (experimental)"},
-    {"sidefill:3", 0, "the glow, and over it what the picture showed beside its edge a moment ago, carried out into the bar as the picture moves: a pan fills the bar on the side the picture moves away from, darker and fading into the glow. where it is unsure (the side the camera turns towards, cuts, zoom, flat areas, things moving at different depths) it is the glow. marked hud areas and parts that do not move with the picture are kept out. not with the side stretch, not with an output rate (any rate): the glow then, and not while the letterbox crop fills the window. the cpu work (about 0.4 ms a new frame, about twice that at 4k) runs after the frame has gone to the screen, so it does not add to the delay (experimental)"},
+    {"sidefill:3", 0, "the glow, and over it what the picture showed beside its edge a moment ago, carried out into the bar as the picture moves: a pan fills the bar on the side the picture moves away from, darker and fading into the glow. where it is unsure (the side the camera turns towards, cuts, zoom, flat areas, things moving at different depths) it is the glow. marked hud areas and parts that do not move with the picture are kept out. not with the side stretch, not with an output rate: the glow then, and not while the letterbox crop fills the window. the cpu work (about 0.4 ms a new frame, about twice that at 4k) runs after the frame has gone to the screen, so it does not add to the delay (experimental)"},
     {"sidefill", "side bars", "what the window leaves free beside the picture, or above and below it: black, a flat dark grey, or a dim glow from the picture's edge, or the glow with what the picture showed there before (experimental)"},
     {"sidedim", "side bar brightness", "how dark the glow is against the picture's edge. dark keeps it well below the picture, so a screen that dims on bright frames does not darken the game"},
     {"sideblur", "side bar softness", "how fast the glow goes soft away from the picture. softer shows less shape and less movement at the side of the eye"},
@@ -365,7 +365,7 @@ static const Tip kTips[] = {
     {"layout:", 0, "uncompressed: the picture as the device sends it, the least delay. what meyra always used"},
     {"layout", "layout", "compressed (mjpeg): the device sends jpeg pictures that the mac unpacks, a little more delay. some usb cards only reach their format's full frame rate this way. choosing one restarts the source. "
                          "a repeated frame can come unpacked a little differently: if frame generation says the source sends no repeated frames, turn on tolerant repeats (P). "
-                         "if black looks dark grey (darkest about 30), the card packs video levels as full range jpeg: levels cannot undo that, uncompressed or a lower format can"},
+                         "if black looks dark grey (darkest about 30), the card packs video levels as full range jpeg: levels cannot undo that, uncompressed or a lower format can (experimental)"},
     {"debugreport", 0, "copies a text about this mac, its screens, the capture devices and their formats, what runs now and the changed settings, to paste into a message to the developer. no names, serial numbers or folders"},
     {"ain", "audio input", "where the sound is taken from. choosing one restarts the source"},
     {"restart", "source", "stopped and started again, the levels are detected afresh"},
@@ -413,6 +413,7 @@ static const Tip kTips[] = {
     {"@arrangeInFront:", 0, "meyra's windows in front of the other apps'"},
     {"#Compare", 0, "the original against the finished picture, or every stage of the chain, on the picture"},
     {"#Presets", 0, "ten sets of switches on the number keys. shift + a number saves the switches as they are now on that key"},
+    {"#Save Current Switches As", 0, "keeps the switches a preset sets, as they are now, under a number key (also: shift + the number)"},
     {"#Meyra", 0, "the app itself: vsync, screen buffers, game mode, updates"},
     {"#Source", 0, "which device or recording is shown, its format and sound, snapshots"},
     {"#Picture", 0, "what is done to every frame: levels, colour, dither removal, upscaling, enhance, sharpening"},
@@ -456,6 +457,22 @@ static void setTips(NSMenu *m) {
         if (!i.toolTip.length) i.toolTip = tipText(i);
         if (i.submenu) setTips(i.submenu);
     }
+}
+
+// -muteOutput YES (tests: the sound path runs, the speakers stay quiet) counts on the command line only, so a
+// --set or defaults write of it cannot leave the speakers silent behind a ticked play audio
+static bool muteOutput() { return [[[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain][@"muteOutput"] description] boolValue]; }
+
+// the I and M keys: every choice the menu has, in turn. I without the second generator's files stops on it once
+// (return downloads it there), not twice. M skips apple super resolution where the menu greys it
+static int nextGenModel(int g, bool missing) {
+    static const int kMissing[4] = {1, 3, 3, 0};
+    g = ((g % 4) + 4) % 4;
+    return missing ? kMissing[g] : (g + 1) % 4;
+}
+static int nextUpscale(int u, bool srThere) {
+    int n = (((u % 6) + 6) % 6 + 1) % 6;
+    return n == 2 && !srThere ? 3 : n;
 }
 
 // overlay text: a label and its parts, wrapped so that nothing is wider than the picture. the renderer draws the
@@ -681,6 +698,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     MeyraView *_view;
     std::unique_ptr<Source> _source;
     std::string _sourceId, _sourceName;
+    std::vector<std::string> _sourceNames; // every source started this run: the debug report scrubs their kept lines by name
     SourceStatus _status;
     bool _sourceAudio;
     bool _hadFrames;
@@ -901,6 +919,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     _starved = false;
     _cap = _capAll = CaptureCounts(); _hasCap = _signalRateNoted = _starvePinned = false;
     if (id.rfind("replay:", 0) == 0) _sourceName = std::string("Replay: ") + [ns(id.substr(7)) lastPathComponent].UTF8String;
+    if (std::find(_sourceNames.begin(), _sourceNames.end(), _sourceName) == _sourceNames.end()) _sourceNames.push_back(_sourceName);
     _win.subtitle = ns(_sourceName);
     _hadFrames = false;
     gSet.freeze = false;
@@ -919,7 +938,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     audio::reset();
     // replay has no sound; capture sources start the output now so it is ready when the first packet comes
     _sourceAudio = id.rfind("replay:", 0) != 0 && gSet.audio;
-    audio::setMute([NSUserDefaults.standardUserDefaults boolForKey:@"muteOutput"]);
+    audio::setMute(muteOutput());
     if (_sourceAudio && !audio::start(kAudioIoFrames)) logLine("audio output could not start");
     std::string err;
     logLine("source: %s (%s)", _sourceName.c_str(), id.c_str());
@@ -999,7 +1018,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         _videoDelay = _videoDelay > 0 ? _videoDelay + (vd - _videoDelay) * 0.5 : vd; // halfway each second: steady, still quick
     }
     // muteOutput: automated tests keep the speakers quiet while still measuring the sound path
-    audio::retarget(_videoDelay > 0 ? _videoDelay : kDefaultVideoDelay, gSet.audioTrim, !gSet.audio || [NSUserDefaults.standardUserDefaults boolForKey:@"muteOutput"]);
+    audio::retarget(_videoDelay > 0 ? _videoDelay : kDefaultVideoDelay, gSet.audioTrim, !gSet.audio || muteOutput());
 
     int w, h, fw, fh, up;
     renderer::lastSize(w, h, fw, fh, up);
@@ -1289,7 +1308,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
     bool anyNet = did(kDidPreE) || did(kDidE0) || did(kDidE1) || did(kDidE2);
     if (did(kDidE1)) [o addObject:net];
     if (did(kDidD)) [o addObject:@"dither removal"];
-    if (gSet.stabilise && !pass) [o addObject:@"stabilise"]; // no mark of its own: by the setting, as look
+    if (gSet.stabilise && !pass) [o addObject:renderer::stabRan() ? @"stabilise" : gSet.frameGen && ![self genWhy:s] ? @"stabilise idle: steps aside while frames are made" : @"stabilise idle"];
     if (did(kDidE0)) [o addObject:net];
     if (en && !pass && !anyNet) {
         const char *st = en > nets::count() ? "no such net" : nets::status(en);
@@ -1317,7 +1336,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
     if (gSet.look && !pass) [o addObject:[NSString stringWithFormat:@"look %s", kLookName[gSet.look]]];
     if (gSet.grain > 0 && !pass) [o addObject:[NSString stringWithFormat:@"grain %.2f", gSet.grain.load()]];
     if (did(kDidSharp)) [o addObject:sharp];
-    if (gSet.sideFill && !pass && sideBarsNow()) [o addObject:gSet.sideFill == 1 ? @"side bars grey" : gSet.sideFill == 3 ? @"side bars canvas" : @"side bars glow"];
+    if (gSet.sideFill && !pass && sideBarsNow()) [o addObject:gSet.sideFill == 1 ? @"side bars grey" : gSet.sideFill == 3 ? (gSet.sideStretch > 0 || gSet.rate != 0 || renderer::cropOn() ? @"side bars canvas, glow only" : @"side bars canvas") : @"side bars glow"];
     if (renderer::cropOn() && !pass) [o addObject:@"letterbox crop"];
     { float sr = 1, sc = 0; renderer::stretchNow(sr, sc); if (sr > 1.001f && !pass) [o addObject:@"side stretch"]; }
     if (gSet.freeze) [o addObject:@"frozen"];
@@ -1443,7 +1462,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
         for (NSUInteger i = 0; i < parts.count; i++) {
             NSString *t = parts[i], *key = nil;
             for (auto &k : kKey) if ([t hasPrefix:k[0]]) key = k[1];
-            bool idle = [t containsString:@" idle"] || [t hasSuffix:@"starting"], ends = !key; // input and screen have no switch
+            bool idle = [t containsString:@" idle"] || [t hasSuffix:@"starting"], ends = [t hasPrefix:@"input"] || [t hasPrefix:@"screen"] || [t isEqual:@"no picture yet"]; // input and screen are not steps
             NSUInteger len = t.length + (ends ? 0 : 2) + (key ? key.length + 1 : 0) + (i ? 3 : 0);
             if (col && col + len > cols) { put(@"\n", dim); col = 0; }
             if (i) { put(@" → ", faint); col += 3; }
@@ -1468,7 +1487,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
         NSString *note = [self rateNote:s] ?: why ? [@"not generating: " stringByAppendingString:why] : nil;
         if (note) put([@"   " stringByAppendingString:note], idleC);
     } else if (gSet.frameGen) put([NSString stringWithFormat:@"   %@", why ? [@"not generating: " stringByAppendingString:why] : [NSString stringWithFormat:@"generating %d /s", s.gen]], why ? idleC : dim);
-    put(gSet.overlayFull ? @"   [H] hide\n" : @"   [H] all switches\n", keyC);
+    put(gSet.overlayFull ? @"   [H] hide\n" : @"   [H] the switches\n", keyC);
     if (_starved) for (NSString *l in [self wrap:[self starveHint] cols:cols]) put([l stringByAppendingString:@"\n"], idleC); // the card sends too few frames
     { // the ten presets in a row, the one in use lit. changed by hand since: amber, with a mark
         NSColor *onP = [NSColor colorWithRed:0.45 green:0.9 blue:0.5 alpha:1];
@@ -1488,7 +1507,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
         // one row per switch: a dot for its state (green on, amber on but idle, hollow off, small for a choice), the
         // key, the name, a short value. the long story is the hint line. rows sit under what they belong to
         enum { kOff, kOn, kIdle, kPick, kHead, kGap, kInfo };
-        struct Row { int st; NSString *key, *name, *val, *cmd; };
+        struct Row { int st; NSString *key, *name, *val, *cmd; bool more = false; }; // more: the rest of the value above, on a row of its own
         auto sw = [](bool on) { return on ? kOn : kOff; };
         auto ex = [&](int i) { std::string t = renderer::extraText(i, s); return t.rfind("off", 0) == 0 ? kOff : t.rfind("idle", 0) == 0 ? kIdle : kOn; };
         auto word = [](int st) { return st == kOn ? @"on" : st == kIdle ? @"idle" : @"off"; };
@@ -1521,6 +1540,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
         auto blkR = [&](bool on) { return !on ? kOff : rateNow ? blk(on) : kIdle; };
         auto ooR = [&](bool on) { return on && !rateNow ? @"idle: needs an output rate" : oo(on); };
         int grainSt = gSet.grain <= 0 ? kOff : gSet.passthrough ? kIdle : kOn;
+        int stabSt = !gSet.stabilise ? kOff : !gSet.passthrough && renderer::stabRan() ? kOn : kIdle; // by what ran: it steps aside while frames are made
         int sideSt = !gSet.sideFill ? kOff : gSet.passthrough || !sideBarsNow() ? kIdle : kOn;
         NSString *sideW = gSet.sideFill == 1 ? @"grey" : gSet.sideFill == 3 ? (gSet.sideStretch > 0 || gSet.rate != 0 || renderer::cropOn() ? @"canvas, glow only" : @"canvas") : @"glow";
         int cropA[4] = {}, cropS[4] = {};
@@ -1539,7 +1559,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
             {noiseSt, @"D", @"noise filter", noiseSt == kOn ? [NSString stringWithFormat:@"on, %.0f ms", _noiseMs] : word(noiseSt), @"denoise"},
             {enOn ? (renderer::enhanceRan() ? kOn : kIdle) : kOff, @"N", @"enhance", enName, @"enhance"},
             {e0, @"O", @" real frames only", word(e0), @"enhancereal"}, {e1, @"Y", @" steady", word(e1), @"enhancehold"},
-            {!gSet.stabilise ? kOff : gSet.passthrough ? kIdle : kOn, @"", @"stabilise", oo(gSet.stabilise), @"stabilise"},
+            {stabSt, @"", @"stabilise", stabSt == kOn ? @"on" : stabSt == kOff ? @"off" : !gSet.passthrough && genSt == kOn ? @"idle: steps aside while frames are made" : @"idle", @"stabilise"},
             {kGap, nil, nil, nil, nil}, {kHead, nil, @"size and sharpness", nil, nil},
             {gSet.passthrough ? kOff : upIdle ? kIdle : kPick, @"M", @"upscaling", upIdle ? [kUpS[want] stringByAppendingString:@", idle"] : kUpS[want], @"upscale"},
             {e2, @"U", @" supersample", word(e2), @"supersample"},
@@ -1563,24 +1583,24 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
             {blk(gSet.genSmallFast), @"", @" small fast things", oo(gSet.genSmallFast), @"gensmallfast"}, {blkR(gSet.genFallback), @"", @" soft where bad", ooR(gSet.genFallback), @"genfallback"},
             {blk(gSet.genSides), @"", @" one side, steady", oo(gSet.genSides), @"gensides"},
             {blk(gSet.genOutline), @"", @" character whole", oo(gSet.genOutline), @"genoutline"},
-            {blkR(gSet.genCutGuard), @"", @" real frame at a cut", ooR(gSet.genCutGuard), @"gencutguard"},
+            {blkR(gSet.genCutGuard), @"", @" real frame at cut", ooR(gSet.genCutGuard), @"gencutguard"},
             {blk(gSet.genSharp), @"", @" made frames sharp", oo(gSet.genSharp), @"gensharp"},
             {kPick, @"S", @" still areas", still, @"genstill"},
             {sw(gSet.hudLock), @"L", @" hud lock", oo(gSet.hudLock), @"hudlock"},
             {_view.marking ? kOn : !hudN ? kPick : genSt == kOn ? kOn : kIdle, @"Q", @" hud areas", _view.marking ? @"drag one now" : hudN ? [NSString stringWithFormat:@"%d marked%@", hudN, gSet.hudShow ? @", shown" : @""] : @"mark one", @"hudmark"},
             {sw(gSet.cutTest), @"K", @" better cut test", oo(gSet.cutTest), @"cuttest"},
             {smallSt == kOff ? kPick : smallSt, @"T", @" made at", smallT, @"gensmall"},
-            {byRate ? kIdle : usual && !dlOn ? kIdle : kPick, @"", @" deadline", byRate ? @"the output rate decides" : dlT, @"gendeadline"},
-            {byRate ? kIdle : lateSt, @"", @" late frames", byRate ? @"the output rate decides" : lateSt == kOn ? @"a refresh later" : lateSt == kIdle ? @"idle" : @"left out", @"genlatenext"},
+            {byRate ? kIdle : usual && !dlOn ? kIdle : kPick, @"", @" deadline", byRate ? @"by the output rate" : dlT, @"gendeadline"},
+            {byRate ? kIdle : lateSt, @"", @" late frames", byRate ? @"by the output rate" : lateSt == kOn ? @"a refresh later" : lateSt == kIdle ? @"idle" : @"left out", @"genlatenext"},
             {kGap, nil, nil, nil, nil}, {kHead, nil, @"timing", nil, nil},
-            {byRate ? kIdle : kPick, @"E", @"schedule", byRate ? @"the output rate decides" : renderer::deepNow() ? @"in turns" : gSet.early ? @"early" : @"on the tick", @"schedule"},
+            {byRate ? kIdle : kPick, @"E", @"schedule", byRate ? @"by the output rate" : renderer::deepNow() ? @"in turns" : gSet.early ? @"early" : @"on the tick", @"schedule"},
             {gSet.rate && !renderer::rateInfo().on ? kIdle : kPick, @"", @"output rate", gSet.rate && !rateRuns() ? [rateText() stringByAppendingString:gSet.passthrough ? @", idle in passthrough" : !gSet.frameGen ? @", needs frame generation" : !framegen::available() ? @", idle: frame generation is not there" : !renderer::rateSourceOk() ? @", idle: the source's picture format is not one it takes" : @", idle"] : gSet.rate && !renderer::rateInfo().on ? [rateText() stringByAppendingString:@", starting"] : rateText(), @"rate"},
             {rateRuns() ? sw(gSet.rateBlend) : gSet.rateBlend ? kIdle : kOff, @"", @" blend in-betweens", oo(gSet.rateBlend), @"rateblend"},
             {rateRuns() ? kPick : kIdle, @"", @" real frames", snapName(gSet.rateSnap), @"ratesnap"},
             {rateRuns() ? kPick : kIdle, @"", @" ride out drops", cushionName(), @"ratecushion"},
-            {!rateRuns() || !gSet.rateCushion ? (gSet.rateEvenLate ? kIdle : kOff) : sw(gSet.rateEvenLate), @"", @" even out late frames", gSet.rateEvenLate && !gSet.rateCushion ? @"idle: needs ride out drops" : oo(gSet.rateEvenLate), @"rateevenlate"},
-            {!gSet.rateEnhanceMade ? kOff : rateRuns() && netRi.net == 1 ? kOn : kIdle, @"", @" enhance made frames", netMadeName(netRi), @"rateenhancemade"},
-            {renderer::rateClock() ? kIdle : sw(gSet.ptsTime), @"J", @"capture clock", renderer::rateClock() ? @"on: the output rate uses it" : oo(gSet.ptsTime), @"ptstime"}, {sw(gSet.repeatTol), @"P", @"tolerant repeats", oo(gSet.repeatTol), @"repeattol"},
+            {!rateRuns() || !gSet.rateCushion ? (gSet.rateEvenLate ? kIdle : kOff) : sw(gSet.rateEvenLate), @"", @" even late frames", gSet.rateEvenLate && !gSet.rateCushion ? @"idle: needs ride out drops" : oo(gSet.rateEvenLate), @"rateevenlate"},
+            {!gSet.rateEnhanceMade ? kOff : rateRuns() && netRi.net == 1 ? kOn : kIdle, @"", @" enhance made too", netMadeName(netRi), @"rateenhancemade"},
+            {renderer::rateClock() ? kIdle : sw(gSet.ptsTime), @"J", @"capture clock", renderer::rateClock() ? @"used by the rate" : oo(gSet.ptsTime), @"ptstime"}, {sw(gSet.repeatTol), @"P", @"tolerant repeats", oo(gSet.repeatTol), @"repeattol"},
             {sw(gSet.repeatRoll), @"", @"skip after backlog", oo(gSet.repeatRoll), @"repeatroll"},
             {sw(gSet.vsync), @"V", @"vsync", oo(gSet.vsync), @"vsync"},
             {sw(gSet.lateDrawable), @"", @"late screen buffer", oo(gSet.lateDrawable), @"latedrawable"},
@@ -1629,6 +1649,18 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
             }
             inf = o;
         }
+        for (auto *rows : {&pic, &mot, &inf}) { // a switch's long value (an idle reason) goes on over the next rows too, under the value column
+            std::vector<Row> o;
+            for (auto &r : *rows) {
+                if (r.st == kHead || r.st == kGap || r.st == kInfo || r.val.length <= valW) { o.push_back(r); continue; }
+                NSArray<NSString *> *ls = [self wrap:r.val cols:valW];
+                Row first = r;
+                first.val = ls.firstObject;
+                o.push_back(first);
+                for (NSUInteger i = 1; i < ls.count; i++) o.push_back({r.st, @"", @"", ls[i], r.cmd, true});
+            }
+            *rows = o;
+        }
         int ncol = wide >= 3 * cellW + 6 ? 3 : wide >= 2 * cellW + 3 ? 2 : 1;
         NSColor *onC = [NSColor colorWithRed:0.45 green:0.9 blue:0.5 alpha:1];
         NSString *last = [_lastCmd stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"+-"]];
@@ -1643,6 +1675,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
             if (r.st == kInfo) { put(@"  ", dim); put(fit(r.name, 10), faint); put(fit(r.val ?: @"", cellW - 12), dim); return; }
             put(@"  ", dim);
             bool mine = last && [r.cmd isEqual:last], sub = [r.name hasPrefix:@" "]; // the switch just used stands out
+            if (r.more) { put(fit(@"", 2 + keyW + nameW), dim); put(fit(r.val, valW), mine ? hintC : r.st == kOff ? faint : r.st == kIdle ? idleC : r.st == kOn ? onC : NSColor.whiteColor); return; }
             put(r.st == kOn ? @"● " : r.st == kIdle ? @"◐ " : r.st == kOff ? @"○ " : @"· ", r.st == kOn ? onC : r.st == kIdle ? idleC : faint);
             put(fit(r.key, keyW), r.st == kOff ? [keyC colorWithAlphaComponent:0.6] : keyC);
             if (sub) put(@" └ ", faint);
@@ -1791,8 +1824,7 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         bool missing = !flyhigh::complete();
         if (missing && arg.intValue > 0 && arg.intValue < 3) { [self command:[NSString stringWithFormat:@"genget:%d", arg.intValue]]; return; } // picked in the menu: ask. the key only hints
         _genWant = 0;
-        int g = gSet.genModel; // the key goes round the old ones only, block matching is picked in the menu. without its files the second generator is one stop, not two
-        gSet.genModel = [c hasSuffix:@"+"] ? (g == 3 ? 0 : missing ? !g : (g + 1) % 3) :
+        gSet.genModel = [c hasSuffix:@"+"] ? nextGenModel(gSet.genModel, missing) :
                          arg.intValue == 3 ? 3 : ((arg.intValue % 3) + 3) % 3;
         flyhigh::retry();
         blocks::retry();
@@ -1836,7 +1868,7 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         [self applyRefresh]; // 2 leaves the screen's rate alone, the others match it again
     }
     else if ([c isEqual:@"rateblend"]) { gSet.rateBlend = !gSet.rateBlend; settingsSave("rateBlend"); }
-    else if ([c isEqual:@"ratesnap"]) { gSet.rateSnap = clampRateSnap(arg.floatValue); settingsSave("rateSnap"); }
+    else if ([c isEqual:@"ratesnap"]) { if (arg.length) { gSet.rateSnap = clampRateSnap(arg.floatValue); settingsSave("rateSnap"); } } // no number: kept, as the side commands
     else if ([c isEqual:@"ratecushion"]) { gSet.rateCushion = MIN(3, MAX(0, arg.intValue)); settingsSave("rateCushion"); }
     else if ([c isEqual:@"rateevenlate"]) { gSet.rateEvenLate = !gSet.rateEvenLate; settingsSave("rateEvenLate"); }
     else if ([c isEqual:@"rateenhancemade"]) { gSet.rateEnhanceMade = !gSet.rateEnhanceMade; settingsSave("rateEnhanceMade"); }
@@ -1901,7 +1933,7 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     else if ([c isEqual:@"enhanceat"]) { gSet.enhanceAt = ((arg.intValue % 3) + 3) % 3; settingsSave("enhanceAt"); }
     else if ([c isEqual:@"enhancedown"]) { gSet.enhanceDown = ((arg.intValue % 2) + 2) % 2; settingsSave("enhanceDown"); }
     else if ([c isEqual:@"upscale"]) { gSet.upscale = arg.intValue == 5 ? 5 : ((arg.intValue % 5) + 5) % 5; settingsSave("upscale"); }
-    else if ([c isEqual:@"upscale+"]) { int n = (gSet.upscale + 1) % 5; gSet.upscale = n == 2 && !superres::available() ? 3 : n; settingsSave("upscale"); }
+    else if ([c isEqual:@"upscale+"]) { gSet.upscale = nextUpscale(gSet.upscale, superres::available()); settingsSave("upscale"); }
     else if ([c isEqual:@"sharp"]) { gSet.sharpen = fminf(1, fmaxf(0, arg.floatValue)); settingsSave("sharpen"); }
     else if ([c isEqual:@"sharp+"]) { gSet.sharpen = fminf(1, roundf(gSet.sharpen * 10 + 1) / 10); settingsSave("sharpen"); }
     else if ([c isEqual:@"sharp-"]) { gSet.sharpen = fmaxf(0, roundf(gSet.sharpen * 10 - 1) / 10); settingsSave("sharpen"); }
@@ -2342,7 +2374,7 @@ static void logPreset(const char *what, int n) {
                          "S  still areas in generated frames\n"
                          "Q  mark a hud area: drag a rectangle that always shows the real frame\n"
                          "T  generate at: full size, 864, 768, 720 lines\n"
-                         "I  frame generator: apple's, second at 480 lines, second at 720 lines. block matching is in the menu\n"
+                         "I  frame generator: apple's, second at 480 lines, second at 720 lines, block matching\n"
                          "return  download the second generator, while it is chosen and missing\n"
                          "O  enhance on real frames only   Y  steady enhance   U  supersample\n"
                          "space  freeze the picture\n"
@@ -2577,7 +2609,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     NSMenu *ps = submenu(pm, @"Save Current Switches As");
     for (size_t i = 0; i < presets().size(); i++) {
         NSMenuItem *mi = item([NSString stringWithFormat:@"Preset %zu", (i + 1) % 10], [NSString stringWithFormat:@"presetsave:%zu", i + 1], nil);
-        mi.toolTip = [NSString stringWithFormat:@"keeps every picture and motion switch as it is now under key %zu (also: shift + %zu)", (i + 1) % 10, (i + 1) % 10];
+        mi.toolTip = [NSString stringWithFormat:@"keeps the switches a preset sets, as they are now, under key %zu (also: shift + %zu). levels, colour, audio, the side bars, match display refresh, gpu awake and the hud areas are not part of it", (i + 1) % 10, (i + 1) % 10];
         [ps addItem:mi];
     }
     for (size_t i = 0; i < presets().size(); i++) { // only the saved ones show, see validateMenuItem
@@ -2757,7 +2789,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
         if (arg.intValue == 2) { // say why it is off or not running
             const char *st = superres::status();
             mi.title = !superres::available() ? @"Apple Super Resolution (needs macOS 26 and Apple silicon)"
-                     : on && srYields() ? (rateRuns() && gSet.srWithGen ? @"Apple Super Resolution (output rate off only, using MetalFX)" : @"Apple Super Resolution (frame generation off only, using MetalFX)")
+                     : on && srYields() ? (rateRuns() && gSet.srWithGen ? @"Apple Super Resolution (steps aside while made frames go up, using MetalFX)" : @"Apple Super Resolution (frame generation off only, using MetalFX)")
                      : on && *st && strcmp(st, "starting") ? [NSString stringWithFormat:@"Apple Super Resolution (%s, using MetalFX)", st] : @"Apple Super Resolution";
         }
     }
@@ -3029,9 +3061,14 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
 - (NSScreen *)reportScreen { return _win.screen; }
 - (std::string)debugReport { return reportText(self); }
 - (void)reportLive:(const std::function<void(const char *, const std::string &)> &)section {
-    using debugreport::scrub;
+    // device names reach the lines raw (messages, macos' error texts, the kept start lines): each known one gets the
+    // name rules, also for a source used earlier this run and gone since
+    std::vector<std::string> names = _sourceNames;
+    names.push_back(_sourceName);
+    for (auto &d : listSources()) names.push_back(d.name);
+    for (auto &c : listAVFAudioInputs()) names.push_back(c.name);
     std::string t;
-    auto add = [&](NSString *l) { t += "  " + scrub(l.UTF8String) + "\n"; };
+    auto add = [&](NSString *l) { t += "  " + debugreport::scrubKnown(l.UTF8String ?: "", names) + "\n"; };
     if (_sourceId.empty()) add(_off ? @"none, meyra is turned off" : @"none chosen");
     else {
         std::string f = [self curFormat], fn = f, ln = "uncompressed";
@@ -3070,15 +3107,15 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     section("now", t);
     t.clear();
     // start-up facts, kept apart from the ring so a minute of per-second lines does not push them out. written
-    // without device ids
-    for (auto &l : logPinned()) t += "  " + scrub(l) + "\n";
+    // without device ids, but with device names: those get the name rules (an owner after the name goes too)
+    for (auto &l : logPinned()) t += "  " + debugreport::scrubKnown(l, names) + "\n";
     section("capture start (kept)", t.empty() ? "  (no system capture device started this run)" : t);
     t.clear();
     std::vector<std::string> lines; // only the per-second lines and what the card runs: others carry device ids and paths
     for (auto &l : logTail(64))
         for (const char *p : {"t ", "   ", "source: starved", "source: frames back"})
             if (!l.rfind(p, 0)) { lines.push_back(l); break; }
-    for (size_t i = lines.size() > 20 ? lines.size() - 20 : 0; i < lines.size(); i++) t += "  " + scrub(lines[i]) + "\n";
+    for (size_t i = lines.size() > 20 ? lines.size() - 20 : 0; i < lines.size(); i++) t += "  " + debugreport::scrubKnown(lines[i], names) + "\n";
     section("log, last lines", t);
 }
 
@@ -3152,16 +3189,16 @@ static std::string deviceText(bool raw) {
     auto add = [&](const char *fmt, auto... a) { char b[1024]; snprintf(b, sizeof b, fmt, a...); t += b; };
     auto idText = [&](const std::string &id) { std::string k = debugreport::shortId(id); return raw ? id : (k.empty() ? "" : k + " ") + debugreport::idHash(id); };
     for (auto &s : listSources(&hints)) {
-        add("  %s  [%s]  %s, %s:", (raw ? s.name : debugreport::scrub(s.name)).c_str(), idText(s.id).c_str(), s.kind.c_str(), s.formatLabel.c_str());
+        add("  %s  [%s]  %s, %s:", (raw ? s.name : debugreport::scrubName(s.name)).c_str(), idText(s.id).c_str(), s.kind.c_str(), s.formatLabel.c_str());
         for (auto &c : s.formats) add(" %s%s", c.name.c_str(), c.id == s.defaultFormat ? "*" : "");
         t += "\n";
         auto rows = listAVFLayouts(s.id); // every layout the device reports per size and rate
         if (!rows.empty()) t += "    layouts by size and rate (* what the format opens, + offered as compressed):\n";
         for (auto &r : rows) t += "      " + r + "\n";
     }
-    for (auto &h : hints) add("note: %s\n", h.c_str());
+    for (auto &h : hints) add("note: %s\n", (raw ? h : debugreport::scrub(h)).c_str());
     t += "avfoundation audio inputs:\n";
-    for (auto &c : listAVFAudioInputs()) add("  %s  [%s]\n", (raw ? c.name : debugreport::scrub(c.name)).c_str(), (raw ? c.id : debugreport::idHash(c.id)).c_str());
+    for (auto &c : listAVFAudioInputs()) add("  %s  [%s]\n", (raw ? c.name : debugreport::scrubName(c.name)).c_str(), (raw ? c.id : debugreport::idHash(c.id)).c_str());
     add("frame generation: %s\n", framegen::available() ? "available" : "not available");
     return t;
 }
@@ -3205,10 +3242,26 @@ static int gameModeTest(const std::string &set, const char *kept) {
     return 0;
 }
 
+// --self-test: the I and M cycles reach every choice, and the debug report's name rules hold. prints, exits 1 on a failure
+static int selfTest() {
+    int bad = 0;
+    auto check = [&](const char *what, bool ok) { printf("%s %s\n", ok ? "ok  " : "FAIL", what); bad += !ok; };
+    auto walk = [](auto next, int from, int n) { std::vector<int> v = {from}; for (int i = 0; i < n; i++) v.push_back(next(v.back())); return v; };
+    check("I: apple's, 480, 720, block matching, apple's", walk([](int g) { return nextGenModel(g, false); }, 0, 4) == std::vector<int>({0, 1, 2, 3, 0}));
+    check("I without the files: apple's, second, block matching, apple's", walk([](int g) { return nextGenModel(g, true); }, 0, 3) == std::vector<int>({0, 1, 3, 0}));
+    check("I without the files from 720: block matching", nextGenModel(2, true) == 3);
+    check("M: plain, metalfx, apple sr, fsr 1, sgsr 1, hashed, plain", walk([](int u) { return nextUpscale(u, true); }, 0, 6) == std::vector<int>({0, 1, 2, 3, 4, 5, 0}));
+    check("M without apple sr: plain, metalfx, fsr 1, sgsr 1, hashed, plain", walk([](int u) { return nextUpscale(u, false); }, 0, 5) == std::vector<int>({0, 1, 3, 4, 5, 0}));
+    bad += debugreport::scrubTest();
+    printf("%s\n", bad ? "self-test failed" : "self-test passed");
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc > 1 && !strncmp(argv[1], "--update-", 9)) return update::selfTest(std::vector<std::string>(argv + 1, argv + argc));
         if (argc > 1 && !strcmp(argv[1], "--gamemode-test")) return gameModeTest(argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : nullptr);
+        if (argc > 1 && !strcmp(argv[1], "--self-test")) return selfTest();
         for (int i = 1; i < argc; i++) {
             bool more = i + 1 < argc;
             std::string a = argv[i];

@@ -1,5 +1,44 @@
 # changelog
 
+## v0.6.1
+
+released: 2026-11-27
+
+fixes from a read of every setting against its menu, keys, overlay and docs.
+
+- fixed: the i key now steps apple's, second generator at 480, at 720, block matching. without the second
+  generator's files it is apple's, second generator (return downloads it there), block matching. m now reaches hashed
+  filters and plain; apple super resolution is skipped where the menu greys it. help > keyboard shortcuts and the
+  manual say so.
+- fixed: the debug report and `--list-devices` kept an owner's name behind a device ("iphone von …", "iphone de …",
+  "iphone d’…", "iphone di …", "ipad van …") and in front of it ("alexs ipad", "alexin iphone", "アレックスのiphone"),
+  also in the report's last message and last error. a name with an apple device in it (a plain mac too) is now
+  rebuilt from the device words (model, pro, max, 15) and camera or microphone words, in any case or script; other
+  names lose the owner after von, van, de, di, da, do, d’ and before 的, の, 의, while "câmera do studio display" and
+  the like stay whole. every line of the report gets the name rule for the device names it carries, also those of a
+  source used earlier in the run. `--self-test` checks the rules on names and report lines, and that i and m reach
+  every choice.
+- fixed: the full overlay cut values at 18 characters, so most idle reasons could not be read. a long value goes on
+  over the next rows. three row names were shortened to fit: even late frames, real frame at cut, enhance made too;
+  rows the output rate overrides say "by the output rate", the capture clock "used by the rate".
+- fixed: stabilise showed as on while it stepped aside for frame generation. overlay and order line now go by whether
+  it ran: amber "idle: steps aside while frames are made" otherwise.
+- the compact order line gives every step a dot, not only the ones with a key (grain, stabilise, side bars, letterbox
+  crop, side stretch, frozen). "side bars canvas, glow only" where the canvas cannot run.
+- `muteOutput` and `frameLog` count on the command line only (`-muteOutput YES`, `-frameLog FILE`); a `--set` or
+  `defaults write` of them is ignored, so the speakers can no longer stay silent behind a ticked play audio. one
+  saved by 0.6.0 is left out of the report's changed settings.
+- `--command ratesnap` without a number keeps the value instead of setting 0.
+- tooltips: save current switches as says what a preset keeps (and has a tooltip of its own); "take one side, steady"
+  names the switch it is compared with; real frames > some says it is the default; blend says it needs block
+  matching to start; glow with past picture loses "(any rate)"; apple super resolution's title on the output rate
+  says it steps aside while made frames go up; the layout tip says experimental; the status overlay's tip and its
+  h line no longer promise every switch.
+- manual: presets set vsync (built-ins turn it on), as they always did; the full overlay has most switches, not all,
+  and names the ones it leaves out; the still-area rules credit metalgoose; known limits: capture clock drift on
+  30 fps content, not measured; the debug report's name rules; test arguments listed. readme: ride out has three
+  ticks. smaller corrections to w in full screen, n and source > format.
+
 ## v0.6.0
 
 released: 2026-11-27

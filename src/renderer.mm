@@ -321,6 +321,8 @@ static std::atomic<bool> gCropOn;
 bool cropOn() { return gCropOn; }
 void lastSize(int &w, int &h, int &fw, int &fh, int &up) { w = gInfoW; h = gInfoH; fw = gInfoFitW; fh = gInfoFitH; up = gInfoUp; }
 int enhanceRan() { return gInfoNet; }
+static std::atomic<double> gStabRanAt{-1}; // when stabilise last steadied a frame (render thread writes)
+bool stabRan() { double t = gStabRanAt; return t >= 0 && nowSec() - t < 0.5; }
 
 void setLabels(id<MTLTexture> t) { os_unfair_lock_lock(&gLock); gLabelTex = t; os_unfair_lock_unlock(&gLock); }
 std::string compareNames() { os_unfair_lock_lock(&gLock); std::string s = gCmpNames; os_unfair_lock_unlock(&gLock); return s; }
@@ -1189,7 +1191,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     static double genAt;
     if (real && !gRateOn) genAt = nowSec();
     bool stabNow = gSet.stabilise && !gSet.passthrough && (gRateOn ? !rateMaking() : nowSec() - genAt > 0.25);
-    if (stabNow && !real && src.width == W && src.height == H && !(onlyNet && net)) { id<MTLTexture> t = stabilise(cb, src, raw); if (t != src) cmp.push_back({"stabilise", src = t}); }
+    if (stabNow && !real && src.width == W && src.height == H && !(onlyNet && net)) { id<MTLTexture> t = stabilise(cb, src, raw); if (t != src) { cmp.push_back({"stabilise", src = t}); gStabRanAt = nowSec(); } }
     else if ((gStabH[0] || gStabNoW) && !stabNow && !(gRateOn && gSet.stabilise && !gSet.passthrough)) stabDrop();
     else if (!stabNow) gStabOf[0] = gStabOf[1] = 0; // kept textures, not their results: a held picture after the gate
     // lets go would get a steadied one from seconds ago
@@ -2907,7 +2909,8 @@ bool init(NSString *shaderSource, std::string &err) {
     if ([ud floatForKey:@"hudStill"] > 0) gHlStill = [ud floatForKey:@"hudStill"] / 255;
     if ([ud objectForKey:@"drain"]) gDrain = [ud boolForKey:@"drain"];
     gGenDrain = [ud boolForKey:@"genDrain"];
-    if ((gLogPath = [[ud stringForKey:@"frameLog"] stringByExpandingTildeInPath])) gLog = (LogRow *)calloc(kLogMax, sizeof(LogRow));
+    // -frameLog counts on the command line only: kept in the settings, every run would carry the log and the pair figures
+    if ((gLogPath = [[[ud volatileDomainForName:NSArgumentDomain][@"frameLog"] description] stringByExpandingTildeInPath])) gLog = (LogRow *)calloc(kLogMax, sizeof(LogRow));
     if (gLog) blocks::measure(true); // the pair figures, see LogRow. off: the block generator as it was
     // numbered snapshots, see renderer.h
     for (NSString *f in [[[ud objectForKey:@"snapFrames"] description] componentsSeparatedByString:@","])

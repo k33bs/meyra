@@ -366,7 +366,7 @@ fixes. stuck: ask on [discord](https://discord.gg/UpgbaZEUj4).
 - **30 fps on a screen kept at 100 or 144 hz**: output rate > every screen refresh with block matching. most of what you
   see is made then.
 - **a hitch every time the game drops a frame**: with an output rate on, output rate > ride out dropped frames > one
-  tick (+17 ms) or two ticks (+33 ms). costs that delay all the time.
+  tick (+17 ms), two (+33 ms) or three (+50 ms). costs that delay all the time.
 - **a rattle on near detail while turning, 30 fps game**: output rate > even out the game's late frames (experimental),
   with ride out and every signal tick, every screen refresh or a fixed rate. more delay, nearly every frame is made,
   wrong for some games.
