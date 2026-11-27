@@ -3,6 +3,7 @@
 // additional terms under section 7 of the licence: see "licence" in README.md
 #import <QuartzCore/QuartzCore.h>
 #include "common.h"
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,9 @@ Settings gSet;
 
 static FILE *gLogFile;
 static os_unfair_lock gLogLock = OS_UNFAIR_LOCK_INIT;
+static const int kRing = 64;
+static std::string *const gRing = new std::string[kRing]; // the last lines, for the debug report. never freed: threads log during exit
+static int gRingN;
 
 double nowSec() { return CACurrentMediaTime(); }
 static const double gStart = CACurrentMediaTime();
@@ -34,7 +38,40 @@ void logLine(const char *fmt, ...) {
     fprintf(stdout, "%s\n", b);
     fflush(stdout);
     if (gLogFile) { fprintf(gLogFile, "%s\n", b); fflush(gLogFile); }
+    gRing[gRingN++ % kRing] = b;
     os_unfair_lock_unlock(&gLogLock);
+}
+
+static const int kPins = 40;
+static std::string *const gPins = new std::string[kPins]; // a few source starts' worth: switching formats keeps the one before
+static int gPinN;
+
+void logPin(const char *fmt, ...) {
+    char b[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    logLine("%s", b);
+    os_unfair_lock_lock(&gLogLock);
+    gPins[gPinN++ % kPins] = b;
+    os_unfair_lock_unlock(&gLogLock);
+}
+
+std::vector<std::string> logPinned() {
+    std::vector<std::string> v;
+    os_unfair_lock_lock(&gLogLock);
+    for (int i = std::max(gPinN - kPins, 0); i < gPinN; i++) v.push_back(gPins[i % kPins]);
+    os_unfair_lock_unlock(&gLogLock);
+    return v;
+}
+
+std::vector<std::string> logTail(int n) {
+    std::vector<std::string> v;
+    os_unfair_lock_lock(&gLogLock);
+    for (int i = std::max(gRingN - std::min(n, kRing), 0); i < gRingN; i++) v.push_back(gRing[i % kRing]);
+    os_unfair_lock_unlock(&gLogLock);
+    return v;
 }
 
 // ordinary threads wake up to a frame late from a sleep. a time constraint thread does not
@@ -180,12 +217,34 @@ void settingsLoad() {
     gSet.superSample = [d boolForKey:@"superSample"];
     gSet.genShift = [d boolForKey:@"genShift"];
     gSet.genDoubt = [d boolForKey:@"genDoubt"];
+    gSet.genSmallFast = [d boolForKey:@"genSmallFast"];
+    gSet.genFallback = [d boolForKey:@"genFallback"];
+    gSet.genSides = [d boolForKey:@"genSides"];
+    gSet.genOutline = [d boolForKey:@"genOutline"];
+    gSet.genCutGuard = [d boolForKey:@"genCutGuard"];
+    gSet.genSharp = [d boolForKey:@"genSharp"];
     gSet.repeatRoll = [d boolForKey:@"repeatRoll"];
     gSet.grain = (float)fmin(1, fmax(0, [d doubleForKey:@"grain"]));
     gSet.stabilise = [d boolForKey:@"stabilise"];
     gSet.lateDrawable = [d boolForKey:@"lateDrawable"];
     gSet.drawables = [d integerForKey:@"drawables"] == 2 ? 2 : 3;
     gSet.noise = fminf(1, fmaxf(0, [d floatForKey:@"noise"]));
+    gSet.rate = clampRate([d integerForKey:@"rate"]);
+    gSet.rateNum = clampRateNum(gSet.rate, [d doubleForKey:@"rateNum"]);
+    gSet.rateBlend = [d boolForKey:@"rateBlend"];
+    gSet.rateSnap = [d objectForKey:@"rateSnap"] ? clampRateSnap([d floatForKey:@"rateSnap"]) : 0.1f;
+    gSet.rateEven = [d boolForKey:@"rateEven"];
+    gSet.rateCushion = MIN(3, MAX(0, (int)[d integerForKey:@"rateCushion"]));
+    gSet.rateEvenLate = [d boolForKey:@"rateEvenLate"];
+    gSet.rateEnhanceMade = [d boolForKey:@"rateEnhanceMade"];
+    gSet.sideFill = (int)[d integerForKey:@"sideFill"];
+    if ([d objectForKey:@"sideDim"]) gSet.sideDim = [d floatForKey:@"sideDim"];
+    if ([d objectForKey:@"sideBlur"]) gSet.sideBlur = [d floatForKey:@"sideBlur"];
+    if ([d objectForKey:@"sideSmooth"]) gSet.sideSmooth = [d floatForKey:@"sideSmooth"];
+    gSet.letterboxCrop = [d boolForKey:@"letterboxCrop"];
+    gSet.sideStretch = (int)[d integerForKey:@"sideStretch"];
+    if ([d objectForKey:@"stretchCentre"]) gSet.stretchCentre = [d floatForKey:@"stretchCentre"];
+    clampSide();
     hudRectsParse([[d objectForKey:@"hudRects"] description].UTF8String);
     gSet.hudShow = [d boolForKey:@"hudShow"];
     if (id c = [d objectForKey:@"chain"]) { // hidden, for tests. anything but a string was never a chain
@@ -236,11 +295,32 @@ void settingsSave(const char *key) {
     else if ([k isEqual:@"superSample"]) [d setBool:gSet.superSample forKey:k];
     else if ([k isEqual:@"genShift"]) [d setBool:gSet.genShift forKey:k];
     else if ([k isEqual:@"genDoubt"]) [d setBool:gSet.genDoubt forKey:k];
+    else if ([k isEqual:@"genSmallFast"]) [d setBool:gSet.genSmallFast forKey:k];
+    else if ([k isEqual:@"genFallback"]) [d setBool:gSet.genFallback forKey:k];
+    else if ([k isEqual:@"genSides"]) [d setBool:gSet.genSides forKey:k];
+    else if ([k isEqual:@"genOutline"]) [d setBool:gSet.genOutline forKey:k];
+    else if ([k isEqual:@"genCutGuard"]) [d setBool:gSet.genCutGuard forKey:k];
+    else if ([k isEqual:@"genSharp"]) [d setBool:gSet.genSharp forKey:k];
     else if ([k isEqual:@"repeatRoll"]) [d setBool:gSet.repeatRoll forKey:k];
     else if ([k isEqual:@"grain"]) [d setDouble:gSet.grain forKey:k];
     else if ([k isEqual:@"stabilise"]) [d setBool:gSet.stabilise forKey:k];
     else if ([k isEqual:@"lateDrawable"]) [d setBool:gSet.lateDrawable forKey:k];
     else if ([k isEqual:@"drawables"]) [d setInteger:gSet.drawables forKey:k];
+    else if ([k isEqual:@"rate"]) [d setInteger:gSet.rate forKey:k];
+    else if ([k isEqual:@"rateNum"]) [d setDouble:gSet.rateNum forKey:k];
+    else if ([k isEqual:@"rateBlend"]) [d setBool:gSet.rateBlend forKey:k];
+    else if ([k isEqual:@"rateSnap"]) [d setFloat:gSet.rateSnap forKey:k];
+    else if ([k isEqual:@"rateEven"]) [d setBool:gSet.rateEven forKey:k];
+    else if ([k isEqual:@"rateCushion"]) [d setInteger:gSet.rateCushion forKey:k];
+    else if ([k isEqual:@"rateEvenLate"]) [d setBool:gSet.rateEvenLate forKey:k];
+    else if ([k isEqual:@"rateEnhanceMade"]) [d setBool:gSet.rateEnhanceMade forKey:k];
+    else if ([k isEqual:@"sideFill"]) [d setInteger:gSet.sideFill forKey:k];
+    else if ([k isEqual:@"sideDim"]) [d setFloat:gSet.sideDim forKey:k];
+    else if ([k isEqual:@"sideBlur"]) [d setFloat:gSet.sideBlur forKey:k];
+    else if ([k isEqual:@"sideSmooth"]) [d setFloat:gSet.sideSmooth forKey:k];
+    else if ([k isEqual:@"letterboxCrop"]) [d setBool:gSet.letterboxCrop forKey:k];
+    else if ([k isEqual:@"sideStretch"]) [d setInteger:gSet.sideStretch forKey:k];
+    else if ([k isEqual:@"stretchCentre"]) [d setFloat:gSet.stretchCentre forKey:k];
     else if ([k isEqual:@"passthrough"]) [d setBool:gSet.passthrough forKey:k];
     else if ([k isEqual:@"audio"]) [d setBool:gSet.audio forKey:k];
     else if ([k isEqual:@"audioTrimMs"]) [d setDouble:round(gSet.audioTrim * 1000) forKey:k];

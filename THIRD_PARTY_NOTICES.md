@@ -1,17 +1,17 @@
-# Third-party notices
+# third-party notices
 
-Meyra is licensed under the GNU General Public License, version 3 or later (see `LICENSE`). This file lists the
-material in this repository that comes from others, and the published methods Meyra's own code follows.
+meyra is licensed under the gnu general public license, version 3 or later (see `LICENSE`). this file lists the
+material in this repository that comes from others, and the published methods meyra's own code follows.
 
-## Blackmagic Design Desktop Video SDK headers
+## blackmagic design desktop video sdk headers
 
 `vendor/decklink/` contains the header files and `DeckLinkAPIDispatch.cpp` from the `Mac/Include` folder of the
-Blackmagic Design Desktop Video SDK, unmodified. Each file keeps its copyright notice and licence statement.
-They are needed to build Meyra; at run time Meyra loads the Desktop Video runtime
+blackmagic design desktop video sdk, unmodified. each file keeps its copyright notice and licence statement.
+they are needed to build meyra; at run time meyra loads the desktop video runtime
 (`/Library/Frameworks/DeckLinkAPI.framework`), which is not part of this repository and is installed separately
-by the user together with the Blackmagic driver.
+by the user together with the blackmagic driver.
 
-The licence statement carried by these files (the copyright year differs per file):
+the licence statement carried by these files (the copyright year differs per file):
 
 ```
 Copyright (c) 2026 Blackmagic Design
@@ -51,15 +51,15 @@ A copy of the Software is available free of charge at
 https://www.blackmagicdesign.com/desktopvideo_sdk under the EULA.
 ```
 
-The SDK's EULA states (clause 0.1) that its clauses 1, 4.3, 4.4, 5, 7 and 8 do not apply to the files in the
-SDK's `Include` folders, which are the only SDK files included here. These files remain under the terms above,
-not under the GPL; the GPL applies to Meyra's own code. Blackmagic Design, DeckLink and UltraStudio are
+the sdk's eula states (clause 0.1) that its clauses 1, 4.3, 4.4, 5, 7 and 8 do not apply to the files in the
+sdk's `Include` folders, which are the only sdk files included here. these files remain under the terms above,
+not under the gpl; the gpl applies to meyra's own code. Blackmagic Design, DeckLink and UltraStudio are
 trademarks of Blackmagic Design Pty. Ltd.; Meyra is not affiliated with or endorsed by Blackmagic Design.
 
-## AMD FidelityFX Super Resolution 1 (EASU)
+## amd fidelityfx super resolution 1 (easu)
 
-The edge-aware upscaler (`fsEasu` in `resources/Shaders.metal`) is a port of the EASU pass of AMD FidelityFX
-Super Resolution 1 to Metal. It is used under the MIT licence:
+the edge-aware upscaler (`fsEasu` in `resources/Shaders.metal`) is a port of the easu pass of amd fidelityfx
+super resolution 1 to metal. it is used under the mit licence:
 
 Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
 
@@ -77,10 +77,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY
 CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 
-## Snapdragon Game Super Resolution 1
+## snapdragon game super resolution 1
 
-The second edge-aware upscaler (`fsSgsr` in `resources/Shaders.metal`) is a port of Snapdragon Game Super
-Resolution 1 to Metal. It is used under the BSD 3-Clause licence:
+the second edge-aware upscaler (`fsSgsr` in `resources/Shaders.metal`) is a port of snapdragon game super
+resolution 1 to metal. it is used under the bsd 3-clause licence:
 
 Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
 
@@ -112,51 +112,68 @@ POSSIBILITY OF SUCH DAMAGE.
 
 SPDX-License-Identifier: BSD-3-Clause
 
-## PushFPS Live HUD Lock
+## pushfps live hud lock
 
-The hud lock (`fsLockUpdate`, `fsNvFixLock` and their helpers in `resources/Shaders.metal`) is a port to Metal of
-`shaders/PushHudLockUpdate.hlsl` and `shaders/PushHudLockCompose.hlsl` of PushFPS
-(https://github.com/DosukaSOL/PushFPS, commit 3be641ca70f8179838cef4a8ff6cc3117664d185). Changed for Meyra on
-2026-11-22: fragment passes instead of compute passes, the frames are read as two-plane YCbCr, the tolerance is a
-setting, and the compose step is appended to the pass that already repairs generated frames. Both files carry:
+the hud lock (`fsLockUpdate`, `fsNvFixLock` and their helpers in `resources/Shaders.metal`) is a port to metal of
+`shaders/PushHudLockUpdate.hlsl` and `shaders/PushHudLockCompose.hlsl` of pushfps
+(https://github.com/DosukaSOL/PushFPS, commit 3be641ca70f8179838cef4a8ff6cc3117664d185). changed for meyra on
+2026-11-22: fragment passes instead of compute passes, the frames are read as two-plane ycbcr, the tolerance is a
+setting, and the compose step is appended to the pass that already repairs generated frames. both files carry:
 
 Copyright (C) 2026 DosukaSOL and the PushFPS contributors. Part of PushFPS, a modified version of Veyra.
 
 SPDX-License-Identifier: GPL-3.0-or-later
 
-PushFPS is licensed under the GNU General Public License version 3 (see `LICENSE`, the same text); its
-`NOTICE.md` states that the files written for PushFPS are additionally available under any later version of that
-licence, which these two are. PushFPS comes with no warranty.
+pushfps is licensed under the gnu general public license version 3 (see `LICENSE`, the same text); its
+`NOTICE.md` states that the files written for pushfps are additionally available under any later version of that
+licence, which these two are. pushfps comes with no warranty.
 
-## FlyHigh Engine (the second frame generator)
+## metalgoose stability blend
 
-`src/flyhigh.mm` is a port to Objective-C++, MPSGraph and Metal of parts of FlyHigh Engine
+the rules "by motion against contrast" and "by motion against contrast, allows for dither" for still areas in
+generated frames (`genStill` 2 and 3: the `mode > 2.5` branch of `stillWeight`, lines 71-105, and the mix of the two
+real frames in `nvFix`, line 149, in `resources/Shaders.metal`) are a port to metal of `stabilityWeight` and
+`stabilized` in `MetalGoose/Shaders/Stability.metal` of metalgoose
+(https://github.com/Stallion77RepoOfficial/MetalGoose, compared against commit 7a96844), with the numbers of
+`MetalGoose/Core/StabilityBlend.swift`: a noise floor of 4 of 255 and a motion limit of 0.9. changed for meyra on
+2026-11-22: a fragment pass on luma instead of a tiled compute pass on rgb, the test for "nothing changed nearby" on
+whole levels (1.5 of 255, where metalgoose has 1), the two real frames mixed at the middle and on luma only, and the
+newer real frame's pixel where nothing changed. the second rule's test on 3x3 averages, taken only where nothing
+within 5x5 changed by more than 9 of 255, is meyra's own. the metalgoose files carry no copyright line of their own;
+the copyright is held by the metalgoose authors.
+
+metalgoose is licensed under the gnu general public license version 3 (see `LICENSE`, the same text). its readme
+names version 3.0, without "or later", so this part of meyra is under version 3. metalgoose comes with no warranty.
+
+## flyhigh engine (the second frame generator)
+
+`src/flyhigh.mm` is a port to objective-c++, mpsgraph and metal of parts of flyhigh engine
 (https://github.com/getflyhigh/flyhigh-engine, commit 34c3fb6): what each operator of its model graph does
 (`crates/flyhigh-engine/src/net/build.rs`) and the kernels `tex_down`, `render_tex`, `interp`, `warp`, `sad`,
-`convex`, `film`, `luma` and `blend` in `shaders/`. Changed for Meyra on 2026-11-22: the operators are built as one
-MPSGraph instead of WebGPU compute passes, the frames are read and written as two-plane YCbCr, the result is
-written plane by plane, and only the half-way frame is made. The engine's still test, static protection, pattern
+`convex`, `film`, `luma` and `blend` in `shaders/`. changed for meyra on 2026-11-22: the operators are built as one
+mpsgraph instead of webgpu compute passes, the frames are read and written as two-plane ycbcr, the result is
+written plane by plane, and only the half-way frame is made. the engine's still test, static protection, pattern
 repair, pacing and scene classification are not included.
 
-FlyHigh Engine is licensed under the Apache License, Version 2.0; a copy is in `vendor/flyhigh-engine/LICENSE`,
-its `NOTICE` file next to it. That file reads:
+flyhigh engine is licensed under the apache license, version 2.0; a copy is in `vendor/flyhigh-engine/LICENSE`,
+its `NOTICE` file next to it. that file reads:
 
 ```
 FlyHigh Engine
 Copyright 2026 getflyhigh (https://github.com/getflyhigh)
 ```
 
-**The model is not included.** The engine's model files (`graph.json`, `flyhighfg.json`, `flyhighfg.bin`) are
-licensed separately under Creative Commons Attribution-NonCommercial 4.0 International, which cannot be combined
-with the GPL. They are not in this repository or in the app, in any form: Meyra reads them at run time from
-`~/Library/Application Support/Meyra/flyhighfg/` if the user has put them there or had Meyra download them (only on
-request, from that project, after saying what the licence allows), and uses Apple's interpolator otherwise. Whoever installs them is bound by their licence (noncommercial use, attribution).
+**the model is not included.** the engine's model files (`graph.json`, `flyhighfg.json`, `flyhighfg.bin`) are
+licensed separately under creative commons attribution-noncommercial 4.0 international, which cannot be combined
+with the gpl. they are not in this repository or in the app, in any form: meyra reads them at run time from
+`~/Library/Application Support/Meyra/flyhighfg/` if the user has put them there or had meyra download them (only on
+request, from that project, after saying what the licence allows), and uses apple's interpolator otherwise. whoever installs them is bound by their licence (noncommercial use, attribution).
 
-## FSRCNNX weights
+## fsrcnnx weights
 
-`resources/nets/1-fsrcnnx-8-0-4-1.net` holds the weights of FSRCNNX x2 8-0-4-1, taken from the mpv user shader
+`resources/nets/1-fsrcnnx-8-0-4-1.net` holds the weights of fsrcnnx x2 8-0-4-1, taken from the mpv user shader
 `FSRCNNX_x2_8-0-4-1.glsl` (release 1.1 of https://github.com/igv/FSRCNN-TensorFlow) and rewritten as plain numbers
-by `tools/mpv2net.py`; the shader code that runs them is Meyra's own (`src/nets.mm`). The file keeps the
+by `tools/mpv2net.py`; the shader code that runs them is meyra's own (`src/nets.mm`). the file keeps the
 shader's notice:
 
 Copyright (C) 2017-2021 igv
@@ -169,16 +186,16 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public
 License for more details.
 
-The GNU Lesser General Public License version 3 consists of the GNU General Public License version 3 (see
+the gnu lesser general public license version 3 consists of the gnu general public license version 3 (see
 `LICENSE`) and the additional permissions at https://www.gnu.org/licenses/lgpl-3.0.html.
 
 SPDX-License-Identifier: LGPL-3.0-or-later
 
-## ArtCNN weights
+## artcnn weights
 
-`resources/nets/2-artcnn-c4f16.net` and `resources/nets/3-artcnn-c4f16-ds.net` hold the weights of ArtCNN C4F16
-and C4F16 DS, taken from the mpv user shaders `ArtCNN_C4F16.glsl` and `ArtCNN_C4F16_DS.glsl` of
-https://github.com/Artoriuz/ArtCNN in the same way. They are used under the MIT licence:
+`resources/nets/2-artcnn-c4f16.net` and `resources/nets/3-artcnn-c4f16-ds.net` hold the weights of artcnn c4f16
+and c4f16 ds, taken from the mpv user shaders `ArtCNN_C4F16.glsl` and `ArtCNN_C4F16_DS.glsl` of
+https://github.com/Artoriuz/ArtCNN in the same way. they are used under the mit licence:
 
 Copyright (c) 2024 Joao Chrisostomo, Kacper Michajłow
 
@@ -196,12 +213,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY
 CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 
-## Real-ESRGAN weights
+## real-esrgan weights
 
 `resources/nets/99-realesr-general-x4v3.net` holds the weights of realesr-general-x4v3 (release v0.2.5.0 of
 https://github.com/xinntao/Real-ESRGAN) as plain numbers, restructured to one luma channel, not retrained.
 the `teach-general` nets and the `teach-x2plus` nets were trained to copy the output of realesr-general-x4v3 and
-RealESRGAN_x2plus from the same project; their weights are meyra's own. Real-ESRGAN is used under the BSD 3-Clause
+realesrgan_x2plus from the same project; their weights are meyra's own. real-esrgan is used under the bsd 3-clause
 licence:
 
 ```
@@ -236,15 +253,15 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## RAVU-Lite filter table
+## ravu-lite filter table
 
-`resources/ravu-lite-r3.txt` holds the trained filter table of RAVU-Lite r3, taken from
+`resources/ravu-lite-r3.txt` holds the trained filter table of ravu-lite r3, taken from
 `weights/ravu-lite_weights-r3.py` on the `source` branch of https://github.com/bjin/mpv-prescalers (commit
 6b9ba842a05a113a75e5a2ac3d0a7f00f21ffbae) and rewritten as plain numbers in another order by
-`tools/ravu2hash.py`. The shader that uses it (`fsHashY` in `resources/Shaders.metal`, upscale 5) is Meyra's own,
-written from the published method (RAISR, Romano, Isidoro and Milanfar, arXiv 1606.01299, and RAVU-Lite's
-bucket layout); no shader code from that repository is included. The weights file carries no notice of its own;
-the repository is licensed under the LGPL 3.0, and its generator `ravu-lite.py` carries this notice, which the
+`tools/ravu2hash.py`. the shader that uses it (`fsHashY` in `resources/Shaders.metal`, upscale 5) is meyra's own,
+written from the published method (raisr, romano, isidoro and milanfar, arXiv 1606.01299, and ravu-lite's
+bucket layout); no shader code from that repository is included. the weights file carries no notice of its own;
+the repository is licensed under the lgpl 3.0, and its generator `ravu-lite.py` carries this notice, which the
 table file keeps:
 
 Copyright (C) 2017 Bin Jin <bjin@ctrl-d.org>
@@ -257,42 +274,76 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for
 more details.
 
-The GNU Lesser General Public License version 3 consists of the GNU General Public License version 3 (see
+the gnu lesser general public license version 3 consists of the gnu general public license version 3 (see
 `LICENSE`) and the additional permissions at https://www.gnu.org/licenses/lgpl-3.0.html.
 
 SPDX-License-Identifier: LGPL-3.0-or-later
 
-## Methods (no third-party code included)
+## methods (no third-party code included)
 
-- **Sharpening** (`fsOut` in `resources/Shaders.metal`) follows the method of AMD FidelityFX Contrast Adaptive
-  Sharpening (CAS) and the noise term of FidelityFX Robust Contrast Adaptive Sharpening (RCAS), applied to luma
-  only. The FidelityFX SDK is published by Advanced Micro Devices, Inc. under the MIT licence. Meyra's shader
-  is its own implementation; no AMD source code is included.
-- **Dither removal** (`fsDeband`) follows the general approach of the debanding filter in libplacebo (averaging
-  taps on rings around the pixel and keeping the average only where it is close to the pixel). No libplacebo
+- **sharpening** (`fsOut` in `resources/Shaders.metal`) follows the method of amd fidelityfx contrast adaptive
+  sharpening (cas) and the noise term of fidelityfx robust contrast adaptive sharpening (rcas), applied to luma
+  only. the fidelityfx sdk is published by advanced micro devices, inc. under the mit licence. meyra's shader
+  is its own implementation; no amd source code is included.
+- **dither removal** (`fsDeband`) follows the general approach of the debanding filter in libplacebo (averaging
+  taps on rings around the pixel and keeping the average only where it is close to the pixel). no libplacebo
   code is included.
-- **Frame generation** uses Apple's VideoToolbox low latency frame interpolation, a system framework.
-- **Stabilise** (`fsStab` and the passes before it) follows the history reprojection with a neighbourhood clamp
-  of temporal anti-aliasing as described by Brian Karis (High Quality Temporal Supersampling, SIGGRAPH 2014), with
-  motion from Meyra's own block search. No code from any implementation is included.
-- **Cut test, tolerant repeats, capture clock** (`src/cadence.h`) follow methods described for Veyra
-  (https://github.com/Likely7/Veyra-NRVideo, GPL-3.0): scene cuts from a 64x36 luma grid and a histogram,
-  repeated frames compared within a band of 3 levels against the last new frame, and presents timed from the
-  capture timestamp plus a tracked clock offset. Meyra's code is its own implementation with its own tests and
-  thresholds; no Veyra code is included.
-- **Block frame generator** (`src/blocks.mm`) follows the method of the Metal shader generator in MacFrameGen
-  (https://github.com/PabloVSouza/MacFrameGen, GPL-3.0), and the order of its stages: a luma pyramid, block matching
+- **frame generation** uses apple's videotoolbox low latency frame interpolation, a system framework.
+- **stabilise** (`fsStab` and the passes before it) follows the history reprojection with a neighbourhood clamp
+  of temporal anti-aliasing as described by brian karis (high quality temporal supersampling, siggraph 2014), with
+  motion from meyra's own block search. no code from any implementation is included.
+- **cut test, tolerant repeats, capture clock** (`src/cadence.h`) follow methods of veyra
+  (https://github.com/Likely7/Veyra-NRVideo, gpl-3.0): scene cuts from a 64x36 luma grid and a histogram, repeated
+  frames compared within a band of 3 levels against the last new frame, and presents timed from the capture timestamp
+  plus a tracked clock offset. veyra's code was read to understand the methods; meyra's was written apart, and no veyra
+  code is included. the repeat and cut tests have their own sampling, bins and thresholds. the capture clock shares
+  veyra's numbers and rules: its two loop gains (0.1, and 0.0025 = 0.1^2 / 4), its ten-sample start, the outlier limit
+  (a third of a frame, at most 8 ms) and an outlier ignored once, believed the second time on the same side.
+- **block frame generator** (`src/blocks.mm`) follows the method of the metal shader generator in macframegen
+  (https://github.com/PabloVSouza/MacFrameGen, gpl-3.0), and the order of its stages: a luma pyramid, block matching
   on the frame in between from coarse to fine, a 3x3 vector medoid, and a per-pixel choice among a few vectors
-  including zero. It was written after reading that project's source. The kernels, the cost (the mean difference
-  taken out), the candidates, the choice rule and the numbers are Meyra's own.
-- **Picture shift and doubt in the block generator** (`src/blocks.mm`) follow methods of ZeroFG
-  (https://github.com/hy300leosquizz-ctrl/ZeroFG, Apache-2.0 or GPL-2.0-or-later): the whole picture's shift,
+  including zero. it was written after reading that project's source. the kernels, the cost (the mean difference
+  taken out), the candidates, the choice rule and the numbers are meyra's own.
+- **picture shift and doubt in the block generator** (`src/blocks.mm`) follow methods of zerofg
+  (https://github.com/hy300leosquizz-ctrl/ZeroFG, apache-2.0 or gpl-2.0-or-later): the whole picture's shift,
   searched on the coarsest level, as a start vector for fast pans, and, per pixel, a check of whether the frame
-  before and the one after agree on what moves there, the side that does not counting less. No ZeroFG code is
-  included.
-- **Skip only after a lasting backlog** (`src/renderer.mm`) follows the idea of the frame pacer in Moonlight
-  (https://github.com/moonlight-stream/moonlight-qt, GPL-3.0): a frame is dropped to catch up only when the queue
-  has stayed behind over a window of time, not at the first late frame. No Moonlight code is included.
-- **Grain** (`grainOn` in `resources/Shaders.metal`) follows the idea of film grain synthesis as libplacebo applies
-  it (https://github.com/haasn/libplacebo, LGPL-2.1-or-later): noise added to the luma with a strength that depends
-  on the brightness. The noise and the curve are Meyra's own; no libplacebo code is included.
+  before and the one after agree on what moves there, the side that does not counting less. no zerofg code is
+  included; written from a study that read zerofg's shaders.
+- **skip only after a lasting backlog** (`src/renderer.mm`) follows the idea of the frame pacer in moonlight
+  (https://github.com/moonlight-stream/moonlight-qt, gpl-3.0): a frame is dropped to catch up only when the queue
+  has stayed behind over a window of time, not at the first late frame. no moonlight code is included.
+- **grain** (`grainOn` in `resources/Shaders.metal`) follows the idea of film grain synthesis as libplacebo applies
+  it (https://github.com/haasn/libplacebo, lgpl-2.1-or-later): noise added to the luma with a strength that depends
+  on the brightness. the noise and the curve are meyra's own; no libplacebo code is included.
+- **output rate** (the slot planner in `src/slots.h` and the any-rate path in `src/renderer.mm`) follows methods
+  described for macframegen (https://github.com/PabloVSouza/MacFrameGen, gpl-3.0): a count of in-betweens that
+  follows the gap between real frames, and a delay of about one gap less one output period plus the time to make the
+  frames; and for metalgoose (https://github.com/Stallion77RepoOfficial/MetalGoose, gpl-3.0): sampling the capture
+  timeline at each refresh's own time minus a delay, and a delay that rises at once and falls back at 5 % of real
+  time, which is their number. they were written from a study that read macframegen's source and parts of
+  metalgoose's; the planner and the path are meyra's own, no code of either is included. (the stability blend is ported
+  metalgoose code, see "metalgoose stability blend" above.)
+- **real frames, blend in-betweens** (the output rate's snap and time blend): showing the real frame when a slot lands
+  near one is the idea of lossless scaling's `real_timestamp_tolerance` (closed source, known from a forum post) and of
+  openduckframe's `reuseSources` (https://github.com/Jun-Rex/OpenDuckFrame, mit; the study spot-checked its
+  `SPRateSchedule.hpp`); the in-betweens as a cross-fade of the two real frames by time is how mpv's interpolation and
+  most players blend. the thresholds and the code are meyra's own.
+- **newer block generator switches** (`src/blocks.mm`: find small fast things, go soft where the match is bad, take one
+  side, steady, keep the followed character whole, show a real frame across a cut, made frames as sharp as real ones)
+  build on the methods above, and three of them follow further zerofg methods (see above): go soft where the match is
+  bad does what zerofg does where the two moved samples still disagree, a soft fallback there (zerofg: one side or a
+  box blur or the real frame; here the cross-fade, or with the cut guard the nearer real frame); show a real frame
+  across a cut follows zerofg's "a cut has no middle", with its own test (the share of the picture no vector fits, with
+  hysteresis, where zerofg correlates the two lumas); take one side, steady has the same aim as the side choice already
+  credited, by its own means (a cost z-buffer over the pair, smoothed). the sharper resampling is the keys cubic at
+  a = -0.75, a textbook kernel. find small fast things, keep the followed character whole and the detail step are
+  meyra's own. the thresholds and the code are meyra's own; no code of another project is included.
+- **side bars** (`src/sidefill.mm`, `src/canvas.mm`, `src/letterbox.mm`): the glow follows the ambient modes of players
+  and tvs (blurred, dimmed, time-smoothed edge fill), and blurrier and darker further out as the papers on foveated
+  video extrapolation describe (avraham and schechner, ieee jstsp 2011; aides et al., iccp 2011). the glow with past
+  picture carries what the picture showed out by its motion, the background-mosaic idea (irani, anandan and hsu, iccv
+  1995). the side stretch's curve is the one of bjin's `hyperview.hook`, a
+  user shader for mpv published as a gist with no licence stated (y = (r - 1) x^3 + x); it was written from that formula,
+  taken from a study that read the gist, given a true middle band, and inverted in closed form (cardano) where the shader takes newton
+  steps. the letterbox finder, the glow with past picture and its block matching are meyra's own. the dither's integer
+  hash uses the lowbias32 constants (chris wellons, public domain). no code of these is included.

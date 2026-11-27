@@ -6,11 +6,15 @@
 #import <Foundation/Foundation.h>
 #include <atomic>
 #include <string>
+#include <vector>
 
 double nowSec();                         // CACurrentMediaTime, host clock in seconds
 double sinceStart(double t = 0);         // seconds since launch, now or at host time t
 void logOpen(const char *path);          // also write log lines to this file
 void logLine(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+std::vector<std::string> logTail(int n);  // the last n log lines (up to 64 are kept), oldest first, for the debug report
+void logPin(const char *fmt, ...) __attribute__((format(printf, 1, 2))); // a log line also kept apart (the last 40), so start-up facts stay in the report
+std::vector<std::string> logPinned();     // those, oldest first
 void makeRealtime(double periodSec);     // time constraint policy for the calling thread
 std::string fourcc(uint32_t v);
 void tag709(CVPixelBufferRef pb);       // mark a buffer as bt.709, which every source here is
@@ -80,11 +84,37 @@ struct Settings {
     // 2026-11-25 batch, all off = as before
     std::atomic<bool> genShift{false};    // block generator (genModel 3): the whole picture's shift is searched first and offered as a start vector (big pans)
     std::atomic<bool> genDoubt{false};    // block generator: where the warp from the frame before and the one from the frame after disagree, the side that fits its surroundings is taken
+    std::atomic<bool> genSmallFast{false}; // block generator: the search keeps small fast things its coarse levels lose (blocks::kSmall). not genSmall, that is the size made at
+    std::atomic<bool> genFallback{false}; // block generator, any rate: where the two warped sides still disagree, the time blend (blocks::kFallback)
+    std::atomic<bool> genOutline{false};  // block generator: the followed character over moving scenery keeps its outline (blocks::kStill | kBand | kBorder)
+    std::atomic<bool> genSharp{false};    // block generator: made frames as sharp as real ones (blocks::kCrisp | kDetail), 0.16 ms more a frame
+    std::atomic<bool> genCutGuard{false}; // block generator, output rate: across a cut or a camera whip a real frame, not a torn made one (blocks::kWhole | kNear)
+    std::atomic<bool> genSides{false};    // block generator: which side to believe where something covers or uncovers, once a pair and smoothed (blocks::kSides)
     std::atomic<bool> repeatRoll{false};  // a late frame is only skipped when frames have been queuing for half a second, not at the first one
     std::atomic<float> grain{0};          // fine grain added in the last pass, stronger in the dark and mid tones: 0 off .. 1
     std::atomic<bool> stabilise{false};   // the frame before, moved along the picture's motion and limited to what is around now, is mixed in: steadier edges
     std::atomic<bool> lateDrawable{false};// the screen's buffer is asked for after the gpu work is written down, not before
     std::atomic<int> drawables{3};        // buffers the layer cycles through: 3, or 2 (a frame less queued, can stall)
+    // any rate (renderer.mm, slots.h): output slots of their own, any content rate to any output rate. 0 = as before
+    std::atomic<int> rate{0};             // 0 off, 1 a frame every tick of the signal, 2 every refresh of the screen, 3 a fixed rate (rateNum fps),
+                                          // 4 times rateNum, even phases in every gap, 5 times rateNum with the count following the gap, 6 source rate, nothing in between
+    std::atomic<double> rateNum{0};       // the fps for 3, the times for 4 and 5. 0: 60 resp. 2
+    std::atomic<bool> rateBlend{false};   // in-betweens are a plain cross-fade by time (block generator's blend, whatever genModel says)
+    std::atomic<float> rateSnap{0.1f};    // a slot this close to a real picture (share of the gap) shows the picture. 0 off
+    std::atomic<bool> rateEven{false};    // pictures timed by an even content clock, not by the tick they showed up on (24 / 25 fps in a 60 hz signal)
+    std::atomic<int> rateCushion{0};      // ticks of delay held on purpose (0 to 3): a game frame that much late (a dropped frame) is still in time, no hold
+    std::atomic<bool> rateEvenLate{false}; // content by count, not arrival: a game that moves a fixed step a frame (most at 30) has its late frames
+                                          // shown at its pace, the delay riding in the cushion (slots.h Clock). needs a cushion
+    std::atomic<bool> rateEnhanceMade{false}; // the enhance net after the generator keeps running while made frames go up, on made and real
+                                          // frames alike, while the gpu keeps up (renderer.mm netMadeTick). off: the net steps aside, as before
+    // side bars (sidefill.h): what the window leaves free around the picture. 0 = black, as before
+    std::atomic<int> sideFill{0};         // 0 black, 1 a flat dark grey, 2 a glow in the colours of the picture's edge, 3 the glow with what the picture showed there before (canvas.h)
+    std::atomic<float> sideDim{0.7f};     // how much darker than the edge the glow is past the seam, 0.3 .. 0.95
+    std::atomic<float> sideBlur{1.0f};    // how fast it gets softer going out: px of blur radius per px, 0.25 .. 2
+    std::atomic<float> sideSmooth{200};   // ms the glow takes to follow the picture (time constant), 30 .. 1000
+    std::atomic<bool> letterboxCrop{false}; // black bands above and below a wide picture inside the source: the band fills the window
+    std::atomic<int> sideStretch{0};      // the picture wider into the side bars, middle true: 0 off, 1 2 3 a third, two thirds, all of them
+    std::atomic<float> stretchCentre{0.3f}; // the middle that keeps the fit's scale, in half widths, 0 .. 0.6. hidden: 0 is the plain cubic
 };
 static const int kHudMax = 8;
 void hudRectsParse(const char *s);       // the setting's text into gSet, what does not read as a rectangle is left out
@@ -105,4 +135,24 @@ static const int kGenSmallW[] = {0, 1280, 1344, 1536}, kGenSmallH[] = {0, 720, 7
 // with srWithGen off: super resolution steps aside while frame generation is on (no extra delay that way)
 // noise filter: 0 off, kPreN or kPreNSide. a chain names it itself, without one the setting means beside
 inline int effNoise() { int c = gSet.chain; return gSet.passthrough ? 0 : c & kChainSet ? c & (kPreN | kPreNSide) : gSet.denoise ? kPreNSide : 0; }
-inline bool srYields() { return gSet.upscale == 2 && effFrameGen() && !gSet.srWithGen; }
+// any rate: apple super resolution does not run at all while it is on (renderer.mm, see rateTick)
+namespace framegen { bool available(); }
+namespace renderer { bool rateMaking(); bool rateSourceOk(); }
+// the output rate's settings, one clamp for the command, the menu and the load (a plist, --set, a preset): rate 3 at
+// 0.5 fps from a hand-edited plist ran at 0.5 fps. no number: the mode's own (fixed: 60)
+inline int clampRate(long r) { return r < 0 || r > 6 ? 0 : (int)r; }
+inline double clampRateNum(int rate, double n) { return !(n > 0) ? 0 : rate == 3 ? fmin(240, fmax(10, n)) : rate == 4 || rate == 5 ? fmin(8, fmax(2, round(n))) : 0; }
+inline float clampRateSnap(float s) { return fminf(0.45f, fmaxf(0, s)); }
+// the side bars' settings, one clamp for the load (plist, command line) and the commands. nan reads as the default
+inline void clampSide() {
+    auto cl = [](std::atomic<float> &v, float lo, float hi, float def) { float x = v; v = x == x ? fminf(hi, fmaxf(lo, x)) : def; };
+    if (gSet.sideFill < 0 || gSet.sideFill > 3) gSet.sideFill = 0;
+    cl(gSet.sideDim, 0.3f, 0.95f, 0.7f); cl(gSet.sideBlur, 0.25f, 2, 1); cl(gSet.sideSmooth, 30, 1000, 200); cl(gSet.stretchCentre, 0, 0.6f, 0.3f);
+    if (gSet.sideStretch < 0 || gSet.sideStretch > 3) gSet.sideStretch = 0;
+}
+// the any-rate path can run: a rate, frame generation on and there, a 2vuy source (renderer::rateSourceOk: the last
+// frame's format). rate 2 with another format greyed match display refresh for a path that never ran
+inline bool rateRuns() { return gSet.rate && effFrameGen() && framegen::available() && renderer::rateSourceOk(); }
+// on the any-rate path super resolution steps aside only while made frames are a share of what goes up
+// (renderer::rateMaking, off over 10 %, on again under 4 % for 3 s): rate 6, a generator not ready, all real frames keep it
+inline bool srYields() { return gSet.upscale == 2 && effFrameGen() && (!gSet.srWithGen || (rateRuns() && renderer::rateMaking())); }

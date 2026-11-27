@@ -41,7 +41,25 @@ struct Stats {
     // gpu ms per stage (kSt*), summed over the command buffers measured (stageN), and those buffers' whole gpu time.
     // on unless -stageTimes NO
     double stage[9] = {}, stageCb = 0; int stageN = 0;
+    // content time: every frame shown carries the time of the content it shows (a real frame its own, a generated one
+    // a + t · gap). step: how far content moved from one present to the next against how far apart the two were,
+    // off = more than 2 ms apart. at the present call (call*) and on the glass. glass - content: every frame, not only real ones
+    int callN = 0, callOff = 0; double callErr = 0, callMax = 0;
+    int stepN = 0, stepOff = 0; double stepErr = 0, stepMax = 0;
+    double cGlassSum = 0, cGlassMax = 0, cGlassMin = 1e9; int cGlassN = 0;
+    double cNewSum = 0; int cNewN = 0;           // the same over frames whose content moved on from the one before: what audio and the delay go by (a held picture would add its age)
+    // any rate (gSet.rate): slots presented as a real picture, a generated one, the nearer real one because the
+    // in-between asked for was not made in time (late) or could not be asked for (fall: this generator makes the middle
+    // only, or it is not up), the same picture again (held), and slots passed over because the render thread came late
+    int slotReal = 0, slotGen = 0, slotLate = 0, slotFall = 0, slotHold = 0, slotSkip = 0;
+    int slotMid = 0;                             // of slotFall: off the middle, with a generator that makes the middle only
 };
+// any rate: what the planner is doing, for the overlay and the log
+struct RateInfo { bool on = false; int mode = 0, why = 0, rises = 0, steps = 0, late = 0, pauses = 0, held = 0; double num = 0, d = 0, budget = 0, period = 0, screen = 0, lag = -1, hz = 0, cushion = 0;
+                  bool even = false; double speed = 0, level = 0; long counted = 0, byArrival = 0, capped = 0; // even: rateEvenLate's content clock runs (slots.h Clock): its speed now (usual gap / step), level (arrival - content), pictures by count, by arrival, held under the cushion // the planner's (slots.h), period: of the output. screen: its hz, when it took fewer slots than asked. lag: hand-over to glass as the drain saw it, -1 not on a screen. hz: the screen's refresh as measured (else its mode's), cushion: the delay held on purpose (rateCushion)
+                  int net = 0, netTrips = 0; double netGpu = 0, netSlot = 0, netLate = 0, netAgain = 0; }; // rateEnhanceMade: 0 off, 1 the net runs on made frames too, 2 idle (no net chosen), 3 stepped aside (the gpu p95 a frame and the slot in ms, the late share of made slots, s until it tries again; trips so far); 4 idle (the chain has no net after the interpolator)
+RateInfo rateInfo();
+bool rateClock();                // the output rate runs and times its pictures by the capture clock (unless -rateClock NO)
 // a generated frame, dither removal and the enhance net before the interpolator, dither removal, the net after dither
 // removal / before it / after the upscaler, sharpening before the upscaler, upscalers by lastSize's numbers
 // (kDidUp + 1 = metalfx ...), the net's picture filtered down to the window, sharpening
@@ -80,6 +98,15 @@ int snapsLeft();                     // numbered snapshots still to be saved, -1
 int chainNow();                      // the chain as it runs right now (common.h), which a schedule or a missing part can make another than the one asked for
 Stats takeStats();
 bool fullRange();
+// the letterbox crop (letterboxCrop) as drawn last: where the whole picture went (all, past the drawable's edges) and
+// its part that shows (shown), drawable pixels, x y w h from the top left. w 0: no crop, the picture is at the fit
+void cropRects(int all[4], int shown[4]);
+// the sides-only stretch as drawn last: r, how many times wider than the fit the picture went (1: none), and the half
+// width in the middle kept at the fit's scale. with cropRects' all: picture x (-1..1 across it at the fit) lands at
+// y = x for |x| <= centre, else centre + m t + (r - 1) t^3 with t = (|x| - centre) / m, m = 1 - centre, sign kept, y
+// in the fit's half widths from all's middle
+void stretchNow(float &r, float &centre);
+bool cropOn(); // the letterbox crop holds a band now (cropRects is also set by the stretch alone)
 void lastSize(int &w, int &h, int &fitW, int &fitH, int &upscaler); // upscaler that ran last: 0 none or plain, 1 metalfx, 2 apple super resolution, 3 fsr 1, 4 sgsr 1, 5 hashed filters
 std::string extraText(int which, const Stats &s); // enhanceReal (0), enhanceHold (1), superSample (2): "off", "acting: ..." or "idle: why"
 int enhanceRan();                   // the enhance net the last frame went through, 0 = none (off, still starting, cannot run)

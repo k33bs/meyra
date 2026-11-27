@@ -10,15 +10,19 @@
 #include "cadence.h"
 #include "common.h"
 #include "framegen.h"
+#include "blocks.h"
+#include "slots.h"
 #include "nets.h"
 #include "noise.h"
 #include "record.h"
+#include "sidefill.h"
 #include "superres.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <memory>
+#include <tuple>
 #include <os/lock.h>
 #include <vector>
 
@@ -28,6 +32,7 @@ static id<MTLDevice> gDev;
 static id<MTLCommandQueue> gQueue;
 static id<MTLRenderPipelineState> gPipeYuv, gPipeNv, gPipeNvFix, gPipeOut, gPipeDeband, gPipeHud, gPipeEasu, gPipeSgsr, gPipeDown, gPipeTiles, gPipeTileY, gPipeTileC, gPipeBackY, gPipeBackC, gPipeLock, gPipeNvFixLock, gPipeNvFixHud, gPipeNvFixLockHud, gPipeLook, gPipeCut;
 static id<MTLRenderPipelineState> gPipeBox, gPipeKeepAdd, gPipeKeepUse, gPipeHold; // the experimental switches
+static id<MTLRenderPipelineState> gPipeOutWarp; // the stretch's last pass, sidefill.mm's own: made the first time it is wanted
 static CAMetalLayer *gLayer;
 static CVMetalTextureCacheRef gCache;
 static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
@@ -48,7 +53,12 @@ static std::atomic<int> gSnapLeft{-1}, gLoop{0};
 void replayLoop(int n) { gLoop = n; }
 // frameLog (hidden, for tests): one row per drawn frame, kept in memory and written as csv at quit. the slow frames
 // are in the tail, which the once a second averages hide. times in seconds since launch, gpu and gen in ms
-struct LogRow { const char *kind; int frame; double arrival, present, presented, gpu, gen; };
+// content: the content time it shows (see Stats), due: the slot it was planned for (any rate, else 0), t: the position
+// between its two real frames (0 for a real one), slot: r real, m generated, f the nearer real for a missing in-between,
+// h held, - not the any-rate path
+// any rate with the block generator, on a made frame (m, M): its pair's figures (framegen::Figures, fig.pair 0 none),
+// the columns after slot: pair, pgap (ms), vx, vy, vlen (px), err, unfit, fall
+struct LogRow { const char *kind; int frame; double arrival, present, presented, gpu, gen, content, due; float t; char slot; framegen::Figures fig; };
 static LogRow *gLog;
 static const int kLogMax = 200000;        // 55 minutes at 60
 static std::atomic<int> gLogN{0};
@@ -73,6 +83,7 @@ static std::atomic<bool> gFullSeen{false};
 static std::atomic<int> gDarkFrames{0};
 static std::atomic<double> gQueueLag{0};   // from handing a frame to the display to it being on screen, last frame
 static std::atomic<double> gLagSeen{0};   // when a present last reported
+static std::atomic<double> gGlassAt{0};   // when a present last reported a time on the glass: none off a screen
 static std::atomic<double> gLagSince{0};  // repeatRoll: when the display's queue went behind and has not been under two frame times since, 0 = not behind
 static std::atomic<int> gLagRun{0};        // frames in a row for which that was over two and a half frame times (up to two is normal, by where the refresh falls): the display's queue has backed up and stays so
 // drain (hidden, -drain NO: as before): plain passthrough sheds a backlog too, see tick. genDrain (hidden, off): frame
@@ -183,6 +194,83 @@ static int frameOf(CVPixelBufferRef pb) { // replay's frame number, -1 without
     if (f) CFRelease(f);
     return i;
 }
+// any rate: the slot the next show() is for, set around the call. kind 0: not the any-rate path
+static struct { char kind; double due, content; float t; double lag; } gSlot; // lag: rateEvenLate, arrival - content of what it shows (the audio's delay)
+static bool gRateOn;                      // render thread: the any-rate path runs (see rateTick)
+static int gRateGm;                       // the generator the path was set up for (3: block matching, or blend)
+static bool gRateCapped;                  // rate 3 asked for more than the screen's refresh, got that
+// content time (Stats): a frame's on the frame itself, set where it comes in. read only by the stats and the log, and
+// only kept while the path runs: rate 0 runs the old code, frame log or not. never on a buffer the capture source owns:
+// only on our own copies (the plain path hands the time to show() beside the frame)
+static bool whenOn() { return gRateOn; }
+static bool gLogRate;                     // the path ran in this run: the frame log gets its four columns (else as before)
+static double gPlainWhen;                 // render thread: the plain path's content time for the show() it calls
+static const CFStringRef kWhenKey = CFSTR("meyra.when");
+static void setWhen(CVPixelBufferRef pb, double t) {
+    if (!whenOn()) return;
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &t);
+    CVBufferSetAttachment(pb, kWhenKey, n, kCVAttachmentMode_ShouldNotPropagate);
+    CFRelease(n);
+}
+static double whenOf(CVPixelBufferRef pb) {
+    double t = 0;
+    if (CFTypeRef a = pb ? CVBufferCopyAttachment(pb, kWhenKey, NULL) : NULL) {
+        if (CFGetTypeID(a) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)a, kCFNumberDoubleType, &t);
+        CFRelease(a);
+    }
+    return t;
+}
+static double gRateUnit;                  // its output period, for the gap stat: whole numbers of it are even
+static double gRateShownAt;               // render thread: the any-rate path's last present
+static double gRateShownC;                // and the newest content time it showed
+static double gGlassC;                    // under gLock: content time of the last frame that reached the glass
+static std::atomic<double> gPresentedAt{0}; // the newest presentedTime, for any rate's 2
+// any rate, under gLock: the screen's refresh as presents land on it, and the path's gpu time per frame. the mode's
+// nominal period is off on real screens (the U34's 100 hz is 99.85): rate 2's grid and the cap measured against it
+// fell behind the screen, and only the drain made up for it
+static float gPresGap[64], gGpuMs[120];
+static int gPresGapN, gGpuMsN;
+static std::atomic<double> gPresP{0};     // the median one-refresh gap of the last 64, 0 before 32
+static double gpuP95() { // ms, 0 before 30
+    float v[120];
+    os_unfair_lock_lock(&gLock);
+    int n = std::min(gGpuMsN, 120);
+    memcpy(v, gGpuMs, sizeof v);
+    os_unfair_lock_unlock(&gLock);
+    if (n < 30) return 0;
+    int k = n * 95 / 100;
+    std::nth_element(v, v + k, v + n);
+    return v[k];
+}
+static double screenP() { // measured, else the mode's. a median more than 1 % off the mode is another screen's or mode's
+    double m = gPresP, n = display::period();
+    return m > 0 && n > 0 && fabs(m / n - 1) < 0.01 ? m : n;
+}
+struct Miss { double handed = 0, due = 0, gs = 0, ge = 0; bool gen = false; char kind = 0; }; // gs, ge: the completed handler's, read after
+static std::atomic<double> gRateLead{0}; // rate 2's lead in force (runSlots), for the miss line
+// the presented handler: a present a refresh later after its hand-over than the one before it, after a gap of two
+// refreshes or more. at most a line a second, with the count of the rest. what it says: the call late (the render
+// thread), the gpu late (waited behind other work, or ran long), or neither. "gpu done before the glass" is set against
+// the same for on-time presents (least and median of the last 64): a miss that was done as early as they were is the
+// compositor's or another app's, one done later is ours
+static void missLog(const Miss &m, double pt, double prev) {
+    static double lastLag, lastLine;
+    static int quiet, okN;
+    static float ok[64];
+    double lag = pt - m.handed, P = screenP();
+    bool up = P > 0 && lastLag > 0 && lag > lastLag + 0.5 * P && pt - prev > 1.5 * P;
+    lastLag = lag;
+    if (!up) { if (m.ge > 0 && pt - prev < 1.5 * P) ok[okN++ % 64] = (float)(pt - m.ge); return; }
+    if (pt - lastLine < 1) { quiet++; return; }
+    lastLine = pt;
+    float v[64]; int n = std::min(okN, 64);
+    memcpy(v, ok, sizeof v);
+    std::sort(v, v + n);
+    logLine("rate: a refresh missed (%d more since the last line): slot %c, call done %.1f ms after its slot, gpu waited %.1f ran %.1f ms, done %.1f ms before the glass (on time: least %.1f median %.1f), lead %.1f ms, generator %s, glass %.1f ms after the hand-over",
+            quiet, m.kind ? m.kind : '-', m.due > 0 ? (m.handed - m.due) * 1000 : 0, m.gs > 0 ? (m.gs - m.handed) * 1000 : -1, m.gs > 0 ? (m.ge - m.gs) * 1000 : -1,
+            m.ge > 0 ? (pt - m.ge) * 1000 : -1, n ? v[0] * 1000 : -1, n ? v[n / 2] * 1000 : -1, gRateLead * 1000, m.gen ? "making frames" : "idle", lag * 1000);
+    quiet = 0;
+}
 static void copyFrame(CVPixelBufferRef from, CVPixelBufferRef to) {
     CFTypeRef f = CVBufferCopyAttachment(from, kFrameKey, NULL);
     if (f) { CVBufferSetAttachment(to, kFrameKey, f, kCVAttachmentMode_ShouldNotPropagate); CFRelease(f); }
@@ -225,6 +313,12 @@ void applyColour() {
 
 void setFrameDur(double s) { if (s > 0.001 && s < 1) gFrameDur = s; }
 
+static std::atomic<int> gCropA[4], gCropS[4]; // render thread writes, any reads: a frame's worth of tearing is harmless
+static std::atomic<float> gWarp[4] = {{1}, {0}, {0}, {0}}; // no stretch until the first one
+void cropRects(int all[4], int shown[4]) { for (int i = 0; i < 4; i++) { all[i] = gCropA[i]; shown[i] = gCropS[i]; } }
+void stretchNow(float &r, float &centre) { r = gWarp[0]; centre = gWarp[1]; }
+static std::atomic<bool> gCropOn;
+bool cropOn() { return gCropOn; }
 void lastSize(int &w, int &h, int &fw, int &fh, int &up) { w = gInfoW; h = gInfoH; fw = gInfoFitW; fh = gInfoFitH; up = gInfoUp; }
 int enhanceRan() { return gInfoNet; }
 
@@ -372,7 +466,7 @@ static void stSample(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> pipe, M
     }
     StCtx *c = gStCtx.get();
     if (!c || c->n >= kStPasses) return;
-    c->st[c->n] = gStInStab ? kStStab : pipe == gPipeDeband ? kStDither : pipe == gPipeOut || pipe == gPipeLook ? kStSharpen : pipe == gPipeHud || pipe == gPipeCut ? kStOverlay : pipe == gPipeDown ? kStShrink
+    c->st[c->n] = gStInStab ? kStStab : pipe == gPipeDeband ? kStDither : pipe == gPipeOut || pipe == gPipeOutWarp || pipe == gPipeLook ? kStSharpen : pipe == gPipeHud || pipe == gPipeCut ? kStOverlay : pipe == gPipeDown ? kStShrink
                 : pipe == gPipeYuv || pipe == gPipeNv || pipe == gPipeNvFix || pipe == gPipeNvFixLock || pipe == gPipeNvFixHud || pipe == gPipeNvFixLockHud || pipe == gPipeBackY || pipe == gPipeBackC ? kStConvert : kStUpscale; // easu, sgsr, apple's tiles
     MTLRenderPassSampleBufferAttachmentDescriptor *a = rp.sampleBufferAttachments[0];
     a.sampleBuffer = c->buf;
@@ -392,6 +486,7 @@ static double gKeptAt;                    // when the net ran on it
 static id<MTLTexture> gKeptRaw, gKeptTmp, gKeptPic; // the net's own change before steadying, a generated frame's, the finished picture
 static int gKeptStamp;
 static bool gRepeatNow;                   // set by tick: the frame being shown is a repeat of the one shown before
+static bool gNetMade;                     // rateEnhanceMade acting now (render thread, netMadeTick): the net runs on made frames too
 // hidden, for tests: keepTol, how far (levels of 255) a pixel's 3x3 may be from the guide and still count as the same
 // picture, none from twice that (the soft still rule's numbers). holdMs, the time constant of steady enhance.
 // holdMargin, how far outside the fresh 3x3 range the held change may sit. enhanceAhead NO: generated frames only
@@ -448,7 +543,7 @@ static id<MTLTexture> enhance(id<MTLCommandBuffer> cb, int en, int at, id<MTLTex
             return gKeptPic;
         }
     float tol = gKeepTol / 255;
-    if ((!made && gRepeatNow) || (made && gSet.enhanceReal)) {
+    if ((!made && gRepeatNow) || (made && gSet.enhanceReal && !(gRateOn && gNetMade))) { // rateEnhanceMade: the net itself on a made frame
         Kept *k1 = NULL, *k2 = NULL;
         if (made) {
             for (Kept &k : gKept) { if (k.of && k.of == a) k1 = &k; else if (k.of && k.of == b) k2 = &k; }
@@ -653,16 +748,19 @@ static CVPixelBufferRef picOf(CVPixelBufferRef pb, double graceMs, bool count = 
 // read what it writes. a pixel that moves lets go by itself, so nothing here resets on a cut
 static id<MTLTexture> gHl[2];             // [0] the state up to gHlFor
 static CVPixelBufferRef gHlFor;           // the real frame the state has seen last, retained
+static CVPixelBufferRef gHlPrev;          // the one before it, retained: gHl[1] is the state up to it until the next update.
+                                          // any rate shows a pair after a newer picture came in (d longer than a gap)
 static float gHlStill = 0.02f;            // hudStill (hidden, in levels of 255): largest change still counted as the same pixel
 static std::atomic<float> gHlShare{-1};   // share of the picture locked, counted about once a second, for the log
 static void lockDrop() {
     if (gHlFor) { CFRelease(gHlFor); gHlFor = NULL; }
+    if (gHlPrev) { CFRelease(gHlPrev); gHlPrev = NULL; }
     gHl[0] = gHl[1] = nil;
     gHlShare = -1;
 }
 float hudLocked() { return gHlShare; }
-static id<MTLTexture> lockFor(size_t W, size_t H) {
-    return gSet.hudLock && gHl[0] && gHl[0].width == W && gHl[0].height == H ? gHl[0] : nil;
+static id<MTLTexture> lockFor(size_t W, size_t H, CVPixelBufferRef upTo) { // upTo: the newer real frame of the pair shown
+    return gSet.hudLock && gHl[0] && gHl[0].width == W && gHl[0].height == H ? (upTo && upTo == gHlPrev && upTo != gHlFor ? gHl[1] : gHl[0]) : nil;
 }
 static void lockUpdate(CVPixelBufferRef nv) {
     size_t W = CVPixelBufferGetWidth(nv), H = CVPixelBufferGetHeight(nv);
@@ -717,7 +815,10 @@ static void lockUpdate(CVPixelBufferRef nv) {
         [cb commit];
     } else for (auto x : p) if (x) CFRelease(x);
     CFRetain(nv);
-    if (gHlFor) CFRelease(gHlFor);
+    bool prev = !fresh && gRateOn; // a fresh start wrote no state up to the one before. rate 0 holds no more than it did
+    if (gHlPrev) CFRelease(gHlPrev);
+    gHlPrev = prev ? gHlFor : NULL;
+    if (!prev && gHlFor) CFRelease(gHlFor);
     gHlFor = nv;
 }
 
@@ -920,8 +1021,15 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         pb = gFrozen;
         real = prevReal = NULL;
     } else thaw();
-    CVPixelBufferRef raw = pb; // as it came, before the noise filter or a stage ahead of the interpolator
-    pb = picOf(pb, onlyNet ? 2 : 14, !onlyNet); // a frame shown the moment it arrived (no frame generation, 60 fps content) waits for its filter here
+    // content time (Stats), before the frames are swapped for their filtered pictures: a generated one's halfway on
+    // the two schedules, where the any-rate path's slot says otherwise
+    double content = 0, clag = gSlot.kind ? gSlot.lag : 0; // clag: rateEvenLate's level, for glass - content (audio)
+    if (whenOn()) {
+        double wa = whenOf(prevReal), wb = whenOf(real);
+        content = gSlot.kind ? gSlot.content : real ? (!prevReal ? wb : wa > 0 && wb > 0 ? 0.5 * (wa + wb) : 0) : gPlainWhen > 0 ? gPlainWhen : whenOf(pb);
+    }
+    CVPixelBufferRef raw = pb, realIn = real; // as it came, before the noise filter or a stage ahead of the interpolator
+    pb = picOf(pb, onlyNet ? 2 : gSlot.kind ? 1 : 14, !onlyNet); // a frame shown the moment it arrived (no frame generation, 60 fps content) waits for its filter here. any rate: a slot is due now, the raw frame rather than a missed refresh
     if (real) real = picOf(real, 2);
     if (gSet.freeze && CVBufferHasAttachment(pb, kPreKey)) pb = raw; // frozen: the chain as it is now, not the pre picture made when the frame came
     if (prevReal) prevReal = picOf(prevReal, 0);
@@ -935,10 +1043,16 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     size_t W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb), gw = W, gh = H;
     if (real) { W = CVPixelBufferGetWidth(real); H = CVPixelBufferGetHeight(real); } // genSmall: a generated frame is smaller than the picture
     CVMetalTextureRef t0 = NULL, t1 = NULL, r0 = NULL, r1 = NULL, p0 = NULL;
-    if (real && prevReal) CVMetalTextureCacheCreateTextureFromImage(NULL, gCache, prevReal, NULL, MTLPixelFormatR8Unorm, W, H, 0, &p0);
+    // any rate, a position before the middle: the fix pass takes its pixels from the older real frame, the nearer one,
+    // else a hud change shows up early on every position of the pair. done by what is bound, the passes stay the same:
+    // hud lock, hud areas and the colour rim read the older frame, the still rule compares the same two frames and
+    // takes still pixels from the older (still = the same in both)
+    CVPixelBufferRef fixA = real, fixB = prevReal;
+    if ((gSlot.kind == 'm' || gSlot.kind == 'M') && gSlot.t < 0.5f && real && prevReal) std::swap(fixA, fixB);
+    if (real && prevReal) CVMetalTextureCacheCreateTextureFromImage(NULL, gCache, fixB, NULL, MTLPixelFormatR8Unorm, W, H, 0, &p0);
     if (real) {
-        CVMetalTextureCacheCreateTextureFromImage(NULL, gCache, real, NULL, MTLPixelFormatR8Unorm, W, H, 0, &r0);
-        CVMetalTextureCacheCreateTextureFromImage(NULL, gCache, real, NULL, MTLPixelFormatRG8Unorm, W / 2, H / 2, 1, &r1);
+        CVMetalTextureCacheCreateTextureFromImage(NULL, gCache, fixA, NULL, MTLPixelFormatR8Unorm, W, H, 0, &r0);
+        CVMetalTextureCacheCreateTextureFromImage(NULL, gCache, fixA, NULL, MTLPixelFormatRG8Unorm, W / 2, H / 2, 1, &r1);
     }
     if (nv) {
         CVMetalTextureCacheCreateTextureFromImage(NULL, gCache, pb, NULL, MTLPixelFormatR8Unorm, gw, gh, 0, &t0);
@@ -1001,6 +1115,12 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     // which then works on window pixels, costs more than twice as much; outside that it runs as at 0
     int en = onlyScale || scaled || enSet > nets::count() ? 0 : enSet, at = gSet.enhanceAt;
     if (cs) { at = 0; if (!postE) en = 0; } // a chain has the net after dither removal, or before the interpolator
+    // any rate: no net after frame generation while made frames go up. its residual can only be kept from a real frame
+    // for still pixels: moving edges would be sharp on real frames and soft on made ones, a pulse at the cadence. a net
+    // before the interpolator (a chain with E first) still runs: made frames come from its pictures. nothing made
+    // (rate 6, a generator not ready, all real on a slow screen): the net runs on the real frames
+    // rateEnhanceMade (netMadeTick): the net stays, on made and real frames alike, while the gpu keeps up
+    if (gRateOn && (rateMaking() || gSlot.kind == 'm' || gSlot.kind == 'M') && !gNetMade) en = 0; // a made frame itself: never
     if (at == 2 && !(fw > W && fh > H && fw * fh <= 2 * W * H)) at = 0;
     id<MTLTexture> net = nil; // the net's picture, once it has run
     if (!enSet) nets::idle();
@@ -1025,7 +1145,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     // "nothing changed" is 1 of 255 (1.5 here is the same test on whole levels). 4, for tests only: no rule
     int st = gSet.genStill;
     float lv[4] = {fullRange() ? 1.0f : 0.0f, p0 && st < 4 ? st + 1.0f : 0.0f, (st == 1 ? 4.5f : 1.5f) / 255, (gSd ? 1.0f : 0.0f) + (oldGreen ? 2.0f : 0.0f)}; // levels, still-area rule, its tolerance, mode
-    id<MTLTexture> lk = nv && r0 && r1 ? lockFor(W, H) : nil; // hud lock: after the still-area rule, on top of it
+    id<MTLTexture> lk = nv && r0 && r1 ? lockFor(W, H, gRateOn ? realIn : NULL) : nil; // rate 0 as it was. hud lock: after the still-area rule, on top of it
     // hud areas: the marked rectangles take the real frame's pixel last of all (struct HA in the shader). none set: the passes as they were
     float ha[36] = {};
     int hn = nv && r0 && r1 ? std::min(gSet.hudN.load(), kHudMax) : 0;
@@ -1064,12 +1184,15 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         if (flat) { pass(cb, gPipeDeband, src, nil, flat, (MTLViewport){0, 0, (double)flat.width, (double)flat.height, 0, 1}, db); src = flat; cmp.push_back({"dither removal", src}); }
     }
     // not while frames are generated: only the real ones would be steadied, and the picture would change between
-    // steadied and not at the screen's rate
+    // steadied and not at the screen's rate. the output rate: by the made share (madeCount), a made frame alone passes
+    // untouched, and the textures stay for when it comes back (freed and made again on the render thread each time)
     static double genAt;
-    if (real) genAt = nowSec();
-    bool stabNow = gSet.stabilise && !gSet.passthrough && nowSec() - genAt > 0.25;
+    if (real && !gRateOn) genAt = nowSec();
+    bool stabNow = gSet.stabilise && !gSet.passthrough && (gRateOn ? !rateMaking() : nowSec() - genAt > 0.25);
     if (stabNow && !real && src.width == W && src.height == H && !(onlyNet && net)) { id<MTLTexture> t = stabilise(cb, src, raw); if (t != src) cmp.push_back({"stabilise", src = t}); }
-    else if ((gStabH[0] || gStabNoW) && !stabNow) stabDrop();
+    else if ((gStabH[0] || gStabNoW) && !stabNow && !(gRateOn && gSet.stabilise && !gSet.passthrough)) stabDrop();
+    else if (!stabNow) gStabOf[0] = gStabOf[1] = 0; // kept textures, not their results: a held picture after the gate
+    // lets go would get a steadied one from seconds ago
     if (en && at == 0 && (net = runNet(src))) { src = net; cmp.push_back({"enhance", src}); }
     if (!onlyNet) {
     if ((ch & kSharpFirst) && effSharpen() > 0) { // chain SU: sharpen what the upscaler is given, the last pass then only resamples
@@ -1196,7 +1319,37 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     float u[4] = {1.0f / src.width, 1.0f / src.height, (ch & kPostS) && !(ch & kSharpFirst) ? effSharpen() : 0, 0};
     float grain = gSet.passthrough ? 0 : gSet.grain.load();
     if (grain > 0) { static uint32_t n; u[3] = (float)(n++ & 1023) + fminf(grain, 0.999f); } // frame number and strength in one float, see grainOn
-    pass(cb, gPipeOut, src, nil, dr.texture, vp, u);
+    // letterbox crop: a wide band inside the source, black above and below, fills the window. the picture goes up
+    // larger, past the drawable's edges, and only the band shows. vp stays the fit: the snapshot, the recording's
+    // rectangle and the overlay take it as always. not with a compare view
+    MTLViewport all = vp, shown = vp;
+    double ease = 1;
+    bool crop = gSet.letterboxCrop && !gSet.passthrough && !cm && !onlyScale && !onlyNet;
+    if (crop) crop = sidefill::crop(realIn ?: raw, fullRange(), vp, dw, dh, all, shown, &ease);
+    else sidefill::cropOff(); // starts over with its full hold when it is back
+    // sides-only stretch: the picture wider into the side bars, its middle true, the stretch growing to the edges
+    // (sidefill.h, fsOutWarp). the same rules as the crop. the crop wins: while it eases in, the stretch eases out
+    float wc[4] = {1, 0, 0, 0};
+    double sr = gSet.sideStretch && !gSet.passthrough && !cm && !onlyScale && !onlyNet ? sidefill::stretchWidth(gSet.sideStretch, vp, dw) : 1;
+    if (crop) sr = 1 + (sr - 1) * (1 - ease);
+    MTLViewport allC = all, shownC = shown;
+    bool warp = sr > 1 && sidefill::stretch(sr, gSet.stretchCentre, dw, all, shown, wc);
+    if (warp && !gPipeOutWarp) gPipeOutWarp = sidefill::warpPipe(gDev);
+    if (!gPipeOutWarp && warp) { warp = false; all = allC; shown = shownC; }
+    if (crop) { gSc = (MTLScissorRect){(NSUInteger)shown.originX, (NSUInteger)shown.originY, (NSUInteger)shown.width, (NSUInteger)shown.height}; gScOn = true; }
+    pass(cb, warp ? gPipeOutWarp : gPipeOut, src, nil, dr.texture, all, u, false, nil, nil, nil, nil, warp ? wc : NULL, warp ? sizeof wc : 0);
+    gScOn = false;
+    static bool cropWas; // off and off before: nothing written
+    if (crop || warp || cropWas) {
+        bool on = cropWas = crop || warp;
+        gCropOn = crop;
+        const double a[4] = {all.originX, all.originY, all.width, all.height}, s[4] = {shown.originX, shown.originY, shown.width, shown.height};
+        for (int i = 0; i < 4; i++) { gCropA[i] = on ? (int)lround(a[i]) : 0; gCropS[i] = on ? (int)lround(s[i]) : 0; gWarp[i] = warp ? wc[i] : i ? 0 : 1; }
+    }
+    // side bars: drawn around what shows of the picture from what goes up now, their time counted with this pass's. the
+    // snapshot and the recording take vp only, so they leave them out as they leave out the grain. off or in plain
+    // passthrough: nothing
+    if (gSet.sideFill && !gSet.passthrough) sidefill::draw(cb, src, realIn ?: raw, !realIn, dr.texture, shown, all, fw, fh, ^(MTLRenderPassDescriptor *rp) { if (gStOn) stSample(cb, gPipeOut, rp); });
     // compare view. 1 to 5: the original against the result, see below. 6 and 7: the picture in strips, left to right as
     // the chain goes, each from one stage further on. 6: every strip its own part of the picture. 7: the middle strip of
     // the picture, from every stage. over the finished frame, snapshots are taken without it
@@ -1312,26 +1465,63 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
 
     // every frame: when did it really reach the screen. counts alone can look perfect while the spacing is not
     double dur = gFrameDur, handed = nowSec();
+    // the gap stat counts whole frame times as even. any rate: whole output periods, the tolerance at most a quarter of one
+    double unit = gRateOn && gRateUnit > 0 ? gRateUnit : dur, tol = gRateOn ? fmin(4.5, unit * 250) : 4.5;
     int li = gLog ? gLogN.fetch_add(1) : kLogMax;
     LogRow *lr = li < kLogMax ? &gLog[li] : NULL;
-    if (lr) *lr = {arrival > 0 ? "real" : real ? "gen" : "repeat", frameOf(real ?: pb), arrival > 0 ? sinceStart(arrival) : 0, 0, 0, 0, real ? framegen::lastMs() : 0};
+    if (lr) *lr = {arrival > 0 ? "real" : real ? "gen" : "repeat", frameOf(real ?: pb), arrival > 0 ? sinceStart(arrival) : 0, 0, 0, 0, real ? framegen::lastMs() : 0,
+                   content > 0 ? sinceStart(content) : 0, gSlot.kind ? sinceStart(gSlot.due) : 0, gSlot.kind == 'm' || gSlot.kind == 'M' ? gSlot.t : real ? 0.5f : 0.0f, gSlot.kind ? gSlot.kind : '-', {}};
+    if (lr && (gSlot.kind == 'm' || gSlot.kind == 'M')) framegen::figuresOf(raw, lr->fig); // the made frame as it came, before its filters
+    bool ro = gRateOn; // the path's own stores and clock read: none at rate 0
+    // any rate: what a frame that missed its refresh went through, for the log (rate 2 at 100 hz: of 197 misses with the
+    // call on time, 114 had under 3 ms of gpu and nothing in the frame log said why)
+    std::shared_ptr<Miss> mi = ro && gSet.rate == 2 ? std::make_shared<Miss>() : nullptr; // 1:1 only: elsewhere a phase wrap is two refreshes
+    if (mi) { mi->handed = handed; mi->due = gSlot.kind ? gSlot.due : 0; mi->gen = framegen::making(); mi->kind = gSlot.kind; }
     [dr addPresentedHandler:^(id<MTLDrawable> d) {
         static std::atomic<double> last{0};
         double pt = d.presentedTime;
         if (lr && pt > 0) lr->presented = sinceStart(pt);
-        if (pt > 0) { gQueueLag = pt - handed; if (pt - handed > 2.5 * dur) gLagRun++; else gLagRun = 0; }
+        if (ro && pt > 0) { gPresentedAt = pt; gGlassAt = nowSec(); } // any rate 2: the screen's phase. the drain: glass seen
+        if (pt > 0) { gQueueLag = pt - handed; if (pt - handed > 2.5 * unit) gLagRun++; else gLagRun = 0; } // unit: dur, or the output period
         else gLagRun = 0; // not on a screen: nothing known
         // behind from two frame times on, no longer behind under one and a half: a queue that sits at the line must not start the clock again at every frame
         double ls = gLagSince, lag = pt > 0 ? pt - handed : 0;
-        gLagSince = lag > 2.0 * dur ? (ls > 0 ? ls : pt) : lag > 1.5 * dur ? ls : 0;
+        gLagSince = lag > 2.0 * unit ? (ls > 0 ? ls : pt) : lag > 1.5 * unit ? ls : 0;
         gLagSeen = nowSec();
+        double mprev = 0; // for missLog, after the lock (it writes a log line)
         os_unfair_lock_lock(&gLock);
         if (pt <= 0) gS.notShown++;
         else {
             double prev = last.exchange(pt), gap = (pt - prev) * 1000;
+            if (ro && prev > 0) { // one-refresh gaps only: a slot left out or held is two
+                double np = display::period();
+                if (np > 0 && gap > 500 * np && gap < 1500 * np) {
+                    gPresGap[gPresGapN++ % 64] = (float)(gap / 1000);
+                    if (gPresGapN >= 32 && gPresGapN % 8 == 0) {
+                        float v[64]; int n = std::min(gPresGapN, 64);
+                        memcpy(v, gPresGap, sizeof v);
+                        std::nth_element(v, v + n / 2, v + n);
+                        gPresP = v[n / 2];
+                    }
+                }
+                mprev = prev;
+            }
             // off the source's frame grid by more than 4.5 ms. a whole number of frame times is fine: skipped repeats
-            double steps = fmax(1, round(gap / (dur * 1000)));
-            if (prev > 0 && gap > 0 && gap < 500) { gS.gapN++; if (fabs(gap - steps * dur * 1000) > 4.5) gS.gapBad++; if (gap > gS.gapMax) gS.gapMax = gap; }
+            double steps = fmax(1, round(gap / (unit * 1000)));
+            if (prev > 0 && gap > 0 && gap < 500) { gS.gapN++; if (fabs(gap - steps * unit * 1000) > tol) gS.gapBad++; if (gap > gS.gapMax) gS.gapMax = gap; }
+            double pc = gGlassC;
+            if (content > 0) {
+                gGlassC = content;
+                if (pc > 0 && prev > 0 && gap > 0 && gap < 500) {
+                    double e = fabs((content - pc) * 1000 - gap);
+                    gS.stepN++; gS.stepErr += e; gS.stepOff += e > 2; if (e > gS.stepMax) gS.stepMax = e;
+                }
+                double cg = (pt - content - clag) * 1000; // (rateEvenLate: from when it came, not its content time)
+                gS.cGlassSum += cg; gS.cGlassN++;
+                if (content > pc + 1e-6) { gS.cNewSum += cg; gS.cNewN++; }
+                if (cg > gS.cGlassMax) gS.cGlassMax = cg;
+                if (cg < gS.cGlassMin) gS.cGlassMin = cg;
+            }
             if (arrival > 0) {
                 double g = (pt - arrival) * 1000;
                 gS.shown++; gS.toGlassSum += g; gS.toGlassN++;
@@ -1340,6 +1530,7 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
             }
         }
         os_unfair_lock_unlock(&gLock);
+        if (mi && mprev > 0) missLog(*mi, pt, mprev);
     }];
     CFRetain(pb); // the frame's memory must outlive the gpu work
     if (real) CFRetain(real);
@@ -1352,7 +1543,9 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
         if (lr) lr->gpu = gpu;
         gS.gpuSum += gpu; gS.gpuN++;
         if (gpu > gS.gpuMax) gS.gpuMax = gpu;
+        if (ro) gGpuMs[gGpuMsN++ % 120] = (float)gpu;
         os_unfair_lock_unlock(&gLock);
+        if (mi) { mi->gs = c.GPUStartTime; mi->ge = c.GPUEndTime; }
         CFRelease(t0);
         if (t1) CFRelease(t1);
         if (r0) CFRelease(r0);
@@ -1370,13 +1563,24 @@ static void show(CVPixelBufferRef pb, double arrival, CVPixelBufferRef real = NU
     [cb presentDrawable:dr];
     [cb commit];
     if (lr) lr->present = sinceStart();
+    static double callAt, callC; // the content step at the present call, against the calls' own spacing
+    double ce = -1;
+    if (content > 0) {
+        double callNow = nowSec();
+        if (callC > 0 && callNow - callAt < 0.5) ce = fabs((content - callC) - (callNow - callAt)) * 1000;
+        callAt = callNow; callC = content;
+    }
     os_unfair_lock_lock(&gLock);
+    if (ce >= 0) { gS.callN++; gS.callErr += ce; gS.callOff += ce > 2; if (ce > gS.callMax) gS.callMax = ce; }
     gS.drawn++;
     did |= (real ? 1u << kDidGen : 0) | (ran ? 1u << (kDidUp + ran) : 0) | (net ? 1u << (kDidE0 + at) : 0) | (u[2] > 0 ? 1u << kDidSharp : 0);
     for (int i = 0; i < kDidN; i++) gS.did[i] += did >> i & 1;
     if (ran == 2) gS.sr++;
     if (arrival > 0) { gS.toPresSum += (nowSec() - arrival) * 1000; gS.toPresN++; }
     os_unfair_lock_unlock(&gLock);
+    // side bars: the next glow and the canvas's look at the new frame, behind the present, in a buffer of their own.
+    // its gpu time counts towards the next frame's
+    if (id<MTLCommandBuffer> c = sidefill::after(gQueue)) { timed(c); [c commit]; }
 }
 
 // the interpolator only takes 420v. 2vuy in, +1 out. cpu loop, about a millisecond at 1080p
@@ -1622,7 +1826,7 @@ static bool nextAsked;
 // srNoDeep (hidden, for tests): never in turns. the scaler then runs inside show() next to the interpolator
 static bool deepWanted() {
     static const bool no = [NSUserDefaults.standardUserDefaults boolForKey:@"srNoDeep"];
-    return !no && effFrameGen() && effUpscale() == 2 && gSet.srWithGen && superres::available() && gSrCan;
+    return !no && effFrameGen() && effUpscale() == 2 && gSet.srWithGen && superres::available() && gSrCan && !rateRuns(); // any rate: never in turns, see rateTick. a rate that cannot run: as off
 }
 // 1.5 ms of margin left 1% of generated frames late live. pre stages run before the generator can start: their time
 // (as it had to wait for them) counts, and the 15 ms ceiling does not hold then
@@ -1642,7 +1846,485 @@ static double genBudget() {
     return ms / 1000;
 }
 
+// any rate (gSet.rate; 0: nothing here runs, the schedules above are as they were). new pictures go to the slot
+// planner (slots.h) instead of the pair schedules; every output slot shows a real picture, one made between two at a
+// position, or the last picture again, presented from this thread at the slot's own time whatever the schedule
+// setting says. slot times: 1 the signal's ticks (moved on by the work a picture needs, so the least delay lands
+// slots on pictures), 2 the screen's refreshes (its rate for the period, the last presentedTime for the phase; the
+// display is left at its own rate, app.mm), 3 to 6 the planner's own.
+// decided here, all for this path only:
+// - apple super resolution does not run (srYields, deepWanted): on real frames only it would switch scalers at the
+//   output rate, and on every present it is ~9 ms of the neural engine. metalfx stands in
+// - the enhance net does not run after frame generation (show): at 100+ presents a second it cannot run on each, and
+//   a residual kept from real frames only covers still pixels, moving edges would pulse. a net before the
+//   interpolator (a chain with E first) still runs
+// - stabilise steps aside by itself while generated frames go up (show); with nothing generated it runs on real ones
+// - the recorder takes what is drawn, at whatever rate; the audio follows glass - content time (app.mm)
+// - a repeat that changed a little (a spinner) is a new picture only once the picture has stood still for the
+//   planner's pause: a hud ticking at 60 over a 30 fps game must not turn every tick into a picture
+static slots::Planner gPl;                // render thread only
+static std::tuple<int, int, long, long, bool, bool, int, long, int, bool> gRateKey; // what it was set up for (rate, generator, num, period, blend, even, snap, screen, cushion, even late): a change starts over
+// presents no closer than the screen's refresh (runSlots), times modes plan no more (slots.h space), rate 3 no faster.
+// -rateCap NO: off, for tests: a backed-up queue and the drain
+static bool rateCap() { static const bool on = ![[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain][@"rateCap"] isEqual:@"NO"]; return on; }
+// tests only (argument domain): -rateTestLate N: every Nth made frame counts as late (not taken); -rateTestMax K: a
+// request holds at most K positions, the rest thinned as past 16. so a replay run has the fallbacks a slow gpu gets
+static int rateTest(NSString *k) { return [[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain][k] intValue]; }
+static CVPixelBufferRef gRateMid;          // the made frame up now (the fallback shows it again), its pair and content time
+static long gRateMidA = -1;
+static double gCapBase;                    // the earliest the next present may go: one per refresh on average (see runSlots)
+static double gRateMidC;
+static float gRateMidT;
+struct RatePic { long id = -1; CVPixelBufferRef nv = NULL; double t = 0, arrival = 0, lag = 0; bool shown = false; float asked[framegen::kAtMax]; int nAsked = 0; }; // lag: rateEvenLate's level
+static const int kRatePics = 8;
+static RatePic gRp[kRatePics];            // the last pictures, at id % kRatePics, held. asked: the positions asked of (id - 1, id)
+static long gRpN;                         // the next id
+static double gSlotT;                     // the next slot, 0 none
+static slots::Slot gPend;                 // planned, not up yet (the cap)
+static double gPendT, gShownT;            // its due time, 0 none; the due time of the last present
+static double gBehindSince, gDrainAt;     // drain: behind since, the last slot left out
+static bool gDrainArmed;
+static int gDrainWait;
+static double gRateLag;                   // the glass lag the drain saw last, -1 none (not on a screen): the log
+static double gCallLate;                  // the last present's call returned this long after its slot (a blocked drawable)
+static double gGridA, gGridP, gGridPhi;   // 1, 2: a point of the slot grid, its period; 1: how far after the tick
+static double gLastWhen;                  // the last picture's arrival (or capture clock) time
+static bool gStillFed;                    // the last picture was a changed repeat taken in, see above
+static double gEvenW[16], gEvenT;         // rateEven: the last arrivals, the last content time given
+static int gEvenN;
+static slots::Clock gLateClk;               // rateEvenLate: content times by count (slots.h Clock), with a cushion only
+static RateInfo gRi;                      // under gLock
+RateInfo rateInfo() { os_unfair_lock_lock(&gLock); RateInfo r = gRi; os_unfair_lock_unlock(&gLock); return r; }
+static bool rateClockArg() { static const bool on = ![[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain][@"rateClock"] isEqual:@"NO"]; return on; }
+static std::atomic<bool> gClockFed{false}; // the last frame's time came from the capture clock (a source with timestamps)
+bool rateClock() { return rateClockArg() && rateInfo().on && gClockFed; }
+// made frames are a share of what goes up: the enhance net after generation, super resolution and stabilise step aside
+// (made and real frames would differ in sharpness). off past 10 % of about the last 2 s, on again once under 4 % for
+// 3 s. "one in the last 2 s" switched them off for 2 s at every isolated made frame (a 7 ms late picture at 60 on 60, a
+// dropped frame now and then): a change of sharpness on the real frames around it each time. now that frame goes up
+// without them (show) and nothing else changes. "on after 7 s with none" kept them off for good after one dip of a 59
+// fps game. 4-10 % keeps what it was (58 fps with a dip every 30 s: off 38 % of the time). rate 6, a generator not
+// ready or refused, all real: they run. the share outlives a start over of the path (another size, generator, a drop):
+// cleared there, real frames had them and made ones not for the first half second every time
+static std::atomic<bool> gRateMaking{false};
+static double gMadeShare, gMadeT, gMadeLow;
+bool rateMaking() { return gRateMaking; }
+static void madeCount(bool made) { // a slot went up, made or not (the render thread)
+    double now = nowSec(), dt = gMadeT > 0 ? fmin(1.0, now - gMadeT) : 0;
+    gMadeT = now;
+    gMadeShare += ((made ? 1.0 : 0.0) - gMadeShare) * (dt > 0 ? dt / 2 : 0.01); // about the last 2 s
+    if (gMadeShare > 0.1) { gRateMaking = true; gMadeLow = 0; }
+    else if (gMadeShare >= 0.04) gMadeLow = 0;
+    else if (gMadeLow <= 0) gMadeLow = now;
+    else if (now - gMadeLow > 3) gRateMaking = false;
+}
+// rateEnhanceMade: the gate above lets the enhance net after the generator stay, on every frame that goes up, made or
+// real, so a picture of nearly all made frames (rateEvenLate: ~58 of 60) gets the net as the real-frame picture does.
+// the gpu: checked once a second on the render thread. over: the path's gpu time a frame (p95 of the last 120, the
+// net in it; the gpu's wall time, others' work in between counts too) past 9/10 of a slot, or more than 2 % of the
+// made slots of that second came late. two seconds over in a row: the net goes off on all frames, as without the
+// switch (never frame by frame: that would pulse), for 15 s, then it is tried again; each further time twice as
+// long, 4 min at most. a start over of the path forgets it. the net before the interpolator (chain E first) is not
+// gated anyway and costs half: one run per real frame
+static int gNetState, gNetTrips, gNetOver;  // rateInfo's net: 0 off, 1 acting, 2 idle (no net chosen), 3 stepped aside, 4 idle (the chain has no net after the interpolator)
+static double gNetTick, gNetUntil, gNetGpu, gNetLate;
+static long gNetSlots, gNetLateN;           // made slots in this second, of them late
+static void netMadeTick() {
+    double now = nowSec();
+    int en = effEnhance();
+    if (!gSet.rateEnhanceMade || !en || en > nets::count()) {
+        gNetMade = false; gNetState = gSet.rateEnhanceMade ? 2 : 0; gNetUntil = 0; gNetTick = 0; gNetOver = 0;
+        return;
+    }
+    if ((gCh & kChainSet) && !(gCh & kPostE)) { gNetMade = false; gNetState = 4; gNetUntil = 0; gNetTick = 0; gNetOver = 0; return; } // E first or none: nothing gated
+    if (gNetUntil > 0 && now < gNetUntil) { gNetMade = false; gNetState = 3; return; }
+    if (gNetUntil > 0 || gNetTick <= 0) { gNetUntil = 0; gNetOver = 0; gNetTick = now; gNetSlots = gNetLateN = 0; } // (again)
+    gNetMade = true; gNetState = 1;
+    if (now - gNetTick < 1) return;
+    gNetGpu = gpuP95();
+    gNetLate = gNetSlots >= 10 ? (double)gNetLateN / gNetSlots : 0;
+    bool over = (gRateUnit > 0 && gNetGpu > 900 * gRateUnit) || gNetLate > 0.02;
+    gNetOver = over ? gNetOver + 1 : 0;
+    gNetTick = now; gNetSlots = gNetLateN = 0;
+    if (gNetOver < 2) return;
+    gNetTrips++;
+    double wait = fmin(240, 15 * pow(2, std::min(gNetTrips - 1, 5)));
+    gNetUntil = now + wait; gNetMade = false; gNetState = 3; gNetOver = 0;
+    logLine("rate: enhance on made frames stepped aside for %.0f s (time %d): gpu %.1f ms a frame (p95) against a %.1f ms slot, %.1f %% of the made slots late", wait, gNetTrips,
+            gNetGpu, gRateUnit * 1000, gNetLate * 100);
+}
+static std::atomic<bool> gRateFmtOk{true}; // the last frame was 2vuy, what the path takes (true before any: as if)
+bool rateSourceOk() { return gRateFmtOk; }
+
+static RatePic *ratePic(long id) {
+    RatePic &p = gRp[((id % kRatePics) + kRatePics) % kRatePics];
+    return id >= 0 && p.id == id && p.nv ? &p : NULL;
+}
+static void rateDrop() {
+    if (!gRateOn) return;
+    for (RatePic &p : gRp) { if (p.nv) CFRelease(p.nv); p = RatePic(); }
+    framegen::dropAt();
+    gRateOn = false; gSlotT = 0; gRateKey = {}; gRateShownAt = 0;
+    gPendT = gShownT = gBehindSince = gCallLate = gRateShownC = 0; gDrainArmed = false; gDrainWait = 0;
+    if (gRateMid) { CFRelease(gRateMid); gRateMid = NULL; }
+    gRateMidA = -1; gCapBase = 0; // the made share stays (madeCount)
+    gNetMade = false; gNetState = gNetTrips = gNetOver = 0; gNetTick = gNetUntil = 0; // rateEnhanceMade: as new
+    os_unfair_lock_lock(&gLock); gPresGapN = gGpuMsN = 0; gPresP = 0; os_unfair_lock_unlock(&gLock); // another mode or screen: measured again
+    makeRealtime(1 / 59.94); // as the thread began
+    os_unfair_lock_lock(&gLock); gRi.on = false; os_unfair_lock_unlock(&gLock);
+}
+// generator time to a pair's frames, each against its own slot (framegen::pairMs, 95 of the last 120: at 240 hz a
+// frame can take longer than the slots are apart, the last one is the late one), and a margin for the wake-up and the
+// hand-over. before there are times: what blend, the block generator and the others usually take at 1080p
+static double rateBudget(int gm) {
+    double ms = framegen::pairMs();
+    if (ms <= 0) ms = gSet.rateBlend ? 3 : gm == 3 ? 6 : 13;
+    return fmin(30, ceil(ms + 1)) / 1000; // whole ms: d is planned against it, a budget that wobbles by tenths turns slots into holds
+}
+// the grid of 1 and 2 follows what it is fed slowly, not its jitter; a jump of more than a quarter period is taken
+// the planner's lattice is laid in content time against the slots it has seen: when the grid jumps (rate 2's first
+// presentedTime, a new phase) or has slewed 2 % of a period since, it is laid again on the newest picture
+static double gGridMoved;
+static void gridFeed(double x, double P) {
+    if (gGridP != P || gGridA == 0) { gGridP = P; gGridA = x; gGridMoved = 0; gPl.anchor = true; return; }
+    double k = round((x - gGridA) / P), e = x - gGridA - k * P;
+    if (fabs(e) < P / 4) { gGridA += k * P + 0.1 * e; gGridMoved += 0.1 * e; }
+    else { gGridA = x; gGridMoved = 1; }
+    if (fabs(gGridMoved) > 0.02 * P) { gGridMoved = 0; gPl.anchor = true; }
+}
+// the slot after `after` (0: none known yet)
+static double rateNext(double after) {
+    if (gPl.p.mode != slots::Grid) { double T = gPl.due(); return std::isfinite(T) ? T : 0; }
+    if (gGridP <= 0 || gGridA == 0) return 0;
+    return gGridA + (floor((after + gGridP / 2 - gGridA) / gGridP) + 1) * gGridP;
+}
+// the slots still to come, for the positions a pair needs
+static int rateTimes(double *T, int max) {
+    if (gPl.p.mode != slots::Grid) return gPl.times(T, max);
+    double t = gSlotT > 0 ? gSlotT : rateNext(nowSec());
+    if (t <= 0) return 0;
+    for (int i = 0; i < max; i++) T[i] = t + i * gGridP;
+    return max;
+}
+// rateEven: 24 or 25 fps in a 60 hz signal shows up 2, 3, 2, 3 ticks apart, its real times are even. each picture
+// one mean gap (over the last 16) after the one before, but never before the tick before the one it came on, nor after
+// that one. a long gap starts it over
+static double evenTime(double when) {
+    double t = when, tick = gFrameDur;
+    if (gEvenN && when - gEvenW[(gEvenN - 1) % 16] > 0.25) gEvenN = 0;
+    if (gEvenN >= 2) {
+        int k = std::min(gEvenN, 16);
+        double P = (when - gEvenW[(gEvenN - k) % 16]) / k;
+        if (when - gEvenW[(gEvenN - 1) % 16] < 2 * P) t = fmin(when, fmax(when - tick + 1e-4, gEvenT + P));
+    }
+    gEvenW[gEvenN++ % 16] = when;
+    return gEvenT = t;
+}
+// the frames between a and b, at these positions (as ask, more than one)
+static void askAt(CVPixelBufferRef a, CVPixelBufferRef b, long pair, const float *at, int n, double gap) {
+    CVPixelBufferRef in = genIn(b);
+    bool (^ready)(void) = nil;
+    if (in != b && in == held(b, kPicKey)) {
+        id<MTLCommandBuffer> cb = gPreFor == b ? gPreCb : nil;
+        if (cb) ready = ^{ return (bool)(cb.status >= MTLCommandBufferStatusCompleted); };
+        else if (!CVBufferHasAttachment(in, kPreKey)) ready = ^{ return noise::done(in); };
+    }
+    CVPixelBufferRef pa = genIn(a);
+    if (pa != a && pa == held(a, kPicKey) && !CVBufferHasAttachment(pa, kPreKey) && !noise::done(pa)) pa = a;
+    framegen::requestAt(pa, in, pair, at, n, gSet.rateBlend ? blocks::kTimeBlend : (gSet.genSmallFast ? blocks::kSmall : 0) | (gSet.genFallback ? blocks::kFallback | blocks::kMean : 0) | (gSet.genSides ? blocks::kSides : 0)
+        | (gSet.genOutline ? blocks::kStill | blocks::kBand | blocks::kBorder : 0) | (gSet.genCutGuard ? blocks::kWhole | blocks::kNear : 0)
+        | (gSet.genSharp ? blocks::kCrisp | blocks::kDetail : 0), gap, ready, fullRange(), gSd);
+}
+static void dropHeld();
+
+// one capture tick on this path. owns pb. gm: the generator the frames come from (blend: the block generator's)
+static void rateTick(CVPixelBufferRef pb, double arrival, double when, bool repeat, bool changed, bool genOk, int gm) {
+    int rate = gSet.rate;
+    double num = clampRateNum(rate, gSet.rateNum); // as stored, clamped as the load does (a value set another way too)
+    if (num <= 0 && rate >= 3 && rate <= 5) num = rate == 3 ? 60 : 2; // no number: the mode's own
+    double Ps = rateCap() ? display::period() : 0;
+    bool capped = rate == 3 && Ps > 0 && num * Ps > 1.001;
+    if (capped) num = 1 / Ps; // 240 asked of a 100 hz screen: 100
+    if (rate == 3 && gFrameDur > 0) { // 60 asked of a 59.94 signal: 59.94. else d saw-tooths, a hold every 16 s
+        double r = num * gFrameDur, k = r >= 1 ? round(r) : 1 / round(1 / r);
+        if (k > 0 && fabs(r / k - 1) < 0.002) num = k / gFrameDur;
+    }
+    double P = rate == 2 && display::period() > 0 ? display::period() : gFrameDur.load();
+    auto key = std::make_tuple(rate, gm, lround(num * 1000), lround(P * 1e7), (bool)gSet.rateBlend, (bool)gSet.rateEven, (int)lround(gSet.rateSnap * 1000), lround(Ps * 1e7), gSet.rateCushion.load(), (bool)gSet.rateEvenLate);
+    int pw = (int)CVPixelBufferGetWidth(pb), ph = (int)CVPixelBufferGetHeight(pb);
+    RatePic *a = gRpN ? ratePic(gRpN - 1) : NULL;
+    bool resized = a && ((int)CVPixelBufferGetWidth(a->nv) != pw || (int)CVPixelBufferGetHeight(a->nv) != ph);
+    if (!gRateOn || key != gRateKey || resized) { // start (over): from the schedules, another setting, another size
+        framegen::cancel();
+        dropHeld();
+        gPl = slots::Planner();
+        slots::Params &p = gPl.p;
+        p.mode = rate <= 2 ? slots::Grid : rate == 3 ? slots::Rate : rate == 4 ? slots::Times : rate == 5 ? slots::TimesGap : slots::Source;
+        p.num = rate <= 2 ? 1 / P : num;
+        p.tick = gFrameDur;
+        p.snap = gSet.rateSnap;
+        p.cushion = gSet.rateCushion * gFrameDur; // whole ticks: a dropped frame is one late
+        static const int fw = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"rateFastWin"]; // hidden, any domain
+        if (fw > 0) p.fastWin = std::min(64, fw); // (an argument or defaults write): slots.h Params::fastWin, unset 8
+        p.ticks = !gSet.rateEven; // rateEven's content clock is not on ticks (24 / 25p: 2.5 of them)
+        // rateEvenLate, with a cushion (its room) on our own slots and grids: content by count (gLateClk), over rateEven's.
+        // phases roll through the slots: no lattice (its pull and whole-period rises moved d with them), and a real
+        // picture only within 2 % of a gap (all: steps up to 45 % off, 5 %: 14 %)
+        p.level = gSet.rateEvenLate && p.cushion > 0 && (p.mode == slots::Rate || p.mode == slots::Grid);
+        if (p.level) { p.align = false; p.snap = fmin(p.snap, 0.02); }
+        gLateClk = slots::Clock(); gLateClk.tick = gFrameDur; gLateClk.pause = p.pause; gLateClk.room = p.level ? p.cushion : 0;
+        p.floor = 0.002;
+        p.budget = rateBudget(gm);
+        p.space = rate == 4 || rate == 5 ? Ps : 0;
+        gRateCapped = capped;
+        gRpN = 0; gSlotT = 0; gGridA = gGridP = 0; gEvenN = 0; gStillFed = false;
+        gGridPhi = p.floor + p.budget + 0.001; // 1: slots this long after the tick, where a picture and its in-betweens can be in
+        double out = rate <= 2 ? P : rate == 3 ? 1 / num : rate == 6 ? gFrameDur.load() : 2 * gFrameDur / num; // a guess for 4, 5: 30 fps content
+        gRateUnit = rate <= 2 || rate == 3 ? out : display::period() > 0 ? display::period() : out; // self-timed slots land on the screen's refreshes
+        gRateKey = key; gRateOn = true; gLogRate = true; a = NULL; gRateGm = gm;
+        makeRealtime(fmin(1 / 59.94, out)); // woken on time at the output's rate
+        logLine("any rate: mode %d, %s %.2f, generator %d%s, snap %.2f%s, cushion %d%s%s", rate, rate <= 2 ? "grid hz" : rate == 3 ? "fps" : "times", rate <= 2 ? 1 / P : num, gm,
+                gSet.rateBlend ? " (blend)" : "", gSet.rateSnap.load(), gSet.rateEven && !p.level ? ", even content clock" : "", gSet.rateCushion.load(),
+                p.level ? ", late frames evened (content by count, snap 0.02 at most, no lattice)" : gSet.rateEvenLate ? ", late frames evened: idle (needs a cushion and fixed, tick or refresh slots)" : "",
+                gSet.rateEnhanceMade ? ", enhance on made frames too (while the gpu keeps up)" : "");
+    }
+    if (rate == 1) { // every tick, repeats too. the slots this long after the tick: the measured budget's, not the start's
+        // guess. up at once (a late in-between is a fallback), down only by 2 ms (a budget on the edge of a whole ms)
+        double phi = gPl.p.floor + rateBudget(gm) + 0.001;
+        if (phi > gGridPhi + 1e-4 || phi < gGridPhi - 0.002 + 1e-4) { if (gGridA > 0) gGridA += phi - gGridPhi; gGridPhi = phi; gPl.anchor = true; }
+        gridFeed(when + gGridPhi, P);
+    }
+    // nothing new. a changed repeat after the picture stood still for the planner's pause is taken in, see above. an
+    // empty ring takes whatever comes: after a restart or a setting change a still source sends nothing but repeats
+    if (repeat && a && !(changed && (gStillFed || when - gLastWhen > gPl.p.pause))) { CFRelease(pb); return; }
+    gStillFed = repeat;
+    CVPixelBufferRef nv = toNV(pb);
+    CFRelease(pb);
+    if (!nv) return;
+    double t = gPl.p.level ? gLateClk.time(when) : gSet.rateEven ? evenTime(when) : when, lag = gPl.p.level ? when - t : 0;
+    gLastWhen = when;
+    setWhen(nv, t);
+    pre(nv, true);
+    if (gSet.hudLock) lockUpdate(nv);
+    bool calm = !a || calmPair(a->nv, nv); // the schedules' cut test: no in-between across a cut, or across motion too fast for it
+    if (!calm) bump(&Stats::genSkipped);
+    gPl.p.budget = rateBudget(gm);
+    long id = gRpN;
+    // not taken (its time not past the last one's: a jump of the capture clock): the ring keeps nothing either, else
+    // the ring's pair (id - 1, id) and the planner's would differ and every in-between asked for would be thrown away
+    if (!gPl.picture(id, t, !calm, nowSec(), lag)) { CFRelease(nv); return; }
+    gRpN++;
+    RatePic &r = gRp[id % kRatePics];
+    if (r.nv) CFRelease(r.nv);
+    r = RatePic();
+    r.id = id; r.nv = nv; r.t = t; r.arrival = arrival; r.lag = lag;
+    if (gPl.p.mode != slots::Grid) gSlotT = rateNext(0); // the planner's own slots can move with a picture
+    // its in-betweens, right away: the positions the slots to come need between the one before and this one. apple's
+    // and the second generator make the middle only, the others are not asked for and their slots take a real picture
+    if (!a || !calm || !genOk) return;
+    double T[64], at[64];
+    int n = rateTimes(T, 64), m = gPl.phases(id - 1, T, n, at);
+    float want[64];
+    int k = 0;
+    for (int i = 0; i < m; i++) {
+        float x = (float)at[i];
+        bool dup = false;
+        for (int j = 0; j < k; j++) dup |= fabsf(want[j] - x) < 0.005f;
+        if (!dup && (gm == 3 || fabsf(x - 0.5f) <= 0.02f)) want[k++] = x;
+    }
+    // more than a request holds (times 8 in a long dip): every so many, evenly, not the first 16 and none at the end
+    static const int tmax = rateTest(@"rateTestMax");
+    int K = std::min(k, tmax > 0 ? std::min(tmax, framegen::kAtMax) : framegen::kAtMax);
+    for (int i = 0; i < K; i++) r.asked[r.nAsked++] = want[K == k ? i : K == 1 ? k / 2 : (int)lround((double)i * (k - 1) / (K - 1))];
+    if (r.nAsked) askAt(a->nv, nv, id - 1, r.asked, r.nAsked, t - a->t);
+}
+
+// a planned slot goes up. Mix: the frame made at its position, else the nearer real picture of the pair
+static void rateShow(const slots::Slot &s, double T) {
+    RatePic *a = ratePic(s.a), *b = s.kind == slots::Mix ? ratePic(s.b) : NULL;
+    if (!a) return; // nothing yet, or gone from the ring
+    netMadeTick();
+    gRateShownAt = nowSec();
+    gSlot = {s.kind == slots::Real ? 'r' : s.kind == slots::Hold ? 'h' : 'f', T, s.content, (float)s.t, b ? a->lag + (b->lag - a->lag) * s.t : a->lag};
+    if (s.kind == slots::Mix) {
+        CVPixelBufferRef mid = b ? framegen::takeAt(s.a, (float)s.t, 1.5) : NULL;
+        static const int tlate = rateTest(@"rateTestLate");
+        static long tn;
+        if (mid && tlate > 0 && ++tn % tlate == 0) { CFRelease(mid); mid = NULL; } // tests: as if it came late
+        // content never goes back on the glass: a made frame behind what is up already is not shown (a late or thinned
+        // position fell back to b before it)
+        bool back = mid && s.content < gRateShownC - 1e-9;
+        if (back) { CFRelease(mid); mid = NULL; }
+        if (mid) {
+            gSlot.kind = 'm';
+            gRateShownC = fmax(gRateShownC, s.content);
+            madeCount(true); // before show: the scaler sees it for this frame already
+            gNetSlots++;
+            show(mid, 0, b->nv, a->nv);
+            if (gRateMid) CFRelease(gRateMid);
+            gRateMid = mid; gRateMidA = s.a; gRateMidC = s.content; gRateMidT = (float)s.t; // kept: a fallback after it shows it again
+            bump(&Stats::gen); bump(&Stats::slotGen);
+            gSlot = {};
+            return;
+        }
+        bool asked = false; // more: a later position of this pair is still coming. from framegen, not from what was asked: a
+        // request replaced before pickup, the rest of a pair dropped (back-pressure) or a failed frame never comes, and
+        // the slots of the whole gap repeated what was up instead of half of it
+        for (int i = 0; b && i < b->nAsked; i++) asked |= fabsf(b->asked[i] - (float)s.t) <= 0.02f;
+        bool more = b && framegen::comingAfter(s.a, (float)s.t);
+        if (back) bump(&Stats::slotFall); // made, but behind what is up: not late
+        else if (asked) { bump(&Stats::genLate); bump(&Stats::slotLate); gNetSlots++; gNetLateN++; }
+        else {
+            bump(&Stats::slotFall);
+            if (gRateGm != 3 && fabsf((float)s.t - 0.5f) > 0.02f) bump(&Stats::slotMid); // the overlay says to pick another
+        }
+        // late or thinned out (more than a request holds) while later positions of the pair are coming: what is up
+        // stays up. a frame of this pair made at an earlier position goes up again; else the older picture, or b once
+        // b is up. not b ahead of time: the next position made in time would step back from it (b, back, b, back
+        // across a thinned gap). none coming (mid-only generators, refused, not ready): the nearer real frame as before
+        // nothing more coming but a made frame of this pair is up: it stays to the middle, then b (b went up 7/8 of a gap
+        // early after a made frame at 1/8 and the rest cut)
+        if ((more || s.t < 0.5) && gRateMid && gRateMidA == s.a && b && gRateShownC <= gRateMidC + 1e-9) {
+            gSlot.kind = 'M'; gSlot.content = gRateMidC; gSlot.t = gRateMidT; // the frame log: a made frame again
+            madeCount(true);
+            show(gRateMid, 0, b->nv, a->nv);
+            gSlot = {};
+            return;
+        }
+        if (b && (more ? gRateShownC >= b->t - 1e-9 : s.t >= 0.5 || gRateShownC > a->t + 1e-9)) a = b;
+        gSlot.content = a->t; gSlot.lag = a->lag;
+    } else bump(s.kind == slots::Real ? &Stats::slotReal : &Stats::slotHold);
+    if (a->t < gRateShownC - 1e-9) { // never back, whatever the slot (a rise of d plans content before what is up)
+        RatePic *ma = ratePic(gRateMidA), *mb = ratePic(gRateMidA + 1);
+        if (gRateMid && ma && mb && gRateMidC >= gRateShownC - 1e-9) {
+            gSlot.kind = 'M'; gSlot.content = gRateMidC; gSlot.t = gRateMidT;
+            madeCount(true);
+            show(gRateMid, 0, mb->nv, ma->nv);
+            gSlot = {};
+            return;
+        }
+        RatePic *up = NULL; // the ring picture that is up
+        for (RatePic &q : gRp) if (q.nv && q.t >= gRateShownC - 1e-9 && (!up || q.t < up->t)) up = &q;
+        if (up) { a = up; gSlot.content = a->t; gSlot.lag = a->lag; }
+    }
+    gRateShownC = fmax(gRateShownC, a->t);
+    madeCount(false);
+    gRepeatNow = a->shown; // shown before: the net's and stabilise's work on it is used again
+    show(a->nv, a->shown ? 0 : a->arrival);
+    gRepeatNow = false;
+    a->shown = true;
+    gSlot = {};
+}
+
+// present what has come due. every slot that has is planned at its own time, only the newest goes up: a thread
+// that came late (a blocked drawable at 100+ hz) must not pile presents up. and no two presents closer than 0.8 of a
+// refresh (by their due times), nor more than one a refresh in the long run: rate 1 or 6 at 59.94 on a 50 hz screen
+// passed the 0.8 (16.7 ms against 16) and put 60 a second into 50 refreshes. the newest planned slot waits for its
+// turn (-rateCap NO: off, for tests). the drain: presents behind by 1.5 output periods for half a second, on the glass or at
+// the call (a drawable that blocks), and one slot is left out: a held or made one, a real one only after a shown one
+static void drainLog(const slots::Slot &s, double T) { // the frame log has a row for a slot left out: kind drain, its letter
+    int li = gLog ? gLogN.fetch_add(1) : kLogMax;
+    if (li < kLogMax) gLog[li] = {"drain", -1, 0, sinceStart(), 0, 0, 0, s.content > 0 ? sinceStart(s.content) : 0, sinceStart(T), (float)s.t,
+                                  s.kind == slots::Real ? 'r' : s.kind == slots::Hold ? 'h' : 'm', {}};
+}
+static void runSlots() {
+    double now = nowSec();
+    double lead = 0; // rate 2: slots this long before the refresh they are for
+    if (gSet.rate == 2) { // the grid from the screen: a lead before the refresh the last present landed on. the period as
+        // presents land (99.85 for a 100 hz mode), the planner's with it: else the slots crept against the screen.
+        // the lead: what a frame takes on the gpu (p95) and 2.5 ms, half a refresh at least, 0.85 at most. half a
+        // refresh flat left 5 ms at 100 hz, and frames with 4-5 ms of gpu missed their refresh 30-140 times as often
+        double pt = gPresentedAt, P = screenP() > 0 ? screenP() : gGridP;
+        static double seen, gpuAt, gLead;
+        if (now - gpuAt > 0.5 || gLead <= 0) { // the lead: up at once, down only by a whole ms (as rate 1's phase): a p95
+            // on the edge of a half ms must not slew the grid back and forth
+            gpuAt = now;
+            double l = ceil((gpuP95() / 1000 + 0.0025) * 2000) / 2000;
+            if (l > gLead || l < gLead - 0.001) gLead = l;
+        }
+        if (P > 0 && gGridP > 0 && fabs(P - gGridP) > 2e-4 * gGridP) { // laid again below
+            logLine("any rate: the screen refreshes every %.4f ms as presents land (the grid had %.4f)", P * 1000, gGridP * 1000);
+            gPl.p.num = 1 / P; gGridA = 0;
+        } else if (gGridP > 0) P = gGridP; // within 0.02 %: the median's wobble moves nothing
+        lead = P > 0 ? fmin(fmax(gLead, P / 2), 0.85 * P) : 0;
+        gRateLead = lead;
+        if (gGridP > 0 && gGridA > 0 && pt > seen) { seen = pt; gridFeed(pt - lead, P); }
+        else if (gGridA == 0) { gridFeed(pt > 0 ? pt - lead : now, P > 0 ? P : gPl.p.num > 0 ? 1 / gPl.p.num : gFrameDur.load()); seen = pt; } // nothing on the glass yet (or never: a screen asleep): free running
+    }
+    if (gSlotT <= 0) gSlotT = rateNext(now);
+    // 3 to 6 plan nothing past the newest picture: a still source would get no presents at all, and the overlay, the
+    // recorder and a snapshot wait on them. the newest picture goes up again a pause after the last present
+    double keep = gPl.p.mode != slots::Grid && gRpN ? (gRateShownAt > 0 ? gRateShownAt + gPl.p.pause : now) : 0; // nothing up yet: at once
+    double Ps = rateCap() ? screenP() : 0, capT = Ps > 0 ? fmax(gShownT + 0.8 * Ps, gCapBase) : 0;
+    // a present went up at T: the next not before a refresh on from the last allowed one, a quarter refresh of credit for
+    // jitter. the refresh as measured (screenP), 0.9998 of it: fixed 100 on the U34's 99.85 or 59.94 on a "60" that runs
+    // 59.9 are 0.05-0.15 % over the screen and were let through by 0.998 of the nominal one. 0.9995 still queued fixed 100
+    // a frame every 20 s there, 0.9998 one every 50 s, safe to 200 ppm of measuring error. 0.998 while only the nominal
+    // is known: a mode's rate and the source's differ in the 5th digit (59.94 against 60000 / 1001), a full refresh
+    // would build that up into a left-out slot an hour. slots slower than the screen: never held back
+    double capK = gPresP > 0 && Ps == gPresP ? 0.9998 : 0.998;
+    auto shown = [&](double T) { gShownT = T; if (Ps > 0) gCapBase = fmax(gCapBase + capK * Ps, T + 0.75 * Ps); };
+    if (keep > 0 && now + kEarlyWake >= fmax(keep, capT) && (gSlotT <= 0 || gSlotT > keep) && gPendT <= 0) {
+        slots::Slot h;
+        h.a = gRpN - 1; h.content = ratePic(h.a) ? ratePic(h.a)->t : 0;
+        rateShow(h, keep);
+        shown(fmax(keep, now));
+        capT = Ps > 0 ? fmax(gShownT + 0.8 * Ps, gCapBase) : 0;
+        keep = gRateShownAt + gPl.p.pause;
+    }
+    if (gSlotT > 0 && gSlotT <= now + kEarlyWake) {
+        int n = gPendT > 0; // a waiting one is passed over by a newer
+        while (gSlotT > 0 && gSlotT <= now + kEarlyWake) { gPendT = gSlotT; gPend = gPl.plan(gSlotT); n++; gSlotT = rateNext(gPendT); }
+        os_unfair_lock_lock(&gLock);
+        gS.slotSkip += n - 1;
+        os_unfair_lock_unlock(&gLock);
+    }
+    if (gPendT > 0 && now + kEarlyWake >= capT) {
+        slots::Slot s = gPend;
+        double T = gPendT, late = (now - T) * 1000;
+        gPendT = 0;
+        os_unfair_lock_lock(&gLock);
+        if (late > gS.schedLateMax) gS.schedLateMax = late;
+        os_unfair_lock_unlock(&gLock);
+        // behind: on the glass (the presented handler's lag) or at the call. in output periods, at least a refresh
+        double u = gSet.rate == 2 && gGridP > 0 ? gGridP : fmax(gRateUnit, Ps), lag = gQueueLag, seen = nowSec() - gGlassAt < 0.25;
+        // on the glass a present that went straight up is 1 to 1.5 refreshes after its hand-over already: 2.5 there, as the
+        // old path's gLagRun. rate 2 hands over at its lead before a refresh, a present on time lands a refresh and the
+        // lead later, one queued a refresh more: the line between, 2.0 at the old half-refresh lead. 2.5 there fired on
+        // one queued frame only because the U34 runs 0.15 % slow (25.04 ms against 25.0); on a screen at its nominal
+        // rate a one-frame backlog stayed for good. the call: done 1.5 periods after its slot (a drawable that
+        // blocked). -rateDrain NO: off
+        static const bool drain = ![[NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain][@"rateDrain"] isEqual:@"NO"];
+        double line = gSet.rate == 2 ? lead + 1.5 * u : 2.5 * u;
+        bool behind = drain && ((seen && lag > line) || gCallLate > 1.5 * u);
+        gRateLag = seen ? lag : -1;
+        gBehindSince = behind ? (gBehindSince > 0 ? gBehindSince : now) : 0;
+        if (gBehindSince > 0 && now - gBehindSince > 0.5 && now - gDrainAt > 0.5) gDrainArmed = true;
+        // a held or made one first: up to two real ones go by before a real one is left out (all real: rate = content).
+        // half a second between two, so never two in a row
+        if (gDrainArmed && (s.kind != slots::Real || ++gDrainWait > 2)) {
+            gDrainArmed = false; gDrainWait = 0; gDrainAt = now; gBehindSince = 0;
+            bump(&Stats::drained);
+            drainLog(s, T);
+        } else { rateShow(s, T); gCallLate = nowSec() - T; }
+        shown(T);
+    }
+    double next = gSlotT;
+    if (gPendT > 0 && (next <= 0 || capT < next)) next = capT;
+    if (keep > 0 && (next <= 0 || keep < next)) next = keep;
+    gNextDue = next > 0 ? next : gRateShownAt > 0 ? gRateShownAt + gPl.p.pause : 0; // nothing up yet: the next tick
+    os_unfair_lock_lock(&gLock);
+    static long thin; static double thinAt; // the times modes thinned a gap in the last 2 s
+    if (gPl.thinned != thin) { thin = gPl.thinned; thinAt = now; }
+    double scr = (gRateCapped || (thinAt > 0 && now - thinAt < 2)) && display::period() > 0 ? 1 / display::period() : 0;
+    gRi = {true, gSet.rate, gPl.why, gPl.rises, gPl.steps, gPl.late, gPl.pauses, gPl.held, gPl.p.num, gPl.d, gPl.p.budget, gPl.p.mode == slots::Grid ? gGridP : gPl.p.mode == slots::Rate ? gPl.per() : gRateUnit, scr, gRateLag, screenP() > 0 ? 1 / screenP() : 0, gPl.p.cushion,
+           gPl.p.level, gLateClk.s > 0 ? gLateClk.P / gLateClk.s : 0, gLateClk.lag, gLateClk.byCount, gLateClk.byArrival, gLateClk.capped,
+           gNetState, gNetTrips, gNetGpu, gRateUnit * 1000, gNetLate, gNetUntil > now ? gNetUntil - now : 0};
+    os_unfair_lock_unlock(&gLock);
+}
+
 static void dropHeld() {
+    rateDrop();
     keptForget();
     if (prevNv) { CFRelease(prevNv); prevNv = NULL; }
     if (curNv) { CFRelease(curNv); curNv = NULL; }
@@ -1749,11 +2431,16 @@ static void runDue() {
 // changed: a repeat that is not bit for bit the frame before (something small moved: a spinner, a cursor, typed text)
 // when: the time to plan this frame's presents from. its arrival, unless ptsTime has a steadier one
 static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, bool changed) {
+    // every tick, also at rate 0 (one store, nothing reads it there): picking rate 2 then finds the format already, not
+    // a stale "takes it" that let a matched screen go for a second before the stats tick matched it again
+    gRateFmtOk = CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_422YpCbCr8;
+    bool rp = rateRuns(); // any rate, see rateTick. 2vuy only: rateSourceOk
+    if (gRateOn && !rp) { framegen::cancel(); dropHeld(); } // off again (or the source changed format): the schedules start clean
     bool dw = deepWanted(), ew = gSet.early || dw; // deep needs timed presents
     int pw = (int)CVPixelBufferGetWidth(pb), ph = (int)CVPixelBufferGetHeight(pb);
     // genModel: the second generator works on a small copy of its own making, genSmall's is apple's fast path only
     static int genM;
-    int gm = framegen::model();
+    int gm = rp && gSet.rateBlend ? 3 : framegen::model(); // any rate's blend: the block generator's, whatever is chosen
     int sm = effFrameGen() && !gm && pw == 1920 && ph == 1080 ? gSet.genSmall.load() : 0; // the one size the shrinks in toNV are written for
     if (genM != gm) { framegen::cancel(); dropHeld(); genM = gm; } // a pair is made by one generator
     if (early != ew || deep != dw || gSmall != sm) { // the schedules keep different promises: start clean. genSmall: both frames of a pair must be the same size
@@ -1775,6 +2462,7 @@ static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, 
     if ((ch & kPreN) && genOk && (sm || !early)) ch = (ch & ~kPreN) | kPreNSide;
     gCh = ch;
     if (gSet.gpuAwake && ((effEnhance() && effEnhance() <= nets::count()) || (gm && genOk))) awake::touch(); // gpu work for every frame: a net, or the second generator
+    if (rp) { if (plainNv) { CFRelease(plainNv); plainNv = NULL; } if (gHlFor && !(genOk && gSet.hudLock)) lockDrop(); rateTick(pb, arrival, when, repeat, changed, genOk, gm); return; }
     if (prevNv && (CVPixelBufferGetWidth(prevNv) != CVPixelBufferGetWidth(pb) || CVPixelBufferGetHeight(prevNv) != CVPixelBufferGetHeight(pb))) dropHeld();
     if (gHlFor && !(genOk && gSet.hudLock)) lockDrop();
     if (!genOk) {
@@ -1798,16 +2486,19 @@ static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, 
         if (ch & (kPreN | kPreNSide)) {
             if (!repeat || changed || !plainNv) {
                 CVPixelBufferRef nv = toNV(pb);
-                if (nv) { pre(nv, false); if (plainNv) CFRelease(plainNv); plainNv = nv; }
+                if (nv) { setWhen(nv, when); pre(nv, false); if (plainNv) CFRelease(plainNv); plainNv = nv; }
             }
             CFRelease(pb);
             if (plainNv) show(plainNv, repeat ? 0 : arrival);
             return;
         }
         if (plainNv) { CFRelease(plainNv); plainNv = NULL; }
+        static double plainWhen; // content time: a repeat shows the last new frame's. beside the frame, not on it
+        if (!repeat) plainWhen = when;
+        gPlainWhen = whenOn() ? plainWhen : 0;
         gRepeatNow = repeat && !changed; // enhanceReal, enhanceHold: the net's work on the frame before is used again
         show(pb, repeat ? 0 : arrival);
-        gRepeatNow = false;
+        gRepeatNow = false; gPlainWhen = 0;
         CFRelease(pb);
         return;
     }
@@ -1816,6 +2507,7 @@ static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, 
         CVPixelBufferRef nv = toNV(pb);
         CFRelease(pb);
         if (!nv) return;
+        setWhen(nv, when);
         pre(nv, true);
         if (gSet.hudLock) lockUpdate(nv);
         newRun++; repeatRun = 0;
@@ -1896,7 +2588,7 @@ static void tick(CVPixelBufferRef pb, double arrival, double when, bool repeat, 
     if ((changed || !prevNv) && !curNv && gNextDue == 0) {
         CVPixelBufferRef nv = toNV(pb);
         CFRelease(pb);
-        if (nv) { pre(nv, true); if (prevNv) CFRelease(prevNv); prevNv = nv; prevArrival = arrival; prevCounted = !changed; show(prevNv, 0); }
+        if (nv) { setWhen(nv, when); pre(nv, true); if (prevNv) CFRelease(prevNv); prevNv = nv; prevArrival = arrival; prevCounted = !changed; show(prevNv, 0); }
         return;
     }
     CFRelease(pb); // a copy of what we already have
@@ -1989,7 +2681,12 @@ void submit(CVPixelBufferRef pb, double arrival, double captured, bool late, dou
     int darkest = 255, over = -1; float shift = 0;
     // ptsTime: every callback is a sample for the clock, repeats too. a source without timestamps: as without the switch
     double when = arrival;
-    if (gSet.ptsTime && pts >= 0) when = gClock.feed(pts, arrival, gFrameDur);
+    // the output rate's content times too: arrival jitter of 1 to 2 ms put the planner's pictures off their ticks (rate 1
+    // on 59.94: 81 to 845 holds in ten minutes, modelled; none with the clock). rate 0 unchanged. -rateClock NO: arrival
+    bool rclock = rateClockArg();
+    gClock.med = rclock && rateRuns(); // rate 0 (ptsTime): the mean as before
+    gClockFed = (gSet.ptsTime || (rclock && rateRuns())) && pts >= 0;
+    if (gClockFed) when = gClock.feed(pts, arrival, gFrameDur);
     else if (gClock.n) gClock = cadence::PtsClock();
     if (lockLuma(pb, l)) {
         Sig g; Profile p; int dark;
@@ -2080,9 +2777,18 @@ void startThread() {
                 if (gClearReq.exchange(false) && !pb) { framegen::cancel(); dropHeld(); clearNow(); }
                 double t = nowSec();
                 if (pb && gStabNo) CVBufferRemoveAttachment(pb, kStabKey); // stabilise: a buffer the source hands out again starts without its old number
+                // any rate: a slot due within 1.5 ms goes up first, on time, the capture tick after it. rateTick takes 1.5 to
+                // 3 ms (the copy, pre, the cut test, the request): a slot further out is late by the rest at most. no wait
+                // while the queue is behind (the drain's clock runs): the tick's known time would move later with it
+                if (pb && gRateOn && gSlotT > 0 && gSlotT - nowSec() < 0.0015 && gBehindSince <= 0) {
+                    double w = gSlotT - kEarlyWake - nowSec();
+                    if (w > 0) usleep((useconds_t)(w * 1e6));
+                    runSlots();
+                }
                 if (pb) tick(pb, arrival, when, repeat, changed);
                 if (gAheadWait && framegen::done()) { gAheadWait = false; if (curNv) netAhead(curNv); }
-                if (gNextDue > 0) runDue();
+                if (gRateOn) runSlots();
+                else if (gNextDue > 0) runDue();
                 double ms = (nowSec() - t) * 1000;
                 os_unfair_lock_lock(&gLock);
                 if (ms > gS.tickMax) gS.tickMax = ms;
@@ -2103,9 +2809,18 @@ void stopThread() {
     dispatch_semaphore_signal(gWake);
     dispatch_semaphore_wait(gStopped, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
     if (FILE *f = gLog ? fopen(gLogPath.UTF8String, "w") : NULL) {
-        fprintf(f, "kind,frame,arrival,present,presented,gpu,gen\n");
+        fprintf(f, gLogRate ? "kind,frame,arrival,present,presented,gpu,gen,content,due,t,slot,pair,pgap,vx,vy,vlen,err,unfit,fall\n" : "kind,frame,arrival,present,presented,gpu,gen\n");
+        auto num = [](float v, const char *fmt) { static char s[32]; if (std::isfinite(v)) snprintf(s, sizeof s, fmt, v); else s[0] = 0; return std::string(s); };
         for (int i = 0, n = std::min(gLogN.load(), kLogMax); i < n; i++)
-            fprintf(f, "%s,%d,%.5f,%.5f,%.5f,%.3f,%.2f\n", gLog[i].kind, gLog[i].frame, gLog[i].arrival, gLog[i].present, gLog[i].presented, gLog[i].gpu, gLog[i].gen);
+            if (!gLogRate) fprintf(f, "%s,%d,%.5f,%.5f,%.5f,%.3f,%.2f\n", gLog[i].kind, gLog[i].frame, gLog[i].arrival, gLog[i].present, gLog[i].presented, gLog[i].gpu, gLog[i].gen);
+            else {
+                fprintf(f, "%s,%d,%.5f,%.5f,%.5f,%.3f,%.2f,%.5f,%.5f,%.4f,%c,", gLog[i].kind, gLog[i].frame, gLog[i].arrival, gLog[i].present, gLog[i].presented, gLog[i].gpu, gLog[i].gen,
+                        gLog[i].content, gLog[i].due, gLog[i].t, gLog[i].slot ? gLog[i].slot : '-');
+                const framegen::Figures &g = gLog[i].fig; // empty where none: not a made frame, or no figures
+                if (g.pair <= 0) fprintf(f, ",,,,,,,\n");
+                else fprintf(f, "%ld,%s,%s,%s,%s,%s,%s,%s\n", g.pair, num(g.gapMs, "%.2f").c_str(), num(g.vx, "%.2f").c_str(), num(g.vy, "%.2f").c_str(), num(g.len, "%.2f").c_str(),
+                             num(g.err, "%.5f").c_str(), num(g.unfit, "%.4f").c_str(), g.fall >= 0 ? num(g.fall, "%.4f").c_str() : "");
+            }
         fclose(f);
     }
     os_unfair_lock_lock(&gLock);
@@ -2193,6 +2908,7 @@ bool init(NSString *shaderSource, std::string &err) {
     if ([ud objectForKey:@"drain"]) gDrain = [ud boolForKey:@"drain"];
     gGenDrain = [ud boolForKey:@"genDrain"];
     if ((gLogPath = [[ud stringForKey:@"frameLog"] stringByExpandingTildeInPath])) gLog = (LogRow *)calloc(kLogMax, sizeof(LogRow));
+    if (gLog) blocks::measure(true); // the pair figures, see LogRow. off: the block generator as it was
     // numbered snapshots, see renderer.h
     for (NSString *f in [[[ud objectForKey:@"snapFrames"] description] componentsSeparatedByString:@","])
         if (f.length) gSnapWant.push_back({f.intValue, [f hasSuffix:@"g"]});

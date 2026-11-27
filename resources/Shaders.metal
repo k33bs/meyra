@@ -69,10 +69,15 @@ static float stillWeight(float2 uv, float g, texture2d<float> ry, texture2d<floa
     constexpr sampler n(filter::nearest, address::clamp_to_edge);
     float2 ly = 1.0 / float2(ry.get_width(), ry.get_height());
     if (mode > 2.5) {
-        // metalgoose's stability blend (gpl-3, Shaders/Stability.metal), on luma: largest change between the real
-        // frames within 5x5 over the largest step between neighbours there is about "pixels moved". weight falls
-        // with it, none from 0.9; 4/255 is their noise floor. nothing changed within 3x3: the real pixel as it is.
-        // mode 4: that last test on 3x3 averages, because a game's dither changes every frame and never passes it
+        // ported from MetalGoose (github.com/Stallion77RepoOfficial/MetalGoose, stabilityWeight and stabilized in
+        // MetalGoose/Shaders/Stability.metal with the numbers of MetalGoose/Core/StabilityBlend.swift, compared at
+        // commit 7a96844, GPL-3.0, the MetalGoose authors; see THIRD_PARTY_NOTICES.md). changed for here: a fragment
+        // pass on luma instead of a tiled compute pass on rgb, the near test on whole levels (1.5 of 255, theirs 1),
+        // the two real frames mixed at the middle and on luma only (nvFix), the newer real pixel where nothing changed.
+        // largest change between the real frames within 5x5 over the largest step between neighbours there is about
+        // "pixels moved". weight falls with it, none from 0.9; 4/255 is their noise floor. nothing changed within 3x3:
+        // the real pixel as it is. mode 4, meyra's own: that last test on 3x3 averages, because a game's dither
+        // changes every frame and never passes it
         float P[49], N[49];
         for (int j = 0; j < 7; j++)
             for (int i = 0; i < 7; i++) {

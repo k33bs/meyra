@@ -100,17 +100,24 @@ private:
         logLine("replay: %zu frames %dx%d from %s", frames_.size(), W, H, prefix.c_str());
         report(SourceState::Running, [NSString stringWithFormat:@"Replay %dx%d @ 59.94, %zu frames", W, H, frames_.size()].UTF8String);
         makeRealtime(kDur); // paced by sleeping, so it needs on-time wake-ups
-        // for tests of the capture clock (hidden, command line): replayJitter MS hands every frame over late by a random
-        // 0..MS, replayLate N hands every Nth over 10 ms late on top. the timestamps stay on the even grid
+        // for tests of the capture clock and the output rate (hidden, command line): replayJitter MS hands every frame
+        // over a random -MS..+MS off its tick (0: the even clock as always), replayJitterSeed N its seed;
+        // replayJitterShape YES as a real capture measured: +-0.4 ms, 1 in 100 1 to 2 ms off, 1 in 2000 7 ms off.
+        // replayLate N hands every Nth over 10 ms late on top. the timestamps stay on the even grid
         NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
         double jitter = [ud doubleForKey:@"replayJitter"] / 1000;
+        bool shape = [ud boolForKey:@"replayJitterShape"];
         long lateEvery = [ud integerForKey:@"replayLate"];
-        uint32_t rnd = 12345;
+        uint32_t rnd = [ud objectForKey:@"replayJitterSeed"] ? (uint32_t)[ud integerForKey:@"replayJitterSeed"] : 12345;
+        auto uni = [&] { rnd = rnd * 1664525u + 1013904223u; return (rnd >> 8) / 16777216.0; }; // 0..1
         double next = nowSec();
         for (size_t i = 0; !quit_; i++) {
             next += kDur;
             double wait = next - nowSec();
-            if (jitter > 0) { rnd = rnd * 1664525u + 1013904223u; wait += jitter * (rnd >> 8) / 16777216.0; }
+            if (shape) {
+                double u = uni(), side = uni() < 0.5 ? -1 : 1;
+                wait += u < 1 / 2000.0 ? side * 0.007 : u < 1 / 100.0 ? side * (0.001 + 0.001 * uni()) : 0.0004 * (2 * uni() - 1);
+            } else if (jitter > 0) wait += jitter * (2 * uni() - 1);
             if (lateEvery > 0 && i % lateEvery == (size_t)lateEvery - 1) wait += 0.010;
             if (wait > 0) usleep((useconds_t)(wait * 1e6));
             CVPixelBufferRef f = frames_[i % frames_.size()];

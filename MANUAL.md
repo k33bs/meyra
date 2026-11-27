@@ -28,7 +28,8 @@ new here: the readme has the short way in. the same steps in full are here: [ins
 - day to day: [presets](#presets) · [keys](#keys) · [every switch by menu](#every-switch-by-menu)
 - the long read: [what each thing does](#what-each-thing-does) ·
   [the gta6 weights and the others](#the-gta6-weights-and-the-others)
-- upkeep: [updates](#updates) · [when something is off](#when-something-is-off) · [known limits](#known-limits)
+- upkeep: [updates](#updates) · [when something is off](#when-something-is-off) · [debug report](#debug-report) ·
+  [known limits](#known-limits)
 - under the hood: [building](#building) · [development](#development) · [some numbers](#some-numbers)
 
 ## what it does
@@ -141,11 +142,50 @@ is installed. such a device then shows up twice in the source menu:
 got a card from another maker with its own sdk? see
 [adding a driver for another maker](#adding-a-driver-for-another-maker).
 
+source > format lists what the device offers. meyra opens 1080p by itself even where the device offers more; that
+entry says (default), the larger ones sit above it.
+
+### too few frames from the card
+
+cheap usb cards often cannot push uncompressed 1080p60 through: the format says 60, 20 or 30 arrive. meyra watches
+for it on the standard capture route: under 70 % of the format's rate for 3 s, while the gpu keeps up and macos itself
+drops next to nothing, means the card sends too few. then the overlay gets an amber line under the numbers, "the card
+delivers 20 of 60 frames a second in this format: try ...", with what to try; with the overlay off the same text shows
+once as a hint. the motion line says "the card sends only 20 of 60 frames a second" and cadence "(too few frames from
+the card)". it clears after 2 s back at the rate.
+
+- cameras are not watched: they lower their rate in low light.
+- a card whose own timestamps come evenly at a rate games send (24, 25, 30, 48, 50 and their 1000/1001 kin) is passing
+  the signal's own rate through: no hint, one line in the log says so. an even 20 of 60, or 60 with gaps, still counts.
+- what macos really runs is read back after the start and again a second later: size, pixel layout and rate. if it
+  is not what was asked, meyra sets it once more (up to three tries; a device that runs what was asked gets no second
+  call), and if it still differs the hint says "macos runs the card at ..., not the chosen ...: choose the format
+  again, and if it stays send help > copy debug report". the log has a line for each check.
+- every second the log gets a `capture` line: frames from the device, the spacing of its own timestamps, what
+  avfoundation dropped and why (late, out of buffers, discontinuity, other), buffers without a picture, and the format
+  macos runs. the overlay's now column shows "macos runs ..., asked ..." and "dropped ..." only when there is
+  something to show.
+
+- **layout** (experimental): where the format in use also comes compressed, source > format gets a layout section:
+  **uncompressed (least delay)**, what meyra always used, or **compressed (mjpeg)**: the card sends jpeg pictures and
+  the mac unpacks them. a little more delay, and some usb cards only reach their format's full frame rate this way.
+  kept per source, also in source > choose source (the layout row, "automatic" and grey where there is nothing to
+  choose). choosing one restarts the source. not tried yet on a card that offers it: how much delay the unpacking adds
+  is open. if black looks dark grey (the overlay's darkest about 30), the card packs video levels as full range jpeg:
+  the levels switch cannot undo that, uncompressed or a lower format can. a repeat can unpack a little differently, so
+  with compressed and tolerant repeats off, "source sends no repeated frames" points at tolerant repeats (P).
+- then a lower format, or a usb 3 port on the mac itself, no hub or dock.
+- `--list-devices` shows every layout the device reports per size and rate, see
+  [development](#development). for a bug report the [debug report](#debug-report) is better: it has all of it and
+  more, without ids.
+
 ## presets
 
 ten sets of picture and motion switches on the number keys. each starts from the same plain base, so a key always
-gives the same thing; levels, colour, audio, window, display and gpu awake settings are left alone. shift + number saves the
-switches as they are over that slot, and again overwrites what you saved there. presets > remove my preset brings
+gives the same thing; levels, colour, audio, window, display, gpu awake and the side bars are left alone. the output
+rate goes off, and its own switches (blend, real frames, ride out, even out, enhance made frames) and the six newer
+block matching switches go back to their defaults; a preset of your own saved before v0.6.0 does the same, as it did
+not know them. shift + number saves the switches as they are over that slot, and again overwrites what you saved there. presets > remove my preset brings
 that slot's built-in one back, restore built-in presets all of them. the overlay shows which one is on, and
 "(changed)" once one of its switches is.
 
@@ -228,6 +268,7 @@ menu only.
 | menu | setting | key | default |
 |---|---|---|---|
 | source | device, input or format, audio input, restart source | ⌘R | |
+| source | format > layout (experimental, only where the format offers both): uncompressed (least delay), compressed (mjpeg) | | uncompressed |
 | source | save snapshot (png, to pictures) | ⌘S | |
 | picture | levels: automatic, video range, full range | R | automatic |
 | picture | colour: bt.709, srgb, the screen's own | C | bt.709 |
@@ -241,6 +282,10 @@ menu only.
 | picture | enhance real frames only, steady enhance, supersample (experimental) | O Y U | off |
 | picture | look (experimental): off, mild, middle, strong | . | off |
 | picture | grain (experimental): off, light, medium, strong, full | | off |
+| picture | side bars (experimental): off, grey, glow, glow with past picture | | off |
+| picture | side bars: very dark, dark, medium, light (grey and glow); less soft, soft, very soft (glow) | | dark, soft |
+| picture | side bars > fill the window with letterboxed pictures (experimental) | | off |
+| picture | side bars > no stretch, stretch a third, stretch two thirds, stretch to fill (experimental) | | no stretch |
 | picture | plain passthrough (all processing off, every frame shown as it came) | Z | off |
 | motion | frame generation | G | on |
 | motion | frame schedule: early, on the tick | E | on the tick |
@@ -250,6 +295,12 @@ menu only.
 | motion | show late generated frames a refresh later | | off |
 | motion | frame generator (experimental): apple's interpolator, a second one from files you install, at 480 or 720 lines, or block matching (no files, menu only) | I | apple's |
 | motion | frame generator > find the whole picture's shift first, take one side where the frames disagree (block matching, experimental) | | off |
+| motion | frame generator > find small fast things, go soft where the match is bad, take one side, steady, keep the followed character whole, show a real frame across a cut, made frames as sharp as real ones (block matching, experimental) | | off |
+| motion | output rate (experimental): off, every signal tick, every screen refresh, fixed 30 / 50 / 60 fps, times 2 / 3 / 4, times 2 following the gap, source rate (real frames only) | | off |
+| motion | output rate > blend in-betweens instead of generating (experimental) | | off |
+| motion | output rate > real frames: fewest (evenest motion), some, more, all (experimental) | | some |
+| motion | output rate > ride out dropped frames: off, one tick (+17 ms), two ticks (+33 ms), three ticks (+50 ms) (experimental) | | off |
+| motion | output rate > even out the game's late frames, enhance the made frames too (experimental) | | off |
 | motion | hud lock (experimental): what has stood still for a second keeps its real pixels in generated frames | L | off |
 | motion | mark hud area, clear hud areas, show hud areas: up to 8 rectangles that always show the real frame in generated ones | Q | none |
 | motion | cut test (experimental): scene cuts told by a coarse picture and its histogram, flashes let through | K | off |
@@ -273,6 +324,7 @@ menu only.
 | meyra | keep the gpu awake (uses more power) | | off |
 | meyra | turn meyra off: the capture device is let go and nothing is drawn, generated or played. the window and the settings stay, the same item turns it on again | | |
 | meyra | check for updates, at launch, revert to previous version | | at launch: on |
+| help | keyboard shortcuts, copy debug report, common problems and fixes (the readme's [help](README.md#help) in the browser), discord | | |
 
 ## what each thing does
 
@@ -283,11 +335,13 @@ grouped by what you are trying to fix, not by menu.
 - [upscaling](#upscaling)
 - [enhance nets](#enhance-nets)
 - [frame generation](#frame-generation)
+- [output rate](#output-rate)
 - [huds and still things](#huds-and-still-things)
 - [cuts, repeats and timing](#cuts-repeats-and-timing)
 - [the screen and the last few ms](#the-screen-and-the-last-few-ms)
 - [sound](#sound)
 - [window, overlay and comparing](#window-overlay-and-comparing)
+- [side bars](#side-bars)
 - [recording](#recording)
 
 ### picture basics
@@ -436,6 +490,29 @@ and a guess needs watching.
     disagree about what moves where, the side that fits its surroundings is taken instead of a double image. the
     method follows macframegen and zerofg (see `THIRD_PARTY_NOTICES.md`), the code is meyra's own. generate at is
     idle with it, like with the second generator.
+  - six more switches for block matching, all experimental and off, all measured on made-up scenes and recorded
+    clips with a test tool, not judged by many eyes yet. none of them acts while blend in-betweens is on (see
+    [output rate](#output-rate)):
+    - **find small fast things**: the coarse levels of the search lose anything narrower than about two of their cells,
+      so a character or a ball moving 30 px a pair or more came out as a ghost or in pieces. each finer level also
+      starts from the coarser one's vector before it was smoothed, and where nothing fits, a second look about 64 px
+      round the best (at 1080p). the search takes 2.4 to 2.7 ms a pair.
+    - **go soft where the match is bad** (output rate only, grey without one): where the frame before and the one after still disagree
+      after both are moved into place, the made frame is a cross-fade of the two there, soft or doubled instead of torn.
+      not at the picture's border, and less near the real frames. a made frame takes 0.65 to 0.73 ms.
+    - **take one side, steady**: where something covers or uncovers what is behind it, the side to show is picked once
+      for the pair and smoothed. the older take one side where the frames disagree picks per pixel and per made frame,
+      and on moving edges that turned into noise; this one is meant to replace it. 0.4 to 0.5 ms more a pair.
+    - **keep the followed character whole**: a still or slow thing in front of moving scenery (the character the camera
+      follows) keeps its outline, ground only one of the two frames shows is filled from around it, and the picture's
+      border is left alone. about 0.3 ms more a pair.
+    - **show a real frame across a cut** (output rate only, grey without one): when most of the picture fits no motion (a cut, a camera
+      whip), the slots show the nearer real frame instead of a made one torn between two pictures, until most fits
+      again.
+    - **made frames as sharp as real ones**: a made frame is moved by fractions of a pixel and loses fine detail on the
+      way, about 0.88 of a real frame's on the test clips. this gives it back (0.98), held inside what is around each
+      pixel so nothing rings. a slightly wrong match gets sharper too. 0.16 ms more a made frame. with an output rate
+      most frames on screen can be made ones, which is when it matters most.
 - **generate at**: apple's interpolator is quicker on a smaller picture. this hands it a smaller copy of each
   real frame and scales the generated frame back up; real frames are not touched. full size takes about 11 ms a
   frame, 1536×864 about 7.4, 1344×768 about 6, and 1280×720 (its fast path, what "generate at 720p" was) about 3.6.
@@ -458,6 +535,97 @@ and a guess needs watching.
   a screen that refreshes faster than the source sends: 100 or 120 hz, or variable refresh in full screen. on a
   60 hz screen with a 60 hz source the next refresh is the real frame's, there is no room, and the frame is left
   out as before (the overlay shows the switch amber, idle).
+
+### output rate
+
+frame generation as above makes one frame between two real ones, and only when the source sends every frame twice.
+the output rate (motion menu, experimental, off) plans the screen's frames on its own: each slot shows the game as it
+was a fixed delay ago, a real frame where that lands on one, a made frame at that point between two real ones where
+it does not, or the newest frame held when the next is not in yet. so a game that dips to 25, runs unlocked at 40 or
+sits at 30 on a 100 hz screen still gets even motion. all of it was built and measured on replays and a handful of
+runs on one 100 hz screen; read the numbers with that in mind.
+
+it needs frame generation on (so macos 26), and a source the path takes (uncompressed 4:2:2, which every route meyra
+has delivers). otherwise the menu items are grey and the overlay row says why. off is always there as the way back.
+
+- **every signal tick**: a frame on every tick of the signal, 60 a second from a 60 hz signal, every gap between two
+  real frames filled however long it is: dips under 30, unlocked rates. needs a screen at the signal's rate or variable
+  refresh.
+- **every screen refresh**: a frame on every refresh at the screen's own rate (100, 120, 144 hz); most of what you see
+  is made. the display is left at its rate and match display refresh is grey. on a screen a little off the source
+  (60.00 hz for 59.94) nearly every frame is made, at a point that rolls through the gap every 16 s, and the delay is
+  about a refresh more. at 100 hz it leaves out a frame now and then (0.4 to 0.8 a second measured).
+- **fixed 30 / 50 / 60 fps**: that many frames a second at even times, whatever the source sends: 25 or 40 fps filled to
+  60. needs a screen at a multiple of it or variable refresh; fixed 60 on a 100 hz screen cannot be even (10 and 20 ms
+  steps on the glass). 50 is untried on a screen.
+- **times 2 / 3 / 4**: that many times the source's frames, evenly spaced in every gap. **times 2 following the gap**:
+  twice the usual rate, and as many made in a longer gap as fit it, meant to keep the output steady when the game dips.
+  frames never go up faster than the screen refreshes: a times mode the screen cannot take is thinned, down to real
+  frames only (60 fps content on a 60 hz screen), and the overlay says "the screen takes n /s".
+- **source rate (real frames only)**: nothing made, each real frame a fixed delay after it came, as even as the
+  source sends them. not the source rate under match display refresh, which sets the screen's rate.
+- **which generator fills what**: block matching makes a frame at any point. apple's interpolator and the second
+  generator only make the middle; the other slots then show the nearer real frame, and the overlay says "apple's and
+  the second generator make only the middle: pick block matching or blend".
+- **blend in-betweens instead of generating**: the frames in between are a cross-fade of the two real frames by time.
+  no motion to get wrong, softer, little gpu time. works whichever generator is chosen, but it is the block generator's
+  code: if that cannot start, nothing is made and the motion line says why.
+- **real frames** (fewest, some, more, all): only where the screen's rate is not a whole multiple of the game's (30 on
+  100 hz, 25 on 60). a slot this close to a real frame shows the real frame rather than a made one a little off its
+  time: fewest within 5 % of a gap (a step at most 1.6 ms off; 30 fps on 100 hz: 10 of the 30 real), some within 10 %
+  (the default, 3 to 4 ms off, 20 of 30), more within 15 % (4 to 6 ms, all 30), all at the nearest slot (up to half a
+  refresh off). more real frames: fewer made ones and their faults, a little less even motion. a whole multiple (30 on
+  60 or 120) shows them all whatever this says.
+- **ride out dropped frames** (off, one, two, three ticks): delay held on purpose. a tick is one frame of the signal,
+  17 ms at 60 hz. without it a game frame that comes late holds the picture once, the delay rises, then falls back with
+  a short speed-up. with it the late frame is still in time and the longer gap is filled with made frames at even
+  steps: no hold, no rise, no catch-up. one tick covers a frame a tick late (a 50 ms gap at 30 fps) and capture jitter;
+  two cover a missed frame (66 ms, the one before shown twice); three a game that misses two in a row (100 ms) holds one
+  slot, not two. on replays of a 30 fps game dropping a frame a second, at fixed 60: one tick took the 50 ms case from
+  60 holds a minute to none; the 66 ms case needed two (119 to none). the price is that delay all the time, and the
+  overlay's delay says how much of it is held: "(33 held for drops)".
+- **even out the game's late frames** (needs ride out; with every signal tick, every screen refresh or a fixed rate):
+  most 30 fps games move their picture a fixed step a frame, late or not (measured on one: a 50 ms frame moved as far
+  as a 33 ms one). shown by when it came, such a frame crawls at two thirds speed for three refreshes: a rattle on near
+  detail while turning. with this, each frame is shown one step after the one before, the content plays a little slower
+  while the game is late (eased over a third of a second) and the delay floats inside the ride out. on replays of three
+  traces of that game the speed error fell from about 10 % to 3 to 4 %. what it costs, plainly:
+  - more delay: about a tick and a half more at the same ride out. at two ticks and fixed 60 the picture sat 48 to 109
+    ms behind arrival, mostly about 84.
+  - nearly every frame on screen is a made one (about 58 of 60 a second, against 30 without), so made frames' faults
+    show more, and they look softer: made frames as sharp as real ones is worth turning on with it. real frames is
+    held to 2 % of a gap under this switch, whatever it says.
+  - the sound is not stretched: it stays at the mean while the picture swings around it, up to about 30 ms either way
+    for a moment. untested by ear.
+  - wrong for a game that catches up after a late frame (moves by the time passed): that one gets the rattle instead.
+  - a missed frame (66 ms and more) and a freeze go by arrival as before.
+- **enhance the made frames too**: without it, the enhance net after the generator steps aside as soon as more than one
+  frame in ten is made (with even out, nearly always), on real frames too, so the picture stays alike. with it the net
+  runs on every frame that goes up, made or real. a 6x16 net at 1080p costs several ms each, and at 60 a second made and
+  real that is a lot: checked once a second, when the gpu time of a frame passes nine tenths of a slot or more than 2 %
+  of made frames come late for two seconds running, the net goes off on all frames for 15 s, then tries again, twice as
+  long each time up to 4 minutes. with enhance real frames only, made frames get the net itself here, not the real
+  frame's kept change. a net in the chain before frame generation needs none of this. not tried on a screen with a net.
+
+what the output rate does to the rest:
+
+- while made frames are more than one in ten of what goes up, the enhance net after generation, apple super resolution
+  and stabilise step aside, until made frames are under one in twenty-five for 3 s. source rate and all-real cases keep
+  them.
+- the frame schedule, the generated frame deadline and late frames a refresh later decide nothing; their overlay rows
+  say "the output rate decides". the capture clock times the frames whatever its switch says ("on: the output rate uses
+  it").
+- the delay rises at once when a frame comes later than it covers and gives back slowly (5 % of real time). made content
+  never steps back on the glass: a made frame that is late is left out.
+- the still rule and hud lock take the nearer real frame of the pair. hud lock can flicker for a moment when the delay
+  rises past two gaps.
+- the sound follows the picture's delay as it is on the glass.
+- glow with past picture (side bars) falls back to the glow.
+- built-in presets turn the output rate off and put its switches back to their defaults.
+
+the overlay shows an `out` line while it runs: frames a second and how many were real, made, nearer real (a slot whose
+in-between was never asked for), late and held, then left out, the late-evened speed and the screen's rate. the
+method follows macframegen and metalgoose, see `THIRD_PARTY_NOTICES.md`.
 
 ### huds and still things
 
@@ -541,9 +709,11 @@ what meyra does with the display, and what it asks of macos and the gpu.
 - **two screen buffers instead of three** (meyra menu, experimental, off): the layer cycles two buffers, not three:
   one frame less can queue before the screen. can stall when a frame takes long.
 - **game mode**: meyra tells macos it is a game, so full screen gets game mode (more cpu and gpu priority,
-  quicker bluetooth controllers and headphones). macos has no switch for that per app, so turning it off here
-  takes the claim out of the installed app's `Info.plist`. it counts from the next start, and it edits the app
-  bundle, so `codesign --verify` will complain afterwards. the app runs the same.
+  quicker bluetooth controllers and headphones). off is macos' own per-app switch, the same one as in the game mode
+  item in the menu bar: a per-user flag outside the app, the app itself is not changed. it may count only from the next
+  start. where macos has no such switch (it is not public, so older versions may lack it) the item is grey and says so.
+  v0.5.0 turned it off by editing the app's `Info.plist`, which broke the signature, and macos then refused the camera
+  without asking: see [when something is off](#when-something-is-off).
 - **keep the gpu awake** (meyra menu, off): the gpu slows its clock when it has little to do, and one net run or
   one generated frame every 16 ms is little: the same work then takes about twice as long as it would back to
   back. macos has no way to ask for the clock, so this keeps a small job on the gpu (32 threads spinning for
@@ -560,6 +730,8 @@ what meyra does with the display, and what it asks of macos and the gpu.
 - **play audio**: the source's sound, held back so it lands with the picture. off if the console's sound
   goes somewhere else.
 - **earlier / later**: nudges the sound 5 ms at a time, for when lips and voices are off.
+- with an output rate the sound follows the picture's delay as it lands on the glass, ride out included. with even out
+  the game's late frames it stays at the mean while the picture swings around it.
 
 ### window, overlay and comparing
 
@@ -571,6 +743,12 @@ what meyra does with the display, and what it asks of macos and the gpu.
   H steps from off to compact to full. compact: the steps left to right as they ran, each with a dot (green it ran,
   amber it is on but idle) and its key, one line of numbers and the presets. full: every switch in three columns,
   picture, motion, and now (source, timing, gpu ms per stage, window and presets). the row changed last is lit.
+  with an output rate the numbers line gets the delay held for drops and an `out` line (see
+  [output rate](#output-rate)); a card that sends too few frames gets an amber line of its own (see
+  [too few frames from the card](#too-few-frames-from-the-card)). the full overlay has rows for the side bars, the
+  letterbox crop, the side stretch, the six newer block matching switches and every output rate switch, each with its
+  reason when it is on and idle ("needs ride out drops", "the source's picture format is not one it takes", "canvas,
+  glow only").
 - **hints**: after a key or a menu command one line says what is set now and what that does. it stays until the
   next key while the overlay is up, 6 seconds otherwise. the menu items carry the same texts as tooltips.
 - **compare** (/, shift + / goes back): the original against the finished picture, with a caption on each. the original
@@ -588,6 +766,49 @@ what meyra does with the display, and what it asks of macos and the gpu.
   ultrawide. in full screen W steps through the size it renders at (720, 900, 1080 lines, the screen's own).
 - **streaming**: the window is titled "Meyra". keep it visible while another app captures it, macos stops
   updating covered or minimised windows.
+
+### side bars
+
+a 16:9 game on a wider window or screen leaves bars beside the picture, or above and below it on a taller one. picture
+> side bars (experimental, all off) decides what goes there. the picture's own pixels are never touched, snapshots and
+recordings leave the bars out, plain passthrough turns them off, and none of it is in presets. the looks were checked on
+pictures from a test tool, with little play on a screen yet.
+
+- **grey**: one flat dark grey instead of black, easier on the eyes next to a bright picture. next to no gpu. with the
+  brightness steps: very dark, dark (default), medium, light (10, 19, 29, 38 of 255).
+- **glow**: each bar glows in the colours of the picture's edge next to it, softer and darker further out, carried
+  straight out (not mirrored, else a pan would run the other way in the bar), with a dither of one level so dark
+  gradients do not band. it follows the picture a little late (200 ms; `sidesmooth:MS` or the `sideSmooth` setting, 30 to
+  1000) so a flash does not strobe there: flashes up to 125 ms barely reach the bars, a longer one comes in and goes
+  out a step each. a cut reaches them about an eighth of a second later. brightness steps as for grey, kept well below
+  the picture by default so a screen that dims on bright frames does not darken the game; softness: less soft, soft
+  (default), very soft. the frame's own gpu work is the bars alone (about 0.02 to 0.04 ms); the rest runs after the
+  frame has gone to the screen.
+- **glow with past picture** (an experiment on top of the glow): what the picture showed beside its edge a moment ago is
+  carried out into the bar as the picture moves, so a pan fills the bar on the side the picture moves away from, darker
+  and fading into the glow over about 1.5 s. where it is unsure (the side the camera turns towards, cuts, zoom or forward
+  motion, flat areas, things at different depths) it is the glow; marked hud areas and parts that do not move with the
+  picture are kept out. on gameplay footage it mostly shows the glow with a faint copy in the first ~70 px. not with
+  the side stretch, not with an output rate, not while the letterbox crop fills the window: the glow then, and the
+  overlay says "canvas, glow only". costs about 0.4 ms of cpu a new frame (about twice that from a 4k source), after
+  the frame has gone to the screen.
+- **fill the window with letterboxed pictures**: a game showing a wide picture with black bands above and below (a
+  2.39:1 cutscene) gets the band made larger until it fills the window. it takes bands of 4 % of the height or more each,
+  the picture between them 1.9 to 2.8 wide, its edges lit, steady for a second; a dark scene or a fade never counts. it
+  lets go in the same frame anything shows in the bands (subtitles in the band too). a game that boxes only some shots
+  gets a longer hold each time inside 10 s (1, 3, 6, 8 s), so it does not pump. eased in over 200 ms, out at once. a
+  little softer than without: the finished picture is scaled once more (about 85 to 90 % of the fine detail of making it
+  at that size). not with a compare view. snapshots stay the whole picture; recording while it fills the window keeps
+  only the middle, the outer parts of the wide picture are not in the file. hud areas cannot be marked while it fills
+  the window.
+- **stretch a third, two thirds, to fill**: the picture grows into that much of the side bars. the middle stays at its
+  true shape (0.3 of each half, about the middle fifth of a 3440 wide screen at full), past it each column gets wider
+  towards the edge, smoothly: faces in the middle keep their shape, huds and minimaps at the edges get wider, and things
+  speed up as a turn carries them out. at full on a 3440x1440 screen from 16:9 the very edge is about 2.5 times as wide
+  as the middle. grey or glow fill what it leaves. the letterbox crop wins while it fills the window. not with a compare
+  view. snapshots stay unstretched; recording while stretched keeps only the middle of the screen, bent, not the outer
+  parts of the picture. hud areas cannot be marked while stretched. hidden: `stretchCentre` (0 to 0.6, 0.3), the middle
+  that stays true, 0 for the plain curve.
 
 ### recording
 
@@ -653,29 +874,46 @@ newer. turn that off in the meyra menu, "check for updates at launch".
   fails, the app stays as it was. no checksum in the notes, no install.
 - **reverting**: the replaced version is kept in `~/Library/Application Support/Meyra/Previous Version/`.
 - **limits**: the checksum guards against a broken download, not against a compromised account. builds are
-  signed ad hoc for now, so macos asks for camera and microphone access again after an update. meyra cannot
+  signed ad hoc for now, so macos asks for camera and microphone access again after an update, or refuses capture
+  while the switch in system settings still looks on (see [when something is off](#when-something-is-off)). meyra cannot
   update itself from a disk image or straight out of downloads, move it to applications first.
 
 ## when something is off
 
-the usual suspects first. what cannot be fixed is under [known limits](#known-limits).
+moved to one place: [help](README.md#help) in the readme, symptom by symptom, each with the menu item or key that
+fixes it. also in the app under help > common problems and fixes. what cannot be fixed is under
+[known limits](#known-limits); questions go to the [discord](https://discord.gg/UpgbaZEUj4), with a
+[debug report](#debug-report).
 
-| what you see | what to do |
-|---|---|
-| macos refuses to open the app | it is not signed with an apple developer id. system settings > privacy & security > "open anyway", see [install](#install) |
-| macos asks for camera and microphone access | say yes to both: a capture card counts as a camera and its sound as a microphone. it asks again after an update, because builds are signed ad hoc for now |
-| blacks look grey or shadows look crushed | R, and pick the range by hand. the overlay shows the darkest value seen: 16 on a black picture means video range |
-| lips and voices are off | ; and ' move the sound 5 ms at a time. bluetooth headphones cannot be brought in step |
-| frame generation is greyed out in the menu | it needs macos 26 or later. the rest works |
-| frame generation is on and makes nothing | 60 fps content is shown as it is. otherwise the overlay's motion line says why. on a noisy usb card try tolerant repeats (P) |
-| a hud, minimap or subtitles shimmer | a softer still-area rule (S), hud lock (L), or mark the area yourself (Q) |
-| flat areas look smeared | turn dither removal off (B) for that game |
-| the picture is grainy and crunchy | metalfx sharpens grain too: lower the sharpening ([), or try an edge-aware upscaler (M) |
-| no picture from the console at 1440p | the ultrastudio recorder 3g reports some consoles at 1440p as 1080i. set the console to 1080p |
-| the sound is a bitstream (dolby, dts) | not decoded. set the console to pcm |
-| another app's capture of the window stands still | keep the window visible: macos stops updating covered or minimised windows |
-| meyra does not update itself | it cannot from a disk image or straight out of downloads. move it to applications first |
-| the settings are in a state | a preset key puts the picture and motion switches back, `defaults delete io.github.k33bs.meyra` resets the settings |
+## debug report
+
+help > copy debug report puts a plain text on the clipboard, to paste into an issue: what is needed to see what runs,
+without asking ten questions first.
+
+- **machine**: meyra's version and build, macos, the mac's model, chip, memory, cores, gpu, thermal state, low power mode.
+- **displays**: each screen's size in points and pixels, scale, refresh, its top rate and variable refresh range, which
+  one is built in, main, and has the window.
+- **source**: name, kind, format and layout, whether compressed is offered, audio input as automatic, none or chosen,
+  its state, the too-few-frames line.
+- **now**: the order line, frames in, new, cadence, delay, gpu, why frame generation makes nothing if it does not, gpu
+  ms per stage, window size, overlay, preset, the last message and error, the capture line (frames from the device,
+  timestamp spacing, drops by reason, what macos runs) and the same counts since the source started.
+- **capture start (kept)**: kept apart from the log so they are still there after minutes of play: each source start
+  with its format and layout, what was asked and what macos ran after the start and a second later, whether meyra had
+  to set it again, the first frame's size and layout, the first too-few-frames line and test switches in use.
+- **access**: camera and microphone permission as macos has it (read only, never asks; from terminal they are the
+  terminal's), whether the app's signature holds, and whether it is signed ad hoc.
+- **devices**: what `--list-devices` prints.
+- **changed settings**: every saved setting that differs from its default, and test switches given on the command line.
+- **log, last lines**: the last 20 of the once-a-second lines and the source lines; the others carry device ids and
+  folders, so they stay out.
+
+what is taken out: your home folder (as ~), the mac's name, your full name, an owner's name in front of a device
+("someone's iphone camera" becomes "iphone camera"), usb serials, mac addresses and other long ids (usb ids become
+vendor:product), audio input ids, and folders in values (only the last part stays). read it before you paste it anyway.
+
+`Meyra.app/Contents/MacOS/Meyra --debug-report` prints the same and quits, with no window, so without the source, now,
+capture start and log sections.
 
 ## known limits
 
@@ -685,7 +923,29 @@ the usual suspects first. what cannot be fixed is under [known limits](#known-li
   console to 1080p.
 - surround sound is folded down to stereo. dolby and dts bitstreams are not decoded, set the console to pcm.
 - interlaced formats are shown without deinterlacing.
-- capture cards that deliver compressed video may defeat repeated-frame detection, which frame generation needs.
+- capture cards that deliver compressed video may defeat repeated-frame detection, which frame generation needs. the
+  compressed layout has not been tried on a card that offers it.
+- the output rate needs macos 26 even for source rate and blend, and takes uncompressed 4:2:2 frames only (what every
+  route meyra has delivers). 24 / 25 fps content and the 50 fps rate are untried on a screen.
+- ride out dropped frames on 60 fps content: a picture that comes a few ms late on an otherwise usual gap is in time,
+  but the delay then rises a whole refresh on the next picture for a fraction of a second and comes back with a short
+  speed-up (on a replay of the recorder's timing, 59.94 on fixed 59.94 at one tick: 25 to 42 ms for 0.15 to 0.8 s, 9
+  times in 10 minutes). 30 fps games, what the switch is for, do not show it. a fix that netted the late picture took
+  more holds on a mixed 30 / 40 / 60 replay, so it is not in.
+- the output rate as a whole is experimental. seen in a log of a real run:
+  - every screen refresh on a clean 60 fps source, ride out off: the planner still holds a slot now and then (about 10 a
+    minute) and the delay saws between about 16 and 45 ms. short slow-downs in presenting can add a few missed refreshes.
+  - times 2 on 60 fps content on a 100 hz screen makes no frames and still adds a frame (about 16 ms) of delay. with
+    variable refresh the overlay's uneven gaps count is wrong in that mode (it measures against the rate, the screen
+    shows 60).
+  - while a rate runs, the overlay's top line can say "frame generation idle: waiting for a pair of frames" or "the
+    picture is still" though the rate is working.
+  - leaving or entering full screen with a rate running costs a visible hitch, about half a second.
+  - very uneven sources (4 to 20 new frames a second) swing the delay by tens of ms with ride out off.
+- not new, there since v0.5.0: on a still picture with frame generation on, the sound can jump about 0.2 s late for a
+  couple of seconds after a long-held frame.
+- recording while the letterbox crop or the side stretch fills the window keeps only the middle of the screen. side bars
+  are never in snapshots or recordings.
 
 ## building
 
@@ -706,7 +966,12 @@ only place the version lives. `OUT`, `BUNDLE_ID` and `SIGN` can be overridden, e
 |---|---|
 | `src/app.mm` | application, window, menus, source picker, overlay, command line |
 | `src/common.mm` | settings, log, clock |
-| `src/renderer.mm` | metal pipeline, frame analysis, presentation schedules, render thread |
+| `src/renderer.mm` | metal pipeline, frame analysis, presentation schedules, the output rate's path, render thread |
+| `src/slots.h` | the output rate's planner: which picture goes up on which slot, the delay, ride out, even out. plain c++, no app in it |
+| `src/sidefill.mm` | side bars: grey, glow, the stretch's last pass, the letterbox crop's zoom |
+| `src/canvas.mm` | side bars: glow with past picture |
+| `src/letterbox.mm` | finding the black bands of a letterboxed picture |
+| `src/debugreport.mm` | the debug report's machine, displays and settings parts, and what it takes out |
 | `src/cadence.h` | comparing frames and timing them: tolerant repeats, scene cuts, the capture clock |
 | `src/hashstab.mm` | shaders of hashed filters and stabilise, built the first time one of them is used |
 | `src/framegen.mm` | frame generation thread |
@@ -735,14 +1000,16 @@ only place the version lives. `OUT`, `BUNDLE_ID` and `SIGN` can be overridden, e
 
 | argument | effect |
 |---|---|
-| `--list-devices` | print the devices meyra can see and exit |
+| `--list-devices` | print the devices meyra can see and exit. under each system capture device, every pixel layout it reports per size and rate (`*` what the format opens, `+` offered as compressed), the rate ranges, and the sizes the menus leave out with the reason. names are cleaned as in the debug report, ids shortened to a short id and a hash (`[avf usb 534d:2130 #1a2b]`) |
+| `--list-devices --ids` | the same with the raw ids, as `--source avf:UNIQUEID` needs them |
+| `--debug-report` | print the [debug report](#debug-report) and exit, no window |
 | `--source ID` | `replay:PATH`, `avf:UNIQUEID` or `decklink:ID`, for this run only |
 | `--seconds N` | quit after n seconds, never asks for permissions |
 | `--log FILE` | write the once-a-second statistics to a file |
 | `--snapshot FILE` | save one processed frame as png |
 | `--capture-test FILE` | capture the window as other apps would, save as png |
 | `--window WxH`, `--screen NAME`, `--fullscreen` | where and how to open |
-| `--command NAME[@SECONDS]` | run a menu command after launch or that many seconds in, e.g. `sharp:0.3`, `upscale+@5` |
+| `--command NAME[@SECONDS]` | run a menu command after launch or that many seconds in, e.g. `sharp:0.3`, `upscale+@5`, `rate:3:60` (`rate:MODE:NUM`: fixed 10 to 240 fps, times 2 to 8) |
 | `--menu-dump` | log every menu item with its state, and its tooltip on a `tip` line |
 | `--set KEY=VALUE` | store a setting as if chosen in the menu |
 | `-KEY VALUE` | override a setting for this run, e.g. `-frameGen NO` |
@@ -755,10 +1022,17 @@ only place the version lives. `OUT`, `BUNDLE_ID` and `SIGN` can be overridden, e
 <summary>setting keys, for <code>--set KEY=VALUE</code> and <code>-KEY VALUE</code></summary>
 
 setting keys: `levels`, `deband`, `upscale`, `sharpen`, `frameGen`, `early`, `passthrough`, `audio`,
-`audioTrimMs`, `refresh`, `overlay`, `overlayFull`, `checkUpdatesAtLaunch`, `srWithGen`, `srPad`, `vsync`, `colour`, `keepRes`, `gameMode`, `muteOutput`, `enhance`, `enhanceAt`, `enhanceDown`, `enhanceReal`, `enhanceHold`, `superSample`, `look` (0 to 3), `compare` (0 to 7), `netHalf`, `genSmall` (0 off, 1 1280×720, 2 1344×768, 3 1536×864; a saved yes still means 1), `genDeadline` (0, 1), `genLateNext`, `gpuAwake`, `genStill`, `genModel`, `denoise`, `hudLock`, `cutTest`, `repeatTol`, `ptsTime`, `hudStill`, `hudRects`, `hudShow`, and the experimental `genShift`, `genDoubt`, `repeatRoll`, `grain` (0 to 1), `stabilise`, `lateDrawable`, `drawables` (2 or 3), and for recording `recMaxHeight` (the file at most this high, 0 as
+`audioTrimMs`, `refresh`, `overlay`, `overlayFull`, `checkUpdatesAtLaunch`, `srWithGen`, `srPad`, `vsync`, `colour`, `keepRes`, `gameModeOff` (since v0.6.0; v0.5.0's `gameMode` is read once and removed), `muteOutput`, `enhance`, `enhanceAt`, `enhanceDown`, `enhanceReal`, `enhanceHold`, `superSample`, `look` (0 to 3), `compare` (0 to 7), `netHalf`, `genSmall` (0 off, 1 1280×720, 2 1344×768, 3 1536×864; a saved yes still means 1), `genDeadline` (0, 1), `genLateNext`, `gpuAwake`, `genStill`, `genModel`, `denoise`, `hudLock`, `cutTest`, `repeatTol`, `ptsTime`, `hudStill`, `hudRects`, `hudShow`, and the experimental `genShift`, `genDoubt`, `repeatRoll`, `grain` (0 to 1), `stabilise`, `lateDrawable`, `drawables` (2 or 3), and for recording `recMaxHeight` (the file at most this high, 0 as
 shown, 1080), `recMbit` (bitrate in mbit, 0 by size), `recOverlay` (overlay and hint lines in the file), `recKeep`
-(keep the last 30 seconds). `defaults delete
-io.github.k33bs.meyra` resets them.
+(keep the last 30 seconds). new in v0.6.0, all experimental: for block matching `genSmallFast`, `genFallback`,
+`genSides`, `genOutline`, `genCutGuard`, `genSharp`; for the output rate `rate` (0 off, 1 every signal tick, 2 every
+screen refresh, 3 fixed, 4 times, 5 times following the gap, 6 source rate), `rateNum` (the fps for 3, 10 to 240, 60
+when unset; the times for 4 and 5, 2 to 8, 2 when unset), `rateBlend`, `rateSnap` (real frames, 0 to 0.45, 0.1),
+`rateCushion` (ride out, 0 to 3 ticks), `rateEvenLate`, `rateEnhanceMade`, and `rateEven` (no menu: 24 or 25 fps in a
+60 hz signal timed by an even clock, untried on a screen); for the side bars `sideFill` (0 black, 1 grey, 2 glow, 3 glow
+with past picture), `sideDim` (0.3 to 0.95, 0.7), `sideBlur` (0.25 to 2, 1), `sideSmooth` (ms, 30 to 1000, 200),
+`letterboxCrop`, `sideStretch` (0 to 3), `stretchCentre` (0 to 0.6, 0.3); and per source `layouts` (like `formats`).
+`defaults delete io.github.k33bs.meyra` resets them.
 
 </details>
 
@@ -778,7 +1052,28 @@ filter's strength, 0 to 1, 0.5), `-chain PRE:POST` (which stages run before the 
 after, on every frame; none set is `:DUS`, the usual order. the letters are in `src/common.h`).
 
 a few more sit with the switch they belong to: `-genModelDir DIR` (frame generator), `hudStill` (hud lock),
-`-recKeepSeconds N`, `-recMbit N` and `-recDir PATH` (recording).
+`-recKeepSeconds N`, `-recMbit N` and `-recDir PATH` (recording), `stretchCentre` (side stretch).
+
+for the output rate, on the command line only: `-rateCap NO` (presents no longer held to the screen's refresh, for
+testing the backed-up queue), `-rateDrain NO` (a backed-up queue is not shed), `-rateClock NO` (frames timed by
+arrival on the path instead of the capture clock), `-rateTestLate N` (every nth made frame counts as late),
+`-rateTestMax K` (a request holds at most k positions). on the command line or with `defaults write`: `rateFastWin N`
+(how many gaps the quick fall of the delay looks at, 8), and for the replay source `replayJitter MS` (every frame
+handed over up to that many ms off its tick, either way), `replayJitterSeed N` (12345), `replayJitterShape YES` (off
+the tick the way a real capture measured). all of these are logged as `settings: KEY VALUE (test)` when set.
+`autoCompressed YES`: a source that sends too few frames is switched to its compressed layout by itself, once per
+source and run, only while no layout was ever chosen for it; off, because it restarts capture and adds delay without
+asking.
+
+for system capture, as launch arguments or with `defaults write` (none set: the usual start plus the read-back; they
+show under changed settings and on a "test switches" line in the report): `-avfEarly YES` (format and rate set right
+after the input is added, before the output), `-avfKeepLock YES` (the device stays locked from the format set until
+after the start, as ffmpeg does; apple documents lock, set, unlock), `-avfReapply always` (format and rate set again
+after the start even when they match) or `-avfReapply NO` (only look), `-avfOut 420v|420f|native` (what the output
+asks for; 420v also prefers the device's own 420v format at that size and rate; native only where it is 2vuy, 420v or
+420f, else 2vuy and the log says so), `-avfAll YES` (early, keep lock, reapply always and 420v together). with 420v or
+420f the picture runs, but frame generation, the output rate and the noise filter take 2vuy only and stay idle.
+compiled, not yet run on a card.
 
 </details>
 

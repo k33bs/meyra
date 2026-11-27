@@ -1,5 +1,95 @@
 # changelog
 
+## v0.6.0
+
+released: 2026-11-27
+
+frames at any rate, side bars that are not black, a way round usb cards that send too few frames, and a debug
+report to paste. the new switches are all experimental and off unless you turn them on.
+
+- fixed: v0.5.0 with game mode in full screen switched off edited its own bundle (it took the game mode keys out of
+  its `Info.plist`). that broke the app's signature, and macos then refused it the camera without asking, while the
+  switch in system settings still showed on. every start put the edit back, so even a fresh copy broke itself again.
+  game mode off is now macos' own per-app switch (the one in the game mode item in the menu bar), a flag outside the
+  app, and the app is never edited. updating heals it: the update is a fresh, signed bundle, the old setting carries
+  over as the new flag, and a copy edited by v0.5.0 is put back when the original was kept. if the signature is
+  broken anyway, the camera message says so and what to do.
+
+- motion > output rate: how many frames a second go to the screen and when, instead of one made frame between two
+  real ones. every signal tick, every screen refresh, fixed 30 / 50 / 60 fps, times 2 / 3 / 4, times 2 following the
+  gap, source rate. block matching makes a frame at any point between two real ones; apple's and the second generator
+  only the middle, the other slots then show the nearer real frame (the overlay says so). needs frame generation on,
+  so macos 26. the frames go up no faster than the screen refreshes: a times mode the screen cannot take is thinned,
+  down to real frames only. every screen refresh leaves the display at its own rate and greys match display refresh.
+  while more than one frame in ten is made, the enhance net after generation, apple super resolution and stabilise
+  step aside, and the schedule, deadline and late frame switches decide nothing.
+- output rate > blend in-betweens instead of generating: a cross-fade of the two real frames by time. no motion to get
+  wrong, softer, little gpu.
+- output rate > real frames (fewest, some, more, all): where the screen's rate is not a whole multiple of the game's
+  (30 on 100 hz, 25 on 60), how many pictures go up as themselves rather than as a made frame a little off their time.
+  default some.
+- output rate > ride out dropped frames (one, two, three ticks: +17, +33, +50 ms at 60 hz): delay held on purpose, so a
+  game frame that comes late is still in time and the gap is filled with made frames at even steps. no hold, no
+  catch-up. the price is that delay all the time. a frame a tick late (50 ms at 30 fps) needs one tick, a missed one
+  (66 ms) two.
+- output rate > even out the game's late frames: with ride out on, a late game frame is shown one frame's step after the
+  one before, not by when it came, because most 30 fps games move a fixed step a frame, late or not. takes out a
+  rattle on near detail while turning. the costs are real: about a tick and a half more delay at the same ride out,
+  nearly every frame on screen is a made one, the sound is not stretched so lips can drift up to about 30 ms either way
+  for a moment, and a game that moves by the time passed gets the rattle instead. tried on one game so far.
+- output rate > enhance the made frames too: the enhance net keeps running while made frames go up, on every frame.
+  steps aside for 15 s (longer each time) when the gpu cannot keep up.
+- motion > frame generator, six more switches for block matching: find small fast things, go soft where the match is
+  bad, take one side, steady, keep the followed character whole, show a real frame across a cut, made frames as sharp as
+  real ones. go soft and the real frame across a cut only act with an output rate and are grey without one. block
+  matching with all six off makes the same bytes as in v0.5.0 at the same gpu time; their kernels and memory are set
+  up only once one is on (what stays: about 1 mb at 1080p, 4 at 4k).
+- picture > side bars: what the window leaves around the picture can be grey, a dim glow from the picture's edge, or
+  the glow with what the picture showed there a moment ago. brightness and softness steps. the picture itself is not
+  touched, snapshots and recordings leave the bars out.
+- side bars > fill the window with letterboxed pictures: a wide cutscene with black bands, steady for a second, is made
+  larger so the band fills the window. lets go at once when anything shows in the bands.
+- side bars > stretch a third, two thirds, to fill: the picture grows into the side bars, true in the middle, wider
+  towards the edges.
+- source > format > layout: where the device offers its format compressed as well, uncompressed (least delay, as
+  before) or compressed (mjpeg). some usb cards only reach 60 fps compressed. per source, also in choose source. the
+  format meyra opens by itself is marked (default).
+- when a capture card delivers well under its format's rate while the mac keeps up, the overlay says so and what to try
+  (compressed, a lower format, a usb 3 port without a hub). the motion line and cadence say it too. cameras are not
+  watched, and a card that evenly passes a 24 to 50 fps signal through gets no hint.
+- system capture reads back what macos really runs after the start and a second later (size, pixel layout, rate) and
+  sets it once more if it differs; if it still differs, the hint says so instead of blaming the card. every second the
+  log gets a capture line: frames from the device, their timestamp spacing, avfoundation's drops by reason, buffers
+  without a picture. the overlay shows a mismatch or drops only when there are some.
+- help > copy debug report: the mac, its screens, the capture devices and their formats, what runs now with the
+  capture counts, the capture start lines kept apart (asked, what macos ran, set again, first frame), camera and
+  microphone permission and whether the signature holds, and the changed settings, as text on the clipboard. no
+  names, serial numbers, mac addresses or folders. `--debug-report` prints the same and quits.
+- help in one place: the readme's new help section goes symptom by symptom (tearing, stutter, too slow, delay, no
+  picture, colours, sound, …) with the menu item or key for each; the manual's table points there. help > common
+  problems and fixes opens it, help > discord opens the discord, and the no-picture message names the first.
+- `--list-devices` lists, under each system capture device, every pixel layout it reports per size and rate. names are
+  cleaned and ids shortened to a short id and a hash; `--list-devices --ids` prints the raw ids for `--source`.
+- hidden test switches for system capture, for a card that stays short of its rate: `-avfEarly`, `-avfKeepLock`,
+  `-avfReapply always|NO`, `-avfOut 420v|420f|native`, `-avfAll` (see the manual). none set: the usual start.
+- the status overlay has rows for all of the above, an `out` line with what went up each second (real, made, nearer
+  real, late, held, left out), the delay held for drops, and "the output rate decides" on the rows it overrides. the
+  order line names side bars, letterbox crop and side stretch.
+- presets: the built-in ones turn the output rate off and put its switches (blend, real frames, ride out, even out,
+  enhance made frames) and the six block switches back to their defaults, so a key always gives the same thing. your
+  own presets keep what they saved; one saved before v0.6.0 gives these their defaults. side bars are left as they are.
+- output rate > source rate is now "source rate (real frames only)", apart from match display refresh's source rate.
+- known limit: ride out on 60 fps content raises the delay a refresh for a moment after a picture comes a few ms late
+  (see the manual's known limits). 30 fps games are not affected.
+- known limits of the output rate, all in the manual: every screen refresh on clean 60 fps still holds a slot now and
+  then and its delay saws between about 16 and 45 ms; times 2 on 60 fps on a 100 hz screen makes no frames but adds
+  about 16 ms, and with variable refresh its uneven gaps count is wrong; the overlay can say frame generation is idle
+  while a rate works; full screen in or out costs a hitch of about half a second; very uneven sources swing the delay
+  by tens of ms. not new: on a still picture with frame generation on, the sound can jump about 0.2 s late for a moment.
+- licence: the notices name macframegen and metalgoose for the output rate's methods. the still rules "by motion against
+  contrast" (since v0.3.0) are now credited as what they are: a port of metalgoose's stability blend, gpl-3.0 version 3
+  only, with a comment in the shader. side bars and the newer block switches have their lines too.
+
 ## v0.5.0
 
 a third frame generator, a sixth upscaler and a few more switches to try. all experimental and off unless you turn

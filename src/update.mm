@@ -12,6 +12,7 @@
 #import <Security/Security.h>
 #include "update.h"
 #include "common.h"
+#include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -169,27 +170,59 @@ static NSURL *stagingFor(NSURL *app, std::string &err) {
     return d;
 }
 
-// game mode off edits the installed app's Info.plist (app.mm), and an edited bundle no longer verifies. the signed
-// original is kept next to the previous version so it can be put back byte for byte
+// game mode: macos keeps a per-user "game mode off" for each app (what the game mode item in the menu bar sets), in
+// launch services, outside the bundle. there is no public name for it, the key is looked up at run time and the
+// switch says so when this macos has none. "can set" is false for a place launch services will not keep it for
+static NSString *lsKey(const char *sym) {
+    CFStringRef *k = (CFStringRef *)dlsym(RTLD_DEFAULT, sym);
+    return k && *k ? (__bridge NSString *)*k : nil;
+}
+
+int gameModeOff(NSURL *app) {
+    NSString *k = lsKey("_kCFURLApplicationPrefersGameModeDisabledKey"), *can = lsKey("_kCFURLCanSetApplicationPrefersGameModeDisabledKey");
+    if (!k || !can) return -1;
+    NSURL *u = app.filePathURL;
+    NSNumber *v = nil, *c = nil;
+    [u getResourceValue:&c forKey:can error:nil];
+    if (!c.boolValue || ![u getResourceValue:&v forKey:k error:nil]) return -1;
+    return v.boolValue ? 1 : 0;
+}
+
+bool setGameModeOff(NSURL *app, bool off) {
+    NSString *k = lsKey("_kCFURLApplicationPrefersGameModeDisabledKey");
+    if (!k || gameModeOff(app) < 0) return false;
+    NSURL *u = app.filePathURL;
+    if (![u setResourceValue:@(off) forKey:k error:nil]) return false;
+    [u removeAllCachedResourceValues];
+    return gameModeOff(app) == (off ? 1 : 0);
+}
+
+bool verifies(NSURL *app) {
+    SecStaticCodeRef code = NULL;
+    if (SecStaticCodeCreateWithPath((__bridge CFURLRef)app, kSecCSDefaultFlags, &code) != errSecSuccess) return false;
+    bool ok = SecStaticCodeCheckValidity(code, kSecCSStrictValidate | kSecCSCheckAllArchitectures, NULL) == errSecSuccess;
+    CFRelease(code);
+    return ok;
+}
+
+// 0.5.0 and older took the game mode keys out of the installed app's Info.plist and kept the signed original here
+// (one file, for the build that was edited last). nothing writes it any more
 static NSURL *signedPlist() {
     NSURL *as = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
     return [as URLByAppendingPathComponent:@"Meyra/Info.plist.signed"];
 }
 
-void keepSignedPlist(NSURL *app) {
-    // only bytes the signature still covers: a plist that was edited before must not become "the original"
-    if (runTool(@"/usr/bin/codesign", @[@"--verify", @"--strict", app.path]) != 0) return;
-    NSData *d = [NSData dataWithContentsOfURL:[app URLByAppendingPathComponent:@"Contents/Info.plist"]];
-    [NSFileManager.defaultManager createDirectoryAtURL:signedPlist().URLByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
-    if (d) [d writeToURL:signedPlist() atomically:YES];
-}
-
-bool restoreSignedPlist(NSURL *app) {
-    NSDictionary *was = [NSDictionary dictionaryWithContentsOfURL:signedPlist()], *is = infoOf(app);
-    if (!was || !is || [is[@"LSSupportsGameMode"] boolValue]) return false; // nothing kept, or not edited
+bool restoreSignedPlist(NSURL *app, NSURL *kept) {
+    NSURL *plist = [app URLByAppendingPathComponent:@"Contents/Info.plist"];
+    NSData *now = [NSData dataWithContentsOfURL:plist], *orig = [NSData dataWithContentsOfURL:kept ?: signedPlist()];
+    NSDictionary *was = orig ? [NSPropertyListSerialization propertyListWithData:orig options:0 format:nil error:nil] : nil, *is = infoOf(app);
+    if (![was isKindOfClass:NSDictionary.class] || !is || !now || [orig isEqualToData:now]) return false;
     for (NSString *k in @[@"CFBundleIdentifier", @"CFBundleShortVersionString", @"CFBundleVersion"])
         if (![was[k] isEqual:is[k]]) return false; // from another build
-    return [[NSData dataWithContentsOfURL:signedPlist()] writeToURL:[app URLByAppendingPathComponent:@"Contents/Info.plist"] atomically:YES];
+    if (![orig writeToURL:plist atomically:YES]) return false;
+    if (verifies(app)) return true;
+    [now writeToURL:plist atomically:YES]; // not the signed bytes after all: leave it as it was
+    return false;
 }
 
 static NSURL *keptDir() {
@@ -301,6 +334,7 @@ bool swapIn(NSURL *app, NSURL *staged, NSURL *kept, std::string &err) {
 bool revertIn(NSURL *app, NSURL *kept, std::string &err) {
     NSURL *src = [kept URLByAppendingPathComponent:@"Meyra.app"];
     if (!isRealDir(src) || ![infoOf(src)[@"CFBundleIdentifier"] isEqual:infoOf(app)[@"CFBundleIdentifier"]]) { err = "There is no previous version to go back to."; return false; }
+    restoreSignedPlist(src); // kept by 0.5.0 or older with its plist edited for game mode off
     std::string why;
     if (runTool(@"/usr/bin/codesign", @[@"--verify", @"--deep", @"--strict", src.path], &why) != 0) { err = "The previous version's code signature is no longer valid: " + why; return false; }
     NSURL *stage = stagingFor(app, err);

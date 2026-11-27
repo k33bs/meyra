@@ -4,8 +4,10 @@
 //
 // comparing frames and timing them: tolerant repeats, scene cuts, the capture clock. plain c++ on luma bytes and
 // seconds, nothing of the app in here, so the tests can run the same code on files.
-// the ideas (a +-3 level band for repeats, grid + histogram for cuts, capture time plus a tracked offset) are
-// described in veyra (github.com/Likely7/Veyra-NRVideo); written from the description, none of its code is here
+// the methods (a +-3 level band for repeats, grid + histogram for cuts, capture time plus a tracked offset) are
+// veyra's (github.com/Likely7/Veyra-NRVideo): its code was read to understand them, this one was written apart and
+// none of its code is here. the capture clock's gains, its ten-sample start, the outlier limit (a third of a frame,
+// 8 ms at most) and ignore-once-believe-twice are veyra's numbers and rules
 #pragma once
 #include <cmath>
 #include <cstdint>
@@ -162,19 +164,31 @@ inline int classify(const Grid &a, const Grid &b, CutState &st, Pair *out = null
 // most) is ignored once; a second one in a row on the same side is believed and the line moves there.
 // margin: frames must not be scheduled before they are here, so the time handed out is later than the line by twice
 // the mean deviation (all of an even jitter), at most the same limit. a clean source gets next to none
+// kClockDrift = kClockGain^2 / 4, the loop critically damped; kClockMean = 1 / kClockGain samples before it takes over
 static const int kClockMean = 10;
 static const double kClockGain = 0.1, kClockDrift = 0.0025, kClockLim = 0.008;
 struct PtsClock {
     int n = 0, side = 0;
     double off = 0, drift = 0, lastPts = 0, jit = 0;
     int ignored = 0, moved = 0, resets = 0;
+    bool med = false;              // the any-rate path: the median of the first samples, not their mean (see feed)
+    double first[kClockMean];
     void reset() { n = side = 0; off = drift = jit = 0; }
     // pts on the capture clock, arrival on ours, dur: the source's frame time. all seconds. returns the time to plan from
     double feed(double pts, double arrival, double dur) {
         double dp = pts - lastPts, s = arrival - pts, lim = fmin(dur / 3, kClockLim);
         if (n && (dp <= 0 || dp > 0.25)) { reset(); resets++; } // the timestamps jumped: a new stream
         lastPts = pts;
-        if (n < kClockMean) { off += (s - off) / ++n; return pts + off; }
+        if (n < kClockMean && med) { // the first callbacks after a stream jump often run late (gaps up to 22 ms around a
+            // stall): sample 1 alone set the line, content ran a few ms late and closed up over ten frames
+            first[n++] = s;
+            double v[kClockMean]; int m = n, k;
+            for (k = 0; k < m; k++) v[k] = first[k];
+            for (int i = 1; i < m; i++) for (int j = i; j > 0 && v[j] < v[j - 1]; j--) { double x = v[j]; v[j] = v[j - 1]; v[j - 1] = x; }
+            off = m % 2 ? v[m / 2] : m > 2 ? 0.5 * (v[m / 2 - 1] + v[m / 2]) : fmin(v[0], v[1]); // two: the earlier, one late is likelier
+            return pts + off;
+        }
+        if (n < kClockMean) { first[n] = s; off += (s - off) / ++n; return pts + off; } // first[]: rate coming on within ten reads it
         double want = off + drift * (dp / dur), e = s - want; // drift is per frame; a dropped frame is two
         int sd = e > 0 ? 1 : -1;
         if (fabs(e) > lim && side != sd) { side = sd; ignored++; off = want; return pts + off + margin(lim); }

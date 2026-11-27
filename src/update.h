@@ -42,8 +42,13 @@ bool swapIn(NSURL *app, NSURL *staged, NSURL *keptDir, std::string &err);
 bool revertIn(NSURL *app, NSURL *keptDir, std::string &err);
 int selfTest(const std::vector<std::string> &args);             // exit code
 
-// for the game mode switch, which edits the app's Info.plist: keep the signed original, put it back byte for byte
-void keepSignedPlist(NSURL *app);
-bool restoreSignedPlist(NSURL *app);                            // false: none kept for this build
+// game mode off (app.mm): macos' own per-app switch, a per-user launch services flag outside the bundle. the bundle
+// is never edited for it
+int gameModeOff(NSURL *app);                                    // 1 off, 0 on, -1 this macos has no such switch
+bool setGameModeOff(NSURL *app, bool off);
+bool verifies(NSURL *app);                                      // the bundle's signature holds, resources included
+// 0.5.0 and older turned game mode off by editing the app's Info.plist, which broke the signature and with it camera
+// access. puts the signed bytes kept by those versions back if they belong to this build. true: put back, verifies
+bool restoreSignedPlist(NSURL *app, NSURL *kept = nil);         // kept: the saved original, nil = the usual place
 
 }

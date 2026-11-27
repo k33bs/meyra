@@ -4,11 +4,13 @@
 
 meyra shows a game console on a mac, through an hdmi capture card. you play in a window on the mac.
 
+questions, problems, ideas: discord → https://discord.gg/UpgbaZEUj4
+
 [![latest release](https://img.shields.io/github/v/release/k33bs/meyra?include_prereleases&label=release)](https://github.com/k33bs/meyra/releases/latest)
 [![licence: gpl-3.0-or-later](https://img.shields.io/badge/licence-gpl--3.0--or--later-blue)](#licence)
 ![macos, apple silicon](https://img.shields.io/badge/macos-apple%20silicon-lightgrey)
 
-[install](#install) · [first five minutes](#the-first-five-minutes) · [every setting](#every-setting-in-a-few-words) · [manual](MANUAL.md) · [changelog](CHANGELOG.md)
+[install](#install) · [first five minutes](#the-first-five-minutes) · [every setting](#every-setting-in-a-few-words) · [help](#help) · [manual](MANUAL.md) · [changelog](CHANGELOG.md)
 
 </div>
 
@@ -129,8 +131,9 @@ a preset sets many picture and motion settings at once. there are ten, on the nu
 > [!WARNING]
 > presets 8, 9 and 0 use a net that was trained on gta vi and on nothing else. on other games it may well do worse.
 
-<kbd>shift</kbd> + a number key saves your settings, as they are now, on that key. more: [presets](MANUAL.md#presets) in the
-manual.
+<kbd>shift</kbd> + a number key saves your settings, as they are now, on that key. the built-in presets turn the
+output rate off and put the newer motion switches back to their defaults; the side bars stay as you set them. more:
+[presets](MANUAL.md#presets) in the manual.
 
 ---
 
@@ -155,7 +158,7 @@ a small neural net: a trained filter for the picture, which the setting "enhance
 | vsync | <kbd>V</kbd> | waits for the screen. off is a little faster, the picture can tear (show a break) |
 | take the screen buffer late | | experimental. meant to remove one small wait. more work for the mac |
 | two screen buffers instead of three | | experimental. one frame less waits before the screen. the picture can stop for a moment |
-| game mode in full screen | | tells macos that meyra is a game |
+| game mode in full screen | | tells macos that meyra is a game. off is macos' own per-app switch, the app itself is not changed |
 | keep the gpu awake | | keeps the graphics chip fast. uses more power |
 | check for updates | | asks now if there is a newer meyra |
 | check for updates at launch | | asks every time meyra starts |
@@ -169,14 +172,15 @@ more in the manual: [the screen and the last few ms](MANUAL.md#the-screen-and-th
 | setting | key | what it does |
 |---|---|---|
 | the list of devices | | picks which capture card is shown |
-| format | | picks the signal format to ask the card for |
+| format | | picks the signal format to ask the card for. the one meyra picks by itself says (default) |
+| format: layout | | only where the card offers it: uncompressed (least delay) or compressed (mjpeg). experimental. some usb cards only reach 60 fps compressed |
 | audio input | | picks where the sound comes from |
 | choose source | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>O</kbd> | card, format and sound in one window |
 | open replay folder | <kbd>⌘</kbd><kbd>O</kbd> | plays a folder of recorded test frames |
 | restart source | <kbd>⌘</kbd><kbd>R</kbd> | stops the card and starts it again |
 | save snapshot | <kbd>⌘</kbd><kbd>S</kbd> | saves one frame as a picture file |
 
-more in the manual: [capture devices and vendor drivers](MANUAL.md#capture-devices-and-vendor-drivers).
+more in the manual: [capture devices and vendor drivers](MANUAL.md#capture-devices-and-vendor-drivers), [too few frames from the card](MANUAL.md#too-few-frames-from-the-card).
 
 ### picture menu
 
@@ -191,6 +195,10 @@ more in the manual: [capture devices and vendor drivers](MANUAL.md#capture-devic
 | supersample | <kbd>U</kbd> | experimental. smoother edges, more work for the mac |
 | look | <kbd>.</kbd> | experimental. changes brightness and colour. adds no detail |
 | grain | | experimental. adds fine grain. meant to hide a plastic look |
+| side bars | | experimental. the empty space beside the picture: black, grey, a soft glow from the picture's edge, or the glow with what the picture just showed there |
+| side bars: very dark … light, less soft … very soft | | how bright and how soft the grey or glow is |
+| side bars: fill the window with letterboxed pictures | | experimental. a wide cutscene with black bands is made larger to fill the window |
+| side bars: stretch a third, two thirds, to fill | | experimental. the picture grows into the side bars. true in the middle, wider at the edges |
 | dither removal | <kbd>B</kbd> | removes the fine dot pattern many games add |
 | upscaling | <kbd>M</kbd> | how the picture is made bigger. hashed filters is experimental |
 | super resolution: pad edges | | for apple super resolution: cleaner outer edge |
@@ -202,7 +210,7 @@ more in the manual: [capture devices and vendor drivers](MANUAL.md#capture-devic
 | sharpening | <kbd>[</kbd> <kbd>]</kbd> | makes edges crisper. <kbd>[</kbd> is less, <kbd>]</kbd> is more |
 | plain passthrough | <kbd>Z</kbd> | turns all processing off |
 
-more in the manual: [picture basics](MANUAL.md#picture-basics), [upscaling](MANUAL.md#upscaling), [enhance nets](MANUAL.md#enhance-nets).
+more in the manual: [picture basics](MANUAL.md#picture-basics), [upscaling](MANUAL.md#upscaling), [enhance nets](MANUAL.md#enhance-nets), [side bars](MANUAL.md#side-bars).
 
 ### motion menu
 
@@ -210,10 +218,22 @@ more in the manual: [picture basics](MANUAL.md#picture-basics), [upscaling](MANU
 |---|---|---|
 | frame generation | <kbd>G</kbd> | makes 30 fps games move like 60 |
 | frame schedule | <kbd>E</kbd> | early: a little less delay. on the tick: steadier motion |
+| output rate | | experimental. how many frames a second go to the screen: every signal tick, every screen refresh, fixed 30 / 50 / 60, times 2 / 3 / 4, times 2 following the gap, source rate (real frames only). best with block matching |
+| output rate: blend in-betweens instead of generating | | experimental. the frames in between are a soft cross-fade, nothing can tear |
+| output rate: real frames | | experimental. fewest, some, more, all: how many game frames are shown as they are when the screen's rate does not fit the game's |
+| output rate: ride out dropped frames | | experimental. one, two or three ticks (+17, +33, +50 ms delay, all the time) so a late game frame does not stutter |
+| output rate: even out the game's late frames | | experimental. needs ride out. smoother turns in most 30 fps games, more delay, nearly every frame is made. wrong for some games |
+| output rate: enhance the made frames too | | experimental. the enhance net keeps running while made frames go up. heavy |
 | frame generator | <kbd>I</kbd> | experimental. picks what makes the generated frames |
 | frame generator: download | <kbd>return</kbd> | gets the second generator's files, when it is chosen |
 | find the whole picture's shift first | | experimental. block matching only: for when the whole picture moves fast |
 | take one side where the frames disagree | | experimental. block matching only: fewer double images |
+| find small fast things | | experimental. block matching only: a fast character or ball is followed instead of smeared |
+| go soft where the match is bad | | experimental. block matching with an output rate: soft instead of torn edges |
+| take one side, steady | | experimental. block matching only: calmer edges where something covers what is behind it |
+| keep the followed character whole | | experimental. block matching only: the character the camera follows keeps its outline |
+| show a real frame across a cut | | experimental. block matching with an output rate: no torn made frame at a cut or a camera whip |
+| made frames as sharp as real ones | | experimental. block matching only: the made frames lose less detail |
 | generate at | <kbd>T</kbd> | a smaller size is faster and softer |
 | generated frame deadline | | how long meyra waits for a generated frame |
 | show late generated frames a refresh later | | shows a late generated frame instead of leaving it out |
@@ -228,7 +248,7 @@ more in the manual: [picture basics](MANUAL.md#picture-basics), [upscaling](MANU
 | skip only after a lasting backlog | | experimental. waits longer before it skips a frame |
 | match display refresh | | lets meyra change how often the screen redraws, to fit the game |
 
-more in the manual: [frame generation](MANUAL.md#frame-generation), [huds and still things](MANUAL.md#huds-and-still-things), [cuts, repeats and timing](MANUAL.md#cuts-repeats-and-timing).
+more in the manual: [frame generation](MANUAL.md#frame-generation), [output rate](MANUAL.md#output-rate), [huds and still things](MANUAL.md#huds-and-still-things), [cuts, repeats and timing](MANUAL.md#cuts-repeats-and-timing).
 
 ### audio menu
 
@@ -285,27 +305,197 @@ more in the manual: [window, overlay and comparing](MANUAL.md#window-overlay-and
 | setting | key | what it does |
 |---|---|---|
 | keyboard shortcuts | | shows the list of keys |
+| copy debug report | | puts a text about your mac, screens, capture card and settings on the clipboard, to paste into a bug report. no names or serial numbers |
+| common problems and fixes | | opens the [help](#help) below in the browser |
+| discord | | opens meyra's discord: questions, problems, ideas |
 
-more in the manual: [keys](MANUAL.md#keys).
+more in the manual: [keys](MANUAL.md#keys), [debug report](MANUAL.md#debug-report).
 
 ---
 
-## when something is off
+## help
 
-| what you see | what to do |
-|---|---|
-| macos refuses to open meyra | system settings > privacy & security > "open anyway" |
-| blacks look grey, or shadows are too dark | press <kbd>R</kbd> until it looks right |
-| voices do not match the lips | press <kbd>;</kbd> or <kbd>'</kbd> until they match |
-| frame generation is grey in the menu | it needs macos 26 or newer |
-| frame generation is on but nothing changes | the game already runs at 60 fps. or press <kbd>H</kbd> and read the motion line |
-| the hud shimmers | press <kbd>4</kbd>, or press <kbd>Q</kbd> and drag a box around it |
-| flat areas look smeared | press <kbd>B</kbd> to turn dither removal off |
-| no picture with the console at 1440p | set the console to 1080p |
-| the console sends dolby or dts sound | meyra does not decode it. set the console's sound to pcm |
+the usual gotchas and what to do about them. menu paths are written menu > item, keys work while the picture is
+the active window. press <kbd>H</kbd> first: most answers start with a line in the status overlay. if things got
+in a state, <kbd>1</kbd> brings the standard picture and motion back. also in the app: help > common problems and
+fixes. stuck: ask on [discord](https://discord.gg/UpgbaZEUj4).
 
-more: [when something is off](MANUAL.md#when-something-is-off) and [known limits](MANUAL.md#known-limits) in the
-manual.
+### it won't start, or the window stays black
+
+- **macos refuses to open meyra**: system settings > privacy & security > "open anyway". see [install](#install).
+- **"meyra is not allowed to use capture devices"**: system settings > privacy & security > camera, turn meyra on.
+  after an update macos asks again (the builds are signed ad hoc for now): say yes to camera and microphone.
+- **no picture, macos never asks for the camera, though meyra's camera switch looks on**: most likely v0.5.0 with game
+  mode off. it edited its own app and broke the signature, and macos then refuses without asking. install the update or
+  a fresh download and allow. still no question: `tccutil reset Camera io.github.k33bs.meyra` in terminal, open meyra
+  again (`tccutil reset Microphone io.github.k33bs.meyra` if the sound is gone).
+- **"no picture from …, set it to 1080p"**: the console sends a mode the card cannot capture. set the console to 1080p.
+  the ultrastudio recorder 3g reports some consoles at 1440p as 1080i and shows nothing.
+- **"no signal"**: console on, cable in, the right card under source. source > restart source (<kbd>⌘</kbd><kbd>R</kbd>).
+- **black from video apps, or from a console that protects its output (hdcp)**: capture cards get no picture from
+  protected video. turn hdcp off on the console if it has the switch. nothing meyra can do about it.
+- **"meyra is off"**: meyra > turn meyra on.
+
+### the card sends too few frames, or the wrong size
+
+- **amber line "the card delivers 20 of 60 frames a second …"**: source > format > layout > compressed (mjpeg), where
+  the card offers it (experimental), or a lower format, or a usb 3 port on the mac itself, no hub or dock.
+  see [too few frames from the card](MANUAL.md#too-few-frames-from-the-card).
+- **"macos runs … at …, not the chosen …"**: pick the format again under source > format. if it stays, send a debug
+  report (below).
+- **wrong resolution**: meyra opens 1080p by itself, marked (default) under source > format; larger ones sit above it.
+  on the blackmagic driver route the same list is source > input.
+  source > choose source (<kbd>⇧</kbd><kbd>⌘</kbd><kbd>O</kbd>) sets card, format and sound in one window.
+
+### the picture tears
+
+- **a straight break line across the picture**: vsync is off. press <kbd>V</kbd> (meyra > vsync) to turn it on, it
+  costs a few ms. on a variable refresh screen in full screen (<kbd>F</kbd>) vsync on costs next to nothing.
+- **torn edges on moving things only**: that is the frame generator, not the screen. see artefacts below.
+
+### stutter, judder, uneven motion
+
+- **check the cadence first** (<kbd>H</kbd> until the full overlay): `30 in 60 (every frame comes twice)` is the
+  healthy case for a 30 fps game. anything else points at the game or the card (sections above and below).
+- **a 100 or 144 hz screen**: motion > match display refresh > automatic (the default) lets meyra switch it to a rate
+  the game fits. a variable refresh screen: set it to "variable" in system settings and go full screen (<kbd>F</kbd>).
+- **slightly uneven with frame generation**: motion > frame schedule > on the tick (<kbd>E</kbd>), steadier than early.
+- **the game dips under 30 or runs unlocked**: motion > output rate (experimental) > every signal tick, with motion >
+  frame generator > block matching (<kbd>I</kbd>). needs a screen at the signal's rate or variable refresh in full
+  screen; fixed 50 or 60 the same, at a multiple. see [output rate](MANUAL.md#output-rate).
+- **30 fps on a screen kept at 100 or 144 hz**: output rate > every screen refresh with block matching. most of what you
+  see is made then.
+- **a hitch every time the game drops a frame**: with an output rate on, output rate > ride out dropped frames > one
+  tick (+17 ms) or two ticks (+33 ms). costs that delay all the time.
+- **a rattle on near detail while turning, 30 fps game**: output rate > even out the game's late frames (experimental),
+  with ride out and every signal tick, every screen refresh or a fixed rate. more delay, nearly every frame is made,
+  wrong for some games.
+- **the card's timing wobbles**: motion > time frames by capture clock (<kbd>J</kbd>, experimental). only acts on the
+  early schedule with frame generation on.
+- **the picture stops for a moment now and then**: turn meyra > two screen buffers instead of three back off.
+- **overlay says "generated frames not ready in time"**: the mac is too slow for the settings, see the next section.
+  on a 100 / 120 hz or variable refresh screen, motion > show late generated frames a refresh later helps.
+- **frame generation off and a skip now and then**: motion > skip only after a lasting backlog (experimental).
+
+### not fast enough
+
+- **read the overlay's gpu line**: `gpu 9.1 of 16.7 ms a frame (55%)` is how long the graphics chip needs per frame
+  against the time one frame has. near or over 100 % it cannot keep up: late generated frames, stutter. press
+  <kbd>H</kbd> again for "gpu ms per stage", which names the step that costs.
+- **turn off in this order until it fits**:
+  1. enhance: picture > enhance > off (<kbd>N</kbd>), or a lighter net. 4x8 is light, 6x16 middle (presets
+     <kbd>8</kbd>, <kbd>9</kbd> and <kbd>0</kbd> use it), 8x24 and 12x32 are heavy, "realesr-general-x4v3" is for
+     still pictures only. picture > enhance > half precision makes some nets a little faster.
+  2. supersample (<kbd>U</kbd>), more gpu work. preset <kbd>0</kbd> turns it on.
+  3. output rate > enhance the made frames too, if on. heavy.
+  4. the second generator: back to apple's interpolator (<kbd>I</kbd>), which works on the neural engine, not the gpu.
+  5. noise filter (<kbd>D</kbd>), about 10 ms a frame. apple super resolution under upscaling (<kbd>M</kbd>), about
+     9 ms: edge-aware (fsr 1) costs nothing worth measuring.
+  6. meyra > take the screen buffer late, if on: it costs gpu time.
+  7. window > full screen keeps the window's resolution (<kbd>X</kbd>), or a smaller window (<kbd>W</kbd>). softer.
+- **apple's generator too slow**: motion > generate at (<kbd>T</kbd>) a smaller size, 11 ms down to about 4 a frame,
+  softer made frames. 1080p sources only.
+- **meyra > keep the gpu awake** makes the net and the second generator about one and a half times quicker on an idle
+  gpu. uses power. leave it off when another app has the gpu busy.
+- the numbers in these docs come from an m4 max. a smaller mac wants lighter settings: start at <kbd>1</kbd>.
+
+### frame generation does nothing
+
+- **grey in the menu**: it needs macos 26. so does the output rate.
+- **"not generating: source sends no repeated frames"**: meyra puts a made frame where the signal repeats one. a game
+  at a steady 60 has no repeats, and there is nothing to do. a noisy usb card, or the compressed layout, sends repeats
+  a few levels off: motion > tolerant repeat detection (<kbd>P</kbd>, experimental).
+- **the game runs at 40, dips, or sends no clean repeats**: an output rate fills the gaps whatever comes (see stutter
+  above).
+- **"too much changes from frame to frame"**: a cut or a very fast move. normal, the real frame stays up.
+- **"the card sends only n of 60 frames a second"**: see the card section above.
+
+### too much delay
+
+- **the fastest**: preset <kbd>3</kbd>, no generated frames. frame generation (<kbd>G</kbd>) costs about 30 ms.
+- **with frame generation**: frame schedule > early (<kbd>E</kbd>), a few ms. with apple's interpolator also generated
+  frame deadline > by the usual and generate at (<kbd>T</kbd>) 1280×720, down to about 23 ms. presets <kbd>5</kbd>
+  and <kbd>7</kbd> do the early part.
+- **a variable refresh screen**: full screen (<kbd>F</kbd>). measured 25 → 5 ms without frame generation, 85 → 36 with.
+- **what adds delay**: noise filter (about 10 ms), apple super resolution with frame generation (9 ms), ride out
+  (17 ms a tick, all the time), even out late frames (about a tick and a half more), every screen refresh (about a
+  refresh), the compressed layout (a little).
+- **the last few ms**: vsync off (<kbd>V</kbd>) is a few ms sooner and can tear. meyra > two screen buffers instead of
+  three (experimental) queues one frame less and can stall. the screen and the card add their own on top. see
+  [the screen and the last few ms](MANUAL.md#the-screen-and-the-last-few-ms).
+
+### soft or blurry picture
+
+- **more bite**: sharpening <kbd>]</kbd> (<kbd>[</kbd> softer). upscaling (<kbd>M</kbd>): metalfx is the sharpest,
+  apple super resolution and hashed filters are softer, plain is soft.
+- **soft in full screen**: turn window > full screen keeps the window's resolution (<kbd>X</kbd>) off. it renders at
+  the window's size and stretches.
+- **made frames softer than real ones**: generate at (<kbd>T</kbd>) full size. with block matching: frame generator >
+  made frames as sharp as real ones (experimental). the second generator (preset <kbd>6</kbd>) keeps more detail.
+- **the net's look comes and goes**: with an output rate it steps aside once most frames are made; output rate >
+  enhance the made frames too keeps it (heavy). enhance real frames only (<kbd>O</kbd>) leaves moving parts of made
+  frames without it.
+- **grainy and crunchy instead**: metalfx sharpens grain too. lower the sharpening (<kbd>[</kbd>), or upscaling >
+  edge-aware (fsr 1). flat areas smeared: dither removal off (<kbd>B</kbd>).
+
+### artefacts around moving things with frame generation
+
+- **hud, minimap or subtitles shimmer**: preset <kbd>4</kbd>, or a softer still areas rule (<kbd>S</kbd>), hud lock
+  (<kbd>L</kbd>), or mark it yourself: <kbd>Q</kbd> and drag a box (motion > mark hud area). clear hud areas when you
+  change game.
+- **smear on fast pans**: apple's interpolator blurs there. the second generator at 480 lines (preset <kbd>6</kbd>)
+  holds up best. a made frame across a scene cut: motion > better scene cut test (<kbd>K</kbd>).
+- **block matching tears edges or doubles things** (all experimental, under motion > frame generator): take one side,
+  steady; keep the followed character whole; find small fast things for a ball or a fast character. with an output
+  rate also go soft where the match is bad and show a real frame across a cut, or output rate > blend in-betweens
+  instead of generating, which cannot tear.
+- **still bad for this game**: frame generation off (<kbd>G</kbd>) or preset <kbd>3</kbd>.
+
+### wrong colours, grey or crushed blacks
+
+- **blacks look grey or shadows crushed**: picture > levels (<kbd>R</kbd>): video range (16–235) when blacks are grey,
+  full range (0–255) when shadows are crushed. the overlay shows the darkest value: 16 on a black picture means video
+  range.
+- **flat, or too loud**: picture > colour (<kbd>C</kbd>): bt.709 is exact and a little flat, srgb has more contrast,
+  the screen's own is the most saturated.
+- **black stays dark grey with the compressed layout** (darkest about 30): the card packs it wrong, levels cannot undo
+  that. uncompressed or a lower format can.
+- **odd brightness or colour**: picture > look (<kbd>.</kbd>) off, it is an experiment.
+
+### sound
+
+- **out of step with the lips**: <kbd>;</kbd> earlier, <kbd>'</kbd> later, 5 ms a press (audio > earlier by 5 ms /
+  later by 5 ms, reset delay). bluetooth headphones cannot be brought in step.
+- **a blackmagic card plays about 50 ms behind**: pick its "(blackmagic driver)" entry under source, not "(standard
+  capture)". that entry needs blackmagic's desktop video installed.
+- **no sound**: audio > play audio (<kbd>A</kbd>), source > audio input. the console sends dolby or dts: set it to
+  pcm, meyra does not decode bitstreams. after an update allow the microphone again.
+
+### picture too small, black bars
+
+- **bigger**: window size (<kbd>W</kbd>) steps up to what fits, full screen (<kbd>F</kbd>), window > actual size
+  (<kbd>⌘</kbd><kbd>0</kbd>) for one pixel per pixel.
+- **bars beside the picture on a wide screen**: they keep the shape right. picture > side bars (experimental): grey or
+  glow instead of black, or stretch a third, two thirds, to fill.
+- **black bands above and below in cutscenes**: side bars > fill the window with letterboxed pictures (experimental).
+
+### everything else
+
+- **output rate or its switches are grey**: frame generation is off, or the mac is not on macos 26. the overlay's
+  output rate row says what is missing.
+- **times 3 shows only real frames**: the screen is slower than three times the game; the overlay says "the screen
+  takes n /s".
+- **obs, discord or screen sharing shows a frozen window**: keep it visible, macos stops updating covered or minimised
+  windows.
+- **meyra does not update itself**: move it to applications first, it cannot from a disk image or downloads.
+- **settings in a state**: a preset key resets picture and motion, `defaults delete io.github.k33bs.meyra` resets all.
+
+### send a useful report
+
+help > copy debug report puts your mac, screens, card, formats and settings on the clipboard, without names or serial
+numbers. read it, then paste it into [discord](https://discord.gg/UpgbaZEUj4) or a
+[github issue](https://github.com/k33bs/meyra/issues), with what you see and what you tried. more:
+[debug report](MANUAL.md#debug-report) and [known limits](MANUAL.md#known-limits) in the manual.
 
 more to read: the [manual](MANUAL.md), the [changelog](CHANGELOG.md) and the
 [third-party notices](THIRD_PARTY_NOTICES.md).

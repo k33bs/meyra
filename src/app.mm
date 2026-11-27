@@ -9,6 +9,7 @@
 #import <ImageIO/ImageIO.h>
 #include "audio.h"
 #include "awake.h"
+#include "capcheck.h"
 #include "common.h"
 #include "display.h"
 #include "framegen.h"
@@ -21,6 +22,8 @@
 #include "renderer.h"
 #include "source.h"
 #include "update.h"
+#include "debugreport.h"
+#include <set>
 
 static const unsigned kAudioIoFrames = 128;     // output buffer. research ran at 64; 128 leaves room on a busy machine
 static const double kDefaultVideoDelay = 0.03;  // seconds, for the audio until the picture delay has been measured
@@ -28,7 +31,7 @@ static const double kDefaultVideoDelay = 0.03;  // seconds, for the audio until 
 struct Args {
     std::string source, log, snapshot, captureTest, screen;
     double seconds = 0, snapshotAt = -1, captureAt = -1;
-    bool listDevices = false, fullscreen = false, test = false;
+    bool listDevices = false, ids = false, debugReport = false, fullscreen = false, test = false;
     int winW = 0, winH = 0;
     std::vector<std::pair<std::string, std::string>> set;
     std::vector<std::string> commands;
@@ -50,9 +53,12 @@ static NSString *ns(const std::string &s) { return @(s.c_str()); }
 - (void)command:(NSString *)cmd;
 - (void)hudAreaAdd:(NSRect)r;            // in parts of the picture, y from the top. empty: the drag marked nothing
 - (void)say:(NSString *)t;               // a hint line that no command's table row covers
+- (NSScreen *)reportScreen;              // the debug report's parts from the running app
+- (void)reportLive:(const std::function<void(const char *, const std::string &)> &)section;
 @end
 
 static AppDelegate *gApp;
+static std::string reportText(AppDelegate *app);
 
 static NSString *const kCmp[] = {@"off", @"left | right", @"above / below", @"diagonal", @"side by side", @"stacked", @"stage strips", @"same strip"};
 static NSString *const kCmpLong[] = {@"off", @"original left, final right", @"original above, final below", @"diagonal", @"side by side, the same part", @"one above the other, the same part", @"every stage, strips of the picture", @"every stage, the same strip"};
@@ -60,6 +66,34 @@ static NSString *const kCmpLong[] = {@"off", @"original left, final right", @"or
 // presets: a whole set of switches at once, keys 1..9 and 0. each starts from the same plain base, so the same key
 // always gives the same thing. levels, colour, audio, window and display settings are left as they are
 static const char *const kLookName[] = {"off", "mild", "middle", "strong"};
+// any rate (gSet.rate): what it is set to, in a few words. num as the renderer reads it (0: 60 fps resp. times 2)
+// the real frames menu (rateSnap): the choice a value falls under, and its name. other values (set by hand) take the nearest
+static float snapKey(float s) { return s < 0.075f ? 0.05f : s < 0.125f ? 0.1f : s < 0.3f ? 0.15f : 0.45f; }
+static NSString *snapName(float s) { float k = snapKey(s); NSString *n = k == 0.05f ? @"fewest" : k == 0.1f ? @"some" : k == 0.15f ? @"more" : @"all"; return fabsf(s - k) > 1e-4f ? [NSString stringWithFormat:@"%@ (%.2f)", n, s] : n; }
+// ride out dropped frames (rateCushion): ticks of delay held on purpose, and the price at a 60 hz signal
+// rateEnhanceMade's state for the overlay (renderer.h RateInfo net)
+static NSString *netMadeName(const renderer::RateInfo &ri) {
+    if (!gSet.rateEnhanceMade) return @"off";
+    if (!rateRuns() || !ri.on) return @"idle: the output rate is not running";
+    if (ri.net == 2) return @"idle: enhance is off";
+    if (ri.net == 4) return @"idle: the chain runs the net before frame generation, or not at all";
+    if (ri.net == 3) return [NSString stringWithFormat:@"stepped aside: gpu %.1f ms a frame of a %.1f ms slot%@, again in %.0f s", ri.netGpu, ri.netSlot, ri.netLate > 0.02 ? [NSString stringWithFormat:@", %.0f %% made late", ri.netLate * 100] : @"", ri.netAgain];
+    return ri.netGpu > 0 ? [NSString stringWithFormat:@"on, gpu %.1f ms a frame of %.1f", ri.netGpu, ri.netSlot] : @"on";
+}
+static NSString *cushionName() { int c = gSet.rateCushion; return c == 1 ? @"one tick (+17 ms)" : c == 2 ? @"two ticks (+33 ms)" : c == 3 ? @"three ticks (+50 ms)" : @"off"; }
+static NSString *rateText() {
+    int r = gSet.rate;
+    double n = r == 3 ? (gSet.rateNum > 0 ? gSet.rateNum.load() : 60) : fmin(8, fmax(2, round(gSet.rateNum)));
+    switch (r) {
+    case 1: return @"every signal tick";
+    case 2: return @"every screen refresh";
+    case 3: return [NSString stringWithFormat:@"fixed %.0f fps", n];
+    case 4: return [NSString stringWithFormat:@"times %.0f", n];
+    case 5: return [NSString stringWithFormat:@"times %.0f following the gap", n];
+    case 6: return @"source rate";
+    default: return @"off";
+    }
+}
 struct Preset { const char *name, *what; NSDictionary *set; NSArray<NSString *> *nets; };
 static const std::vector<Preset> &presets() {
     static const std::vector<Preset> p = {
@@ -82,28 +116,62 @@ static const std::vector<Preset> &presets() {
 }
 
 // game mode: macos turns it on for a full screen app whose Info.plist says it is a game and supports it (the build's
-// plist does). there is no call to switch it per run, so "off" takes the keys out of the installed app's own plist.
-// launch services only reads a bundle again when its date changes, hence the touch and the re-register, and it only
-// counts from the next start.
-// this edits a signed bundle. fine for the ad hoc builds (still starts, same permissions, only
-// `codesign --verify` complains); with developer id + notarisation it has to become something else
-static bool gGameModeChanged;
-static NSString *infoPlist() { return [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Info.plist"]; }
-static bool gameModeDeclared() { return [[NSDictionary dictionaryWithContentsOfFile:infoPlist()][@"LSSupportsGameMode"] boolValue]; }
+// does, so it is on unless switched off). off is macos' own per-app switch, the one the game mode item in the menu bar
+// sets: a per-user flag in launch services, the bundle is not touched (update.mm). 0.5.0 and older took the keys out
+// of the installed app's Info.plist instead: that broke the signature, and macos then refused the camera without asking.
+// the flag belongs to the app at its path. "gameModeOff" keeps the choice for a moved or new copy, "gameModePath" is
+// where the flag was last seen. "gameMode" was 0.5.0's and its plist edit runs when it is off: it goes, so an old
+// copy that is gone back to leaves its plist alone
+static NSURL *appURL() { return NSBundle.mainBundle.bundleURL; }
+static bool gameModeOn() {
+    int f = update::gameModeOff(appURL());
+    return f < 0 ? ![NSUserDefaults.standardUserDefaults boolForKey:@"gameModeOff"] : f == 0;
+}
 static bool setGameMode(bool on) {
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:infoPlist()];
-    if (!d) return false;
-    bool had = [d[@"LSSupportsGameMode"] boolValue];
-    if (!on && had) update::keepSignedPlist(NSBundle.mainBundle.bundleURL); // the untouched one (if it still is), see update.mm
-    if (on && !had && update::restoreSignedPlist(NSBundle.mainBundle.bundleURL)) d = nil; // back to the signed bytes, nothing to write
-    else if (on) { d[@"LSSupportsGameMode"] = @YES; d[@"GCSupportsGameMode"] = @YES; d[@"LSApplicationCategoryType"] = @"public.app-category.games"; }
-    else { [d removeObjectsForKeys:@[@"LSSupportsGameMode", @"GCSupportsGameMode"]]; d[@"LSApplicationCategoryType"] = @"public.app-category.video"; }
-    NSData *x = d ? [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:nil] : nil;
-    if (d && (!x || ![x writeToFile:infoPlist() atomically:YES])) return false; // read-only place, e.g. run from a disk image
-    [NSFileManager.defaultManager setAttributes:@{NSFileModificationDate: NSDate.date} ofItemAtPath:NSBundle.mainBundle.bundlePath error:nil];
-    LSRegisterURL((__bridge CFURLRef)NSBundle.mainBundle.bundleURL, true);
-    logLine("game mode: %s in the app's Info.plist, counts from the next start", on ? "declared" : "removed");
+    if (!update::setGameModeOff(appURL(), !on)) return false;
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setBool:!on forKey:@"gameModeOff"];
+    [d setObject:appURL().path forKey:@"gameModePath"];
+    logLine("game mode: %s for this app (macos' per-app switch)", on ? "allowed" : "off");
     return true;
+}
+static void gameModeAtLaunch() {
+    NSURL *app = appURL();
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    // a plist edited by an older meyra: the signed bytes back if it kept them for this build, else the camera message
+    // says what to do (permissionText)
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfURL:[app URLByAppendingPathComponent:@"Contents/Info.plist"]];
+    if (info && !info[@"LSSupportsGameMode"] && !update::verifies(app) && update::restoreSignedPlist(app)) {
+        [NSFileManager.defaultManager setAttributes:@{NSFileModificationDate: NSDate.date} ofItemAtPath:app.path error:nil];
+        LSRegisterURL((__bridge CFURLRef)app, true); // launch services reads a bundle again only when its date changes
+        logLine("game mode: the Info.plist an older version edited is the signed one again");
+    }
+    NSDictionary *saved = [d persistentDomainForName:NSBundle.mainBundle.bundleIdentifier];
+    if (saved[@"gameMode"] && !saved[@"gameModeOff"]) [d setBool:![saved[@"gameMode"] boolValue] forKey:@"gameModeOff"];
+    [d removeObjectForKey:@"gameMode"];
+    int f = update::gameModeOff(app);
+    if (f < 0) return;
+    // here before: the flag is the truth, also when it was switched in macos' menu. elsewhere: only off is carried
+    // over, on is the default anyway and must not undo an off made in macos
+    if ([[d stringForKey:@"gameModePath"] isEqual:app.path]) [d setBool:f == 1 forKey:@"gameModeOff"];
+    else if ([d boolForKey:@"gameModeOff"] && f == 0) setGameMode(false);
+    else {
+        if (f == 1) [d setBool:YES forKey:@"gameModeOff"];
+        [d setObject:app.path forKey:@"gameModePath"];
+    }
+}
+
+// camera refused while the bundle does not verify: the switch in system settings cannot help, a fresh copy does
+static NSString *permissionText(const std::string &err) {
+    NSString *m = @(err.c_str());
+    if ([m rangeOfString:@"Privacy & Security > Camera"].location == NSNotFound) return m;
+    static int ok = -1;
+    if (ok < 0) ok = update::verifies(appURL());
+    if (ok) return m;
+    return [NSString stringWithFormat:@"macOS refuses Meyra the camera without asking: this copy of Meyra was changed after it was signed "
+            @"(Meyra 0.5.0 and older did that when Game Mode was turned off). The switch in System Settings does not help.\n"
+            @"Replace this copy with a fresh download from Meyra's releases page, open it and allow camera access. "
+            @"If no question comes, run tccutil reset Camera %@ in Terminal and open Meyra again.", NSBundle.mainBundle.bundleIdentifier];
 }
 
 // the enhance net chosen, where it sits, and why it is not running when it is not
@@ -137,7 +205,7 @@ static NSString *upscalerText(int up, const renderer::Stats &s, const superres::
         return up == 1 ? [@"MetalFX + " stringByAppendingString:t] : up == 3 ? [@"edge-aware FSR 1 + " stringByAppendingString:t] : up == 4 ? [@"edge-aware SGSR 1 + " stringByAppendingString:t] : up == 5 ? [@"hashed filters + " stringByAppendingString:t] : t;
     }
     NSString *t = s.sr ? [NSString stringWithFormat:@"Apple SR %.1f avg %.1f max ms", r.n ? r.sumMs / r.n : 0, r.maxMs] : up == 1 ? @"MetalFX" : up == 3 ? @"edge-aware FSR 1" : up == 4 ? @"edge-aware SGSR 1" : up == 5 ? @"hashed filters" : @"plain";
-    if (srYields()) t = [t stringByAppendingString:@" (Apple SR waits while frame generation is on)"];
+    if (srYields()) t = [t stringByAppendingString:rateRuns() && gSet.srWithGen ? @" (Apple SR waits while made frames go up)" : @" (Apple SR waits while frame generation is on)"];
     else if (s.srLate) t = [t stringByAppendingFormat:@", %d frames by MetalFX (late)", s.srLate];
     else if (effUpscale() == 2 && !s.sr && *superres::status()) t = [t stringByAppendingFormat:@" (Apple SR %s)", superres::status()];
     return t;
@@ -162,6 +230,12 @@ static const Tip kTips[] = {
     {"genmodel", "frame generator", "which generator makes the frames in between: apple's, a second one that is not part of meyra and runs from files you download or install yourself, or block matching, which needs no files"},
     {"#Frame Generator", 0, "which generator makes the frames in between: apple's, a second one that is not part of meyra and runs from files you download or install yourself, or block matching, which needs no files"},
     {"genshift", "shift first", "block matching: the shift of the whole picture is searched first and used as the start, for pans faster than about 160 px a frame (experimental)"},
+    {"gensmallfast", "small fast things", "block matching: small things that move fast (a character, a ball) are followed into the made frames instead of left behind or smeared, where the search used to lose them. the search takes a little longer: 2.4 to 2.7 ms a pair (experimental)"},
+    {"genoutline", "keep the followed character whole", "block matching: a still or slowly moving thing in front of moving scenery (the character the camera follows) keeps its outline, ground that only one of the two frames shows is filled from around it, and the picture's border is left alone. about 0.3 ms more a pair (experimental)"},
+    {"gensharp", "made frames as sharp as real ones", "block matching: the fine detail the shift loses is given back, held inside what is around each pixel so nothing rings. a slightly wrong match gets sharper too. a made frame takes 0.16 ms more (experimental)"},
+    {"gencutguard", "real frame across a cut", "block matching, output rate: when most of the picture fits no motion (a cut, a camera whip), the slots show the nearer real frame instead of a made one torn between two pictures, until most fits again (experimental)"},
+    {"gensides", "one side, steady", "block matching: where something covers or uncovers what is behind it, the side to show is chosen once for the pair and smoothed, so it does not turn into noise the way the older switch can. the search takes 0.4 to 0.5 ms longer a pair (experimental)"},
+    {"genfallback", "soft where the match is bad", "block matching with an output rate: where the frame before and the one after still disagree after both are moved into place, the made frame is a cross-fade of the two there. soft instead of torn edges around moving things. a made frame takes 0.65 to 0.73 ms (experimental)"},
     {"gendoubt", "one side where frames disagree", "block matching: where the frame before and the one after disagree about what moves where, the side that fits its surroundings is taken instead of a double image (experimental)"},
     {"gensmall:0", 0, "apple's interpolator gets the frames at full size: about 11 ms a frame, the sharpest generated frames"},
     {"gensmall:3", 0, "apple's interpolator gets a copy at 1536x864 and the result is scaled back up: about 7 ms instead of 11 a frame, a little softer. 1080p sources only"},
@@ -173,6 +247,33 @@ static const Tip kTips[] = {
     {"gendeadline:1", 0, "early schedule: a generated frame is waited for as long as 95 in 100 of the last 120 took, plus 2 ms. less delay with a quick generator, the slow few come too late"},
     {"gendeadline", "generated frame deadline", "early schedule: how long a generated frame is waited for before the picture goes on without it"},
     {"#Generated Frame Deadline", 0, "early schedule: how long a generated frame is waited for before the picture goes on without it"},
+    {"rate:0", 0, "off: the frame schedule makes one frame between every two real ones, and only when the source repeats every frame"},
+    {"rate:1", 0, "a frame for every tick of the signal: with block matching or blend every gap between two real frames is filled at the signal's rate, also when the game dips below 30 or runs unlocked (apple's and the second generator fill the middle only). needs a screen at the signal's rate or variable (experimental)"},
+    {"rate:2", 0, "a frame for every refresh of the screen, at the screen's own rate (100, 120, 144 hz): with block matching or blend most of what you see is made, not real. the display is left at its rate, match display refresh stays out of it. on a screen a little off the source (60.00 hz for 59.94) nearly every frame is made, at a phase that rolls through the gap every 16 s, and the delay is about a refresh more (experimental)"},
+    {"rate:3:30", 0, "30 frames a second at even times, whatever the source sends. needs a screen at a multiple of it or variable (experimental)"},
+    {"rate:3:50", 0, "50 frames a second at even times, whatever the source sends. needs a screen at a multiple of it or variable (experimental)"},
+    {"rate:3:60", 0, "60 frames a second at even times, whatever the source sends: with block matching or blend 25 or 40 fps filled to 60. needs a screen at a multiple of it or variable (experimental)"},
+    {"rate:4:2", 0, "twice the source's frames: one made in the middle of every gap, however long. needs a screen at least that fast: a slower one gets fewer, or only the real frames (60 fps content on a 60 hz screen) (experimental)"},
+    {"rate:4:3", 0, "three times the source's frames: with block matching or blend two made in every gap, evenly spaced. needs a screen at least that fast: a slower one gets fewer, or only the real frames (60 fps content on a 60 hz screen) (experimental)"},
+    {"rate:4:4", 0, "four times the source's frames: with block matching or blend three made in every gap, evenly spaced. needs a screen at least that fast: a slower one gets fewer, or only the real frames (60 fps content on a 60 hz screen) (experimental)"},
+    {"rate:5:2", 0, "twice the usual frame rate, and with block matching or blend as many made in a longer gap as fit it: meant to keep the output steady when the game dips. needs a screen at least that fast: a slower one gets fewer, or only the real frames (experimental)"},
+    {"rate:6", 0, "the source's own frames at their own times, nothing made in between: each a fixed delay after it came, as even as the source sends them. needs frame generation on (experimental)"},
+    {"rate", "output rate", "how many frames a second go to the screen and when. the frames in between are made at any point between two real ones: block matching makes any, apple's and the second generator only the middle, the rest then show the nearer real frame. once made frames are more than one in ten, the enhance net after generation, apple super resolution and stabilise step aside until they are under one in twenty-five for 3 s (a made frame alone goes up without the net), the frame schedule switches (schedule, deadline, late frames) decide nothing, and the capture clock times the frames whatever its switch says (experimental)"},
+    {"#Output Rate", 0, "how many frames a second go to the screen and when. the frames in between are made at any point between two real ones: block matching makes any, apple's and the second generator only the middle, the rest then show the nearer real frame. once made frames are more than one in ten, the enhance net after generation, apple super resolution and stabilise step aside until they are under one in twenty-five for 3 s (a made frame alone goes up without the net), the frame schedule switches (schedule, deadline, late frames) decide nothing, and the capture clock times the frames whatever its switch says (experimental)"},
+    {"ratesnap:0.05", 0, "fewest real frames: a picture goes up as itself only where a slot comes within 5 % of a gap of it, its other slots are made. the evenest motion, a step at most 1.6 ms off its time (30 fps on 100 hz: 10 of the 30 real)"},
+    {"ratesnap:0.1", 0, "some real frames, as it always was: within 10 % of a gap. steps up to 3-4 ms off (30 fps on 100 hz: 20 of 30 real, 25 on 60: 12 of 25)"},
+    {"ratesnap:0.15", 0, "more real frames: within 15 % of a gap. steps up to 4-6 ms off (30 fps on 100 hz: all 30, 40 on 100: 30 of 40, 25 on 60: 18 of 25)"},
+    {"ratesnap:0.45", 0, "all real frames: every picture goes up as itself at the slot nearest to it. steps up to half a refresh off (5 ms at 100 hz, 8 at 60)"},
+    {"ratecushion:0", 0, "off: delay only as the frames need it. a game frame that comes late holds the picture once and the delay rises, then falls back (a short speed-up)"},
+    {"ratecushion:1", 0, "one signal tick of delay held on purpose, +17 ms at 60 hz: a game frame that comes a tick late (a 50 ms gap in a 30 fps game) is still in time, the gap is filled with made frames at even steps. no hold, no rise. a frame later than that (the game missed one outright, a 66 ms gap) holds a slot and goes on, the delay stays: no catch-up after it. two ticks cover it"},
+    {"ratecushion:2", 0, "two signal ticks held on purpose, +33 ms at 60 hz: a frame the 30 fps game missed (a 66 ms gap, the next one shown twice) is still in time, made frames fill it at even steps. a frame later still (83 or 100 ms) holds a slot or two and goes on, the delay stays: no catch-up after it"},
+    {"ratecushion:3", 0, "three signal ticks held on purpose, +50 ms at 60 hz: a 30 fps game that misses two frames in a row (a 100 ms gap) holds one slot, not two, and one that misses one and a half (83 ms) none. for games whose misses come in pairs"},
+    {"#Ride Out Dropped Frames", 0, "delay held on purpose so that a game frame that comes one to three ticks late (the game dropped a frame or two) is still in time: no hold and no catch-up, the longer gap is filled with made frames at even steps. the price is that delay all the time: +17 ms a tick at a 60 hz signal, 20 ms at 50 hz (experimental)"},
+    {"rateevenlate", "even out late frames", "output rate, with ride out dropped frames: a game frame that comes late is shown one frame's step after the one before, not by when it came. most games at 30 fps move their picture a fixed step a frame, late or not (measured: a 50 ms frame moved as far as a 33 ms one), and by arrival such a frame crawls at two thirds speed for three refreshes, a rattle on near detail while turning. the content then plays a little slower while the game is late, the speed eased over a third of a second, and the delay floats inside the cushion. costs about a tick and a half more delay at the same cushion, and nearly every frame is a made one. wrong for a game that catches up after a late frame (moves by the time passed): that one gets the rattle instead. a missed frame (66 ms and more) and a freeze go by arrival as before (experimental)"},
+    {"rateenhancemade", "enhance made frames", "output rate: the enhance net keeps running while made frames go up, on every frame that goes up, made or real. without it the net steps aside as soon as more than one frame in ten is made, and with even out late frames nearly every frame is: the picture loses the net's sharpness. the net then runs on twice as many frames or more, a 6x16 net at 1080p costs several ms each; when the gpu cannot keep up (a frame's gpu time past nine tenths of a slot, or made frames coming late) it steps aside for 15 s on all frames and tries again, longer each time. with enhance real frames only, made frames get the net itself here, not the real frame's kept change. a net in the chain before frame generation needs none of this (experimental)"},
+    {"ratecushion", "ride out dropped frames", "output rate: delay held on purpose so that a game frame that comes late (the game dropped one) is still in time: no hold and no catch-up, the longer gap is filled with made frames at even steps. the price is that delay all the time: +17 ms a tick at 60 hz, 20 ms at 50 hz (experimental)"},
+    {"ratesnap", "real frames", "output rate, where the screen's rate is not a whole multiple of the source's (30 fps on 100 hz, 25 on 60): how many pictures go up as themselves instead of a made frame a little off their time. more real pictures: fewer made ones and their faults, a little less even motion, as a real one is shown up to a few ms from its own time. a whole multiple (30 on 60 or 120) shows them all whatever this says (experimental)"},
+    {"rateblend", "blend in-betweens", "output rate: the frames in between are a cross-fade of the two real frames by time, not generated. no motion to go wrong, softer, little gpu time. works whichever generator is chosen, needs the block generator to have started (experimental)"},
     {"genlatenext", "late generated frames", "a generated frame that is not ready when due is shown when it comes, a refresh later, instead of being left out. only on a screen that refreshes faster than the source sends (100, 120 hz, variable): at 60 hz the next refresh is the real frame's"},
     {"nethalf", "half precision", "the enhance net does the sums of its layers of up to 24 features in half precision: about 1.2 times quicker on 4x8 and 8x24 nets, next to nothing on 6x16 ones, the picture differs by a level or two of 255 at most. nets of 32 features are slower that way and stay as they are"},
     {"gpuawake", "keep the gpu awake", "a tiny job keeps the gpu busy so it does not slow its clock between frames: the enhance net and the second generator then run about one and a half times as quick, unless something else already has the gpu full. it uses more power and makes more heat for as long as meyra is in front with a picture and one of the two is on"},
@@ -204,6 +305,20 @@ static const Tip kTips[] = {
     {"stabilise", "stabilise", "the frame before, moved along the picture's motion and held to what is around each pixel now, is mixed in a little. meant to steady edges, the effect is small. steps aside while frames are generated (experimental)"},
     {"grain:0", 0, "no grain"},
     {"grain", "grain", "fine grain in the last pass, strongest in dark and mid tones, none in black and white. meant to cover the plastic look of cleaned areas (experimental)"},
+    {"sidefill:0", 0, "black bars, as always"},
+    {"sidefill:1", 0, "the bars are one flat dark grey instead of black, darker or lighter with the brightness steps below: easier on the eyes than black next to a bright picture. the picture itself is not touched, snapshots and recordings leave the bars out. next to no gpu (experimental)"},
+    {"sidefill:2", 0, "the bars glow in the colours of the picture's edge next to them, softer and darker further out, and follow the picture a little late so a flash, even a long one, does not strobe there; a cut reaches them about an eighth of a second later. the picture itself is not touched, snapshots and recordings leave the bars out. the gpu work is done after the frame is handed to the screen, so the frame's own work is only the bars (about 0.02 to 0.04 ms) (experimental)"},
+    {"sidefill:3", 0, "the glow, and over it what the picture showed beside its edge a moment ago, carried out into the bar as the picture moves: a pan fills the bar on the side the picture moves away from, darker and fading into the glow. where it is unsure (the side the camera turns towards, cuts, zoom, flat areas, things moving at different depths) it is the glow. marked hud areas and parts that do not move with the picture are kept out. not with the side stretch, not with an output rate (any rate): the glow then, and not while the letterbox crop fills the window. the cpu work (about 0.4 ms a new frame, about twice that at 4k) runs after the frame has gone to the screen, so it does not add to the delay (experimental)"},
+    {"sidefill", "side bars", "what the window leaves free beside the picture, or above and below it: black, a flat dark grey, or a dim glow from the picture's edge, or the glow with what the picture showed there before (experimental)"},
+    {"sidedim", "side bar brightness", "how dark the glow is against the picture's edge. dark keeps it well below the picture, so a screen that dims on bright frames does not darken the game"},
+    {"sideblur", "side bar softness", "how fast the glow goes soft away from the picture. softer shows less shape and less movement at the side of the eye"},
+    {"sidesmooth", "side bar lag", "how long the glow takes to follow the picture, in ms (30 to 1000, 200 if unset). longer is calmer through flashes, shorter keeps up with cuts"},
+    {"letterboxcrop", "letterbox crop", "when the game shows a wide picture with black bands above and below it (a cutscene in 2.39:1), steady for a second, the picture is made larger so the band fills the window. lets go at once when anything shows in the bands, a dark scene does not count. snapshots stay the whole picture; recording while it fills the window keeps only the middle: the outer parts of the wide picture are not in the file. not with a compare view. a little softer than without: the finished picture is scaled once more (experimental)"},
+    {"sidestretch:0", 0, "the picture keeps its shape, as always"},
+    {"sidestretch:1", 0, "the picture is made wider into a third of the side bars. the middle stays as it is, the stretch grows towards the edges: faces in the middle keep their shape, things at the edges get wider. snapshots stay unstretched; recording while stretched keeps only the middle of the screen: the file holds the bent middle, not the outer parts of the picture. not with a compare view, the letterbox crop wins when it fills the window (experimental)"},
+    {"sidestretch:2", 0, "the picture is made wider into two thirds of the side bars. the middle stays as it is, the stretch grows towards the edges: faces in the middle keep their shape, things at the edges get wider. snapshots stay unstretched; recording while stretched keeps only the middle of the screen: the file holds the bent middle, not the outer parts of the picture. not with a compare view, the letterbox crop wins when it fills the window (experimental)"},
+    {"sidestretch:3", 0, "the picture is made wider into all of the side bars. the middle stays as it is, the stretch grows towards the edges: faces in the middle keep their shape, things at the edges get wider. snapshots stay unstretched; recording while stretched keeps only the middle of the screen: the file holds the bent middle, not the outer parts of the picture. not with a compare view, the letterbox crop wins when it fills the window (experimental)"},
+    {"sidestretch", "side stretch", "when the window is wider than the picture, the picture can grow into the side bars instead of leaving them empty: true in the middle, wider towards the edges. a third, two thirds or all of the bars (experimental)"},
     {"enhancereal", "enhance real frames only", "the enhance net runs on real frames only, generated frames reuse what it added where the picture is still (experimental)"},
     {"enhancehold", "steady enhance", "what the enhance net adds is held steady over time where the picture is still, against flicker (experimental)"},
     {"look:0", 0, "the picture's colours and brightness as they come"},
@@ -247,6 +362,11 @@ static const Tip kTips[] = {
     {"refresh", "match display refresh", "whether meyra may switch the display's refresh rate to fit the source"},
     {"source", "source", "show this source"},
     {"format", "format", "the signal format asked of the device. choosing one restarts the source"},
+    {"layout:", 0, "uncompressed: the picture as the device sends it, the least delay. what meyra always used"},
+    {"layout", "layout", "compressed (mjpeg): the device sends jpeg pictures that the mac unpacks, a little more delay. some usb cards only reach their format's full frame rate this way. choosing one restarts the source. "
+                         "a repeated frame can come unpacked a little differently: if frame generation says the source sends no repeated frames, turn on tolerant repeats (P). "
+                         "if black looks dark grey (darkest about 30), the card packs video levels as full range jpeg: levels cannot undo that, uncompressed or a lower format can"},
+    {"debugreport", 0, "copies a text about this mac, its screens, the capture devices and their formats, what runs now and the changed settings, to paste into a message to the developer. no names, serial numbers or folders"},
     {"ain", "audio input", "where the sound is taken from. choosing one restarts the source"},
     {"restart", "source", "stopped and started again, the levels are detected afresh"},
     {"replay", 0, "plays a folder of recorded raw frames (NAME_f000.uyvy, ...) as the source"},
@@ -256,6 +376,8 @@ static const Tip kTips[] = {
     {"winsize+", "window size", "steps through 720p, 900p, 1080p, 1440p, 2160p, whatever fits the screen. in full screen: the size the picture is made at"},
     {"winsize", "window size", "the picture this many pixels high, the width follows the source's shape"},
     {"keys", 0, "the list of single keys that work while the picture has focus"},
+    {"helpfixes", 0, "opens the help on the project page in the browser: tearing, stutter, too slow, too much delay, no picture, sound, each with what to do"},
+    {"discord", 0, "opens meyra's discord in the browser: questions, problems, ideas. paste a debug report there"},
     {"updates", 0, "asks github whether there is a newer meyra"},
     {"updatesAtLaunch", "check for updates at launch", "asks once at every start, quiet unless there is something newer"},
     {"revertUpdate", 0, "back to the version that was installed before the last update"},
@@ -280,7 +402,7 @@ static const Tip kTips[] = {
     {"vsync", "vsync", "frames wait for the display. off shows them a few ms sooner and can tear"},
     {"latedrawable", "late screen buffer", "the screen's buffer is asked for after the frame's gpu work is written down, not before: a waiting buffer no longer holds the work up. costs gpu time (about twice the work in one test), whether it buys delay is not measured yet (experimental)"},
     {"drawables", "two screen buffers", "the layer cycles two buffers, not three: one frame less can queue before the screen, can stall when a frame takes long (experimental)"},
-    {"gamemode", "game mode", "meyra tells macos it is a game, so full screen gets game mode: more cpu and gpu priority. counts from the next start"},
+    {"gamemode", "game mode", "meyra tells macos it is a game, so full screen gets game mode: more cpu and gpu priority. off is macos' own per-app switch, the same as in the game mode item in the menu bar, the app itself is not changed. it may count only from the next start"},
     {"@orderFrontStandardAboutPanel:", 0, "version and licence"},
     {"@hide:", 0, "hides meyra. macos stops updating a window that is hidden"},
     {"@hideOtherApplications:", 0, "hides every other app"},
@@ -297,7 +419,7 @@ static const Tip kTips[] = {
     {"#Motion", 0, "frame generation and how the display's refresh rate is matched"},
     {"#Audio", 0, "the source's sound and when it plays"},
     {"#Window", 0, "full screen, window size, the status overlay"},
-    {"#Help", 0, "the single keys"},
+    {"#Help", 0, "the single keys, a debug report, common problems and fixes, discord"},
     {"#Services", 0, "what other apps offer here"},
     {"#Still Areas in Generated Frames", 0, "pixels that did not change between two real frames are taken from the real frames in generated ones, so huds and backgrounds do not shimmer. the rules differ in what counts as unchanged"},
     {"-nodevices", 0, "connect a capture device, or open a replay folder"},
@@ -441,7 +563,16 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
     double x0 = (double)((dw - fw) / 2), y0 = (double)((dh - fh) / 2); // from the drawable's top left
     double sx = b.width / dw, sy = b.height / dh, ox = 0, oy = 0;
     if ([l.contentsGravity isEqual:kCAGravityResizeAspect]) { sx = sy = fmin(sx, sy); ox = (b.width - dw * sx) / 2; oy = (b.height - dh * sy) / 2; }
+    int ca[4] = {}, cs[4] = {};
+    renderer::cropRects(ca, cs);
+    if (ca[2] > 0) { x0 = ca[0]; y0 = ca[1]; fw = (size_t)ca[2]; fh = (size_t)ca[3]; } // letterbox crop: the whole picture, past the view's edges
     return NSMakeRect(ox + x0 * sx, b.height - (oy + (y0 + fh) * sy), fw * sx, fh * sy);
+}
+// where a picture fraction f (0..1) lands across the stretched picture (0..1): the middle true, the edges pulled out
+static double stretchX(double f, float r, float c) {
+    double x = 2 * f - 1, m = 1 - c, a = fabs(x), y = a;
+    if (a > c) { double t = (a - c) / m; y = c + m * t + (r - 1) * t * t * t; }
+    return 0.5 + 0.5 * (x < 0 ? -y : y) / r;
 }
 - (void)showAreas:(double)seconds {
     if (seconds > 0) {
@@ -449,11 +580,17 @@ static CGSize gWindowed; // the picture's size in the window, what full screen k
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((seconds + 0.05) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self showAreas:0]; });
     }
     NSRect pr = self.pictureRect;
+    float stR = 1, stC = 0;
+    renderer::stretchNow(stR, stC);
     CGMutablePathRef path = CGPathCreateMutable();
     if (pr.size.width > 0 && (_marking || (gSet.hudShow && gSet.overlay) || nowSec() < _areasUntil)) // shown: only with the overlay
         for (int i = 0, n = gSet.hudN; i < n; i++) {
             double x = gSet.hudRect[4 * i], y = gSet.hudRect[4 * i + 1], rw = gSet.hudRect[4 * i + 2], rh = gSet.hudRect[4 * i + 3];
-            CGPathAddRect(path, NULL, CGRectMake(pr.origin.x + x * pr.size.width, NSMaxY(pr) - (y + rh) * pr.size.height, rw * pr.size.width, rh * pr.size.height));
+            if (stR > 1.001f) { // stretched: the left and right edges go through the same mapping as the picture
+                double gl = stretchX(x, stR, stC), gr = stretchX(x + rw, stR, stC);
+                CGPathAddRect(path, NULL, CGRectMake(pr.origin.x + gl * pr.size.width, NSMaxY(pr) - (y + rh) * pr.size.height, (gr - gl) * pr.size.width, rh * pr.size.height));
+            } else
+                CGPathAddRect(path, NULL, CGRectMake(pr.origin.x + x * pr.size.width, NSMaxY(pr) - (y + rh) * pr.size.height, rw * pr.size.width, rh * pr.size.height));
         }
     if (_dragging) CGPathAddRect(path, NULL, NSIntersectionRect(NSMakeRect(fmin(_from.x, _to.x), fmin(_from.y, _to.y), fabs(_to.x - _from.x), fabs(_to.y - _from.y)), pr));
     if (!_areasView && !CGPathIsEmpty(path)) {
@@ -571,11 +708,23 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     NSMenu *_sourceMenu;
     std::string _curDefaultFormat;
     bool _updating;
+    NSPopUpButton *_pickLayout;
+    NSTextField *_pickLayoutLabel;
+    SourceInfo _sourceInfo;        // the running source as listed when it started: its formats and layouts
+    // a card that sends far fewer frames than its format's rate (see checkStarved)
+    int _starveRun, _starveOk, _starveGot;
+    bool _starved;
+    CaptureCounts _cap;            // what the device delivered last second (system capture), see Source::takeCounts
+    CaptureCounts _capAll;         // the counts since the source started, for the debug report
+    bool _hasCap, _signalRateNoted, _starvePinned;
+    std::set<std::string> _autoPacked; // sources switched to a compressed layout on their own this run, once each
+    NSString *_lastMessage;        // the last message shown in the window, for the debug report
 }
 
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     gApp = self;
+    if (!gArgs.test) gameModeAtLaunch(); // before any source asks for the camera
     nets::load([NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"nets"]);
     // your own weights: any *.net dropped here is listed after the ones that ship
     nets::load([NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"Meyra/nets"]);
@@ -662,9 +811,6 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     if (gArgs.seconds > 0)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gArgs.seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self quit]; });
     // on by default, quiet unless there is something newer. it contacts api.github.com, the manual says what is sent
-    // an update brings a fresh plist: put the choice back
-    if (!gArgs.test && [NSUserDefaults.standardUserDefaults boolForKey:@"gameMode"] != gameModeDeclared())
-        gGameModeChanged = setGameMode([NSUserDefaults.standardUserDefaults boolForKey:@"gameMode"]);
     if (!gArgs.test && [NSUserDefaults.standardUserDefaults boolForKey:@"checkUpdatesAtLaunch"]) [self checkForUpdates:YES];
 }
 
@@ -727,6 +873,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     SourceOptions o;
     o.format = [[d dictionaryForKey:@"formats"][ns(id)] description].UTF8String ?: "";
     o.audioInput = [[d dictionaryForKey:@"audioInputs"][ns(id)] description].UTF8String ?: "auto";
+    o.layout = [[d dictionaryForKey:@"layouts"][ns(id)] description].UTF8String ?: "";
     o.audio = gSet.audio;
     o.mayPrompt = !gArgs.test;
     return o;
@@ -748,7 +895,11 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     bool same = id == _sourceId;
     _sourceId = id;
     _sourceName = id.rfind("replay:", 0) == 0 ? "Replay" : id;
-    for (auto &s : listSources()) if (s.id == id) _sourceName = s.name;
+    _sourceInfo = SourceInfo();
+    for (auto &s : listSources()) if (s.id == id) { _sourceName = s.name; _sourceInfo = s; }
+    _starveRun = _starveOk = _starveGot = 0;
+    _starved = false;
+    _cap = _capAll = CaptureCounts(); _hasCap = _signalRateNoted = _starvePinned = false;
     if (id.rfind("replay:", 0) == 0) _sourceName = std::string("Replay: ") + [ns(id.substr(7)) lastPathComponent].UTF8String;
     _win.subtitle = ns(_sourceName);
     _hadFrames = false;
@@ -772,12 +923,16 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     if (_sourceAudio && !audio::start(kAudioIoFrames)) logLine("audio output could not start");
     std::string err;
     logLine("source: %s (%s)", _sourceName.c_str(), id.c_str());
+    if (id.rfind("avf:", 0) == 0) { // kept for the debug report, without the id
+        SourceOptions o = [self optionsFor:id];
+        logPin("source start: %s, format %s, layout %s", _sourceName.c_str(), o.format.empty() ? "default" : o.format.c_str(), o.layout.empty() ? "uncompressed" : o.layout.c_str());
+    }
     if (!_source->start(err)) {
         logLine("source failed: %s", err.c_str());
         _status = {SourceState::Error, err};
         _source.reset();
         audio::stop();
-        [self showMessage:ns(err)];
+        [self showMessage:permissionText(err)];
         return;
     }
     [self showMessage:@"Starting…"];
@@ -798,7 +953,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         renderer::clear();
         [self showMessage:[NSString stringWithFormat:@"%@ was disconnected.\nIt will start again when it is plugged back in.", ns(_sourceName)]];
     } else if (st.state == SourceState::Error) {
-        [self showMessage:ns(st.text)];
+        [self showMessage:permissionText(st.text)];
     }
     _fps = _source ? 1 / _source->frameDuration() : 0;
     [self applyRefresh];
@@ -835,8 +990,12 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     _last = s; _lastGen = g; _lastSr = r;
     _framesLastSecond = s.in;
     // audio follows the picture: aim at the measured capture -> glass time of real frames
-    if (s.toGlassN) {
-        double vd = s.toGlassSum / s.toGlassN / 1000 + (s.lagN ? s.lagSum / s.lagN / 1000 : 0);
+    // any rate: by glass - content time of the frames that moved content on, what the eye gets. its real frames can
+    // come late or not at all
+    bool rateOn = renderer::rateInfo().on;
+    double vg = rateOn && s.cNewN ? s.cNewSum / s.cNewN : s.toGlassN ? s.toGlassSum / s.toGlassN : 0;
+    if (vg > 0) {
+        double vd = vg / 1000 + (s.lagN ? s.lagSum / s.lagN / 1000 : 0);
         _videoDelay = _videoDelay > 0 ? _videoDelay + (vd - _videoDelay) * 0.5 : vd; // halfway each second: steady, still quick
     }
     // muteOutput: automated tests keep the speakers quiet while still measuring the sound path
@@ -854,15 +1013,24 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         }
     }
 
+    _cap = CaptureCounts();
+    _hasCap = _source && _source->takeCounts(_cap);
+    if (_hasCap) { // a burst at start would be gone from the ring by the time a report is copied
+        _capAll.frames += _cap.frames; _capAll.noImage += _cap.noImage; _capAll.late += _cap.late;
+        _capAll.outOfBuffers += _cap.outOfBuffers; _capAll.discontinuity += _cap.discontinuity; _capAll.otherDrop += _cap.otherDrop;
+    }
+    [self checkStarved:s];
     // what to tell the user when there is no picture
     if (s.in > 0 && _source) { // not the last frames of a source that was just stopped: its message stays
         if (!_hadFrames) { _hadFrames = true; [self applyRefresh]; }
+        static bool fmtOk = true; // the source's format decides whether rate 2 can run: match display refresh follows it
+        if (renderer::rateSourceOk() != fmtOk) { fmtOk = !fmtOk; if (gSet.rate == 2) [self applyRefresh]; }
         [self showMessage:nil];
     } else if (_source) {
         NSString *m;
         if (_status.state == SourceState::Error) m = ns(_status.text);
         else if (_status.state == SourceState::NoSignal || s.nosignal > 0) m = [NSString stringWithFormat:@"%@\nCheck that the source is switched on and the cable is connected.", ns(_status.text.empty() ? "No signal" : _status.text)];
-        else if (_status.state == SourceState::Running) m = [NSString stringWithFormat:@"No picture from %@ (%@).\nIf the source sends a mode this device cannot capture, set it to 1080p.", ns(_sourceName), ns(_status.text)];
+        else if (_status.state == SourceState::Running) m = [NSString stringWithFormat:@"No picture from %@ (%@).\nIf the source sends a mode this device cannot capture, set it to 1080p.\nMore in Help → Common Problems and Fixes.", ns(_sourceName), ns(_status.text)];
         else m = [NSString stringWithFormat:@"%@…", ns(_status.text)];
         if (_hadFrames) { _hadFrames = false; gSet.freeze = false; renderer::clear(); }
         [self showMessage:m];
@@ -888,7 +1056,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
             s.net, s.netPx / 1e6, renderer::extraText(0, s).c_str(), renderer::extraText(1, s).c_str(), renderer::extraText(2, s).c_str(), s.drained, gSet.hudN.load());
     if (gSet.hudShow || _view.marking) [_view showAreas:0]; // the picture's place can have changed
     // the experimental switches: a line of their own, only while one is on
-    if (gSet.hudLock || gSet.cutTest || gSet.repeatTol || gSet.ptsTime)
+    if (gSet.hudLock || gSet.cutTest || gSet.repeatTol || gSet.ptsTime || renderer::rateClock())
         logLine("extras: hud lock %.2f%% of the picture locked (-100: not counted) | cuts %d flashes %d | repeats: most samples over the band %d, largest block shift %.3f | "
                 "capture clock: deviation %.2f ms margin %.2f ms, ignored %d followed %d restarts %d",
                 renderer::hudLocked() * 100, s.cuts, s.flashes, s.repOver, s.repShift, s.ptsJit, s.ptsMargin, s.ptsIgnored, s.ptsMoved, s.ptsResets);
@@ -896,6 +1064,21 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     if (gSet.genDeadline || gSet.genLateNext || gSet.gpuAwake)
         logLine("speed: deadline %s %.1f ms after arrival | late frames shown a refresh on %d (room %d) | gpu awake %s, job %.2f ms",
                 gSet.genDeadline ? "by the usual" : "by the slowest", renderer::genBudgetMs(), s.genNext, (int)renderer::genLateRoom(), awake::running() ? "running" : gSet.gpuAwake ? "resting" : "off", awake::jobMs());
+    // the frame log's pair figures (any rate, block generator, see framegen::Figures): only while it is on
+    if (blocks::measuring()) {
+        framegen::PairStats p = framegen::takePairStats();
+        if (p.n) {
+            float lo = 1e9f, hi = 0;
+            double sum = 0;
+            int lng = 0, k = p.nFig ? p.nFig : 1;
+            for (int i = 0; i < p.nGap; i++) { lo = fminf(lo, p.gap[i]); hi = fmaxf(hi, p.gap[i]); sum += p.gap[i]; }
+            for (int i = 0; i < p.nGap; i++) lng += p.gap[i] > lo * 1.25f;
+            logLine("pairs: %d solved (%d with figures), gap %.1f min %.1f avg %.1f max ms, %d over 1.25 x the shortest | motion %.1f avg %.1f max px, "
+                    "median vector %.1f %.1f px avg | err %.4f unfit %.2f%% | fall %.2f%% avg %.2f%% max (%d frames)",
+                    p.n, p.nFig, lo, sum / p.nGap, hi, lng, p.lenSum / k, p.lenMax, p.vxSum / k, p.vySum / k, p.errSum / k, p.unfitSum / k * 100,
+                    p.fallN ? p.fallSum / p.fallN * 100 : 0, p.fallMax * 100, p.fallN);
+        }
+    }
     if (audio::running())
         logLine("   audio %d frames/s | delay %.0f ms (video %.0f, trim %+.0f) | underruns %d overruns %d resyncs %d gaps %d | jitter %.1f ms | "
                 "peak in %.3f %.3f (any channel %.3f) out %.3f | %s",
@@ -903,22 +1086,124 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
                 a.peakL, a.peakR, a.rawPeak, a.outPeak, audio::statusLine().c_str());
     if (s.in) logLine("   order %s | cadence %s%s%s", [[self orderParts:s] componentsJoinedByString:@" -> "].UTF8String, [self cadence:s].UTF8String,
                       gSet.frameGen && [self genWhy:s] ? " | not generating: " : "", gSet.frameGen ? ([self genWhy:s] ?: @"").UTF8String : "");
+    // content time per present (renderer.h): even motion moves content exactly as far as the presents are apart. only
+    // while the any-rate path runs: rate 0's log stays as it was (the frame log has the times)
+    renderer::RateInfo ri = renderer::rateInfo();
+    if (ri.on && (s.callN || s.cGlassN))
+        logLine("   content: step against present spacing, at the call %d off %d mean %.2f max %.1f ms, on the glass %d off %d mean %.2f max %.1f ms | glass - content %.1f avg %.1f min %.1f max ms (%d)",
+                s.callN, s.callOff, s.callN ? s.callErr / s.callN : 0, s.callMax, s.stepN, s.stepOff, s.stepN ? s.stepErr / s.stepN : 0, s.stepMax,
+                s.cGlassN ? s.cGlassSum / s.cGlassN : 0, s.cGlassN ? s.cGlassMin : 0, s.cGlassMax, s.cGlassN);
+    static const char *const kWhy[] = {"start", "rise", "fall", "fast", "pause", "drift"}; // slots.h
+    if (ri.on)
+        logLine("   rate: %s | slots real %d made %d late %d nearer %d held %d passed over %d left out %d (of the nearer: off the middle %d) | planner d %.1f ms (%s) budget %.1f ms period %.2f ms num %.2f | rises %d steps %d late %d pauses %d held %d%s%s%s%s%s",
+                rateText().UTF8String, s.slotReal, s.slotGen, s.slotLate, s.slotFall, s.slotHold, s.slotSkip, s.drained, s.slotMid, ri.d * 1000, ri.why >= 0 && ri.why < 6 ? kWhy[ri.why] : "?",
+                ri.budget * 1000, ri.period * 1000, ri.num, ri.rises, ri.steps, ri.late, ri.pauses, ri.held, [NSString stringWithFormat:@"%@%@%@", ri.lag >= 0 ? [NSString stringWithFormat:@" | glass lag %.1f ms", ri.lag * 1000] : @"", ri.screen > 0 ? [NSString stringWithFormat:@" | the screen takes %.0f /s", ri.screen] : @"",
+                                                                                                  ri.hz > 0 ? [NSString stringWithFormat:@" | screen %.3f hz", ri.hz] : @""].UTF8String,
+                s.slotMid ? " | " : "", s.slotMid ? [self rateNote:s].UTF8String : "",
+                ri.even ? [NSString stringWithFormat:@" | late frames evened: speed %.3f level %.1f ms, by count %ld by arrival %ld kept under the cushion %ld", ri.speed, ri.level * 1000, ri.counted, ri.byArrival, ri.capped].UTF8String : "",
+                !ri.net ? "" : [NSString stringWithFormat:@" | enhance on made frames: %s, gpu %.1f ms a frame (p95) of a %.1f ms slot, made late %.1f %%, stepped aside %d times%@", ri.net == 1 ? "on" : ri.net == 2 ? "idle (enhance is off)" : ri.net == 4 ? "idle (no net after the interpolator in the chain)" : "stepped aside",
+                                                           ri.netGpu, ri.netSlot, ri.netLate * 100, ri.netTrips, ri.net == 3 ? [NSString stringWithFormat:@", again in %.0f s", ri.netAgain] : @""].UTF8String);
     if (s.stageN) logLine("   stages %s | their sum %.2f of %.2f ms, the gpu time of the %d command buffers measured", [[self stageParts:s] componentsJoinedByString:@"  "].UTF8String,
                           [self stageSum:s], s.stageCb, s.stageN);
+    if (_hasCap) logLine("   capture %s", [self capText].UTF8String); // system capture: what the device itself delivered
     [self updateOverlay:s gen:g sr:r];
     if (_win.styleMask & NSWindowStyleMaskFullScreen) [NSCursor setHiddenUntilMouseMoves:YES];
 }
 
 - (void)showMessage:(NSString *)m {
+    if (m.length) _lastMessage = m;
     _view.message.stringValue = m ?: @"";
     _view.message.hidden = m == nil;
+}
+
+// the running source's format and layout as it opened them: the saved one where the device still offers it, else the default
+- (std::string)curFormat {
+    NSString *v = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"formats"][ns(_sourceId)];
+    for (auto &c : _sourceInfo.formats) if (v && c.id == v.description.UTF8String) return c.id;
+    return _sourceInfo.defaultFormat;
+}
+- (const std::vector<Choice> *)curLayouts {
+    auto it = _sourceInfo.layouts.find([self curFormat]);
+    return it == _sourceInfo.layouts.end() ? nullptr : &it->second;
+}
+- (std::string)curLayout { // "" uncompressed, as always
+    NSString *v = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"layouts"][ns(_sourceId)];
+    if (const std::vector<Choice> *l = [self curLayouts]) for (auto &c : *l) if (v && c.id == v.description.UTF8String) return c.id;
+    return "";
+}
+
+// what to try when the card sends too few frames
+- (NSString *)starveHint {
+    NSString *who = _sourceInfo.kind == "camera" ? @"the camera" : @"the card";
+    if (_hasCap && _cap.mismatch) // the device runs something else than was set: no use changing ports or layouts
+        return [NSString stringWithFormat:@"macos runs %@ at %s, not the chosen %s: choose the format again, and if it stays send Help → Copy Debug Report",
+                                          who, _cap.active.c_str(), _cap.asked.c_str()];
+    const std::vector<Choice> *l = [self curLayouts];
+    bool packedOffer = l && [self curLayout].empty();
+    NSString *head = [NSString stringWithFormat:@"%@ delivers %d of %.0f frames a second in this format: ", who, _starveGot, _fps];
+    if (packedOffer) return [head stringByAppendingFormat:@"try Source → Format → %@, a lower format, or a usb 3 port without a hub", ns(l->front().name)];
+    return [head stringByAppendingString:@"try a lower format in Source → Format, or a usb 3 port without a hub"];
+}
+
+// what the device itself delivered last second, for the log and the debug report
+- (NSString *)capText {
+    const CaptureCounts &c = _cap;
+    NSMutableString *t = [NSMutableString stringWithFormat:@"%d frames from the device", c.frames];
+    if (c.steps && c.stepMed > 0)
+        [t appendFormat:@", its timestamps %.1f ms apart (most %.1f-%.1f, %.1f-%.1f) = %.2f a second", c.stepMed * 1000, c.stepLo * 1000, c.stepHi * 1000, c.stepMin * 1000, c.stepMax * 1000, c.stepMean > 0 ? 1 / c.stepMean : 0];
+    [t appendFormat:@" | dropped by avfoundation: late %d, out of buffers %d, discontinuity %d, other %d | no image %d", c.late, c.outOfBuffers, c.discontinuity, c.otherDrop, c.noImage];
+    if (!c.active.empty()) [t appendFormat:@" | macos runs %s%@", c.active.c_str(), c.mismatch ? [NSString stringWithFormat:@", asked %s", c.asked.c_str()] : @""];
+    return t;
+}
+
+// a capture card whose frames stay well under its format's rate (under 70 % for 3 s) while the gpu keeps up and
+// nothing is thrown away here: the card itself sends too few. cheap usb cards do this with uncompressed 1080p60.
+// cameras are not watched (they lower their rate in low light), nor a signal that is evenly slower by the device's own
+// clock at a rate sources send (24/25/30 into a 60 format)
+- (void)checkStarved:(const renderer::Stats &)s {
+    const CaptureCounts &c = _cap;
+    int drops = _hasCap ? c.drops() : 0, got = s.in + s.rolled;
+    double gpu = s.gpuN ? s.gpuSum / s.gpuN : 0, budget = _fps > 0 ? 1000 / _fps : 0;
+    bool watch = _source && _hasCap && _sourceInfo.kind != "camera" && _status.state == SourceState::Running && _fps > 0 && s.in > 0;
+    bool low = watch && got < 0.7 * _fps && drops <= 0.05 * _fps && gpu < budget;
+    capcheck::Steps st;
+    st.n = c.steps; st.mean = c.stepMean; st.med = c.stepMed; st.lo = c.stepLo; st.hi = c.stepHi;
+    if (low && !c.mismatch && capcheck::evenSignalRate(st, _fps)) { // macos running another rate than asked is never the signal's
+        if (!_signalRateNoted) logPin("source: %.2f frames a second, evenly by the device's clock, in a %.2f format: the signal's own rate, no hint", 1 / c.stepMean, _fps);
+        _signalRateNoted = true;
+        low = false;
+    }
+    _starveRun = low ? _starveRun + 1 : 0;
+    _starveOk = low ? 0 : _starveOk + 1;
+    if (low) _starveGot = got;
+    if (_starved && _starveOk >= 2) { _starved = false; logLine("source: frames back at the format's rate"); }
+    if (_starved || _starveRun < 3) return;
+    _starved = true;
+    NSString *hint = [self starveHint];
+    if (!_starvePinned) logPin("source: starved, %d of %.0f frames a second (drops %d, gpu %.1f of %.1f ms): %s", got, _fps, drops, gpu, budget, hint.UTF8String); // the first one kept: a card at the edge would push the start facts out
+    else logLine("source: starved, %d of %.0f frames a second (drops %d, gpu %.1f of %.1f ms): %s", got, _fps, drops, gpu, budget, hint.UTF8String);
+    _starvePinned = true;
+    // hidden, off by default: once per source and run, switch to the compressed layout by itself. only while the
+    // user has never chosen a layout for this source, and macos runs what was asked
+    const std::vector<Choice> *l = [self curLayouts];
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if ([d boolForKey:@"autoCompressed"] && l && !c.mismatch && ![d dictionaryForKey:@"layouts"][ns(_sourceId)] && !_autoPacked.count(_sourceId)) {
+        _autoPacked.insert(_sourceId);
+        int was = got;
+        double fps = _fps;
+        std::string name = l->front().name;
+        [self setPerSource:@"layouts" value:ns(l->front().id)]; // restarts the source
+        [self say:[NSString stringWithFormat:@"switched to %@: the card delivered only %d of %.0f frames a second uncompressed. Source → Format → Uncompressed goes back", ns(name).lowercaseString, was, fps]];
+        return;
+    }
+    if (!gSet.overlay) [self say:hint]; // with the overlay up the hint is its own line under the numbers
 }
 
 - (void)applyRefresh {
     bool fs = _goingFull || (_win.styleMask & NSWindowStyleMaskFullScreen) != 0;
     // a source that is (re)starting keeps the matched mode: giving it back and taking it again is two black re-syncs
     if (!_hadFrames || _fps <= 0) { if (!_source) display::apply(_win.screen, 0, 0, fs); return; }
-    display::apply(_win.screen, _fps, gSet.refresh, fs);
+    display::apply(_win.screen, _fps, gSet.rate == 2 && rateRuns() ? 0 : gSet.refresh.load(), fs); // any rate 2 follows the screen's own rate: not switched, while it can run
 }
 
 
@@ -928,27 +1213,48 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
 - (NSString *)genWhy:(const renderer::Stats &)s {
     if (gSet.passthrough) return @"off in plain passthrough";
     if (!framegen::available()) return @"not available on this macos (needs macos 26 and apple silicon)";
+    if (rateRuns() && gSet.rateBlend && blocks::refused()) return [@"blend is the block generator's and it did not start: " stringByAppendingString:@(blocks::note())]; // see tick: no other generator stands in
     const char *st = framegen::status();
     if (!strcmp(st, "starting")) return @"starting";
     if (*st) return [@"failed, " stringByAppendingString:@(st)];
     if (s.gen > 0) return nil;
     if (!s.in) return @"no picture";
     if (!s.real) return @"the picture is still";
-    if (s.repeats * 4 < s.in) return @"source sends no repeated frames";
+    if (gSet.rate == 6 && rateRuns()) return @"output rate: source rate, nothing in between";
+    if (s.repeats * 4 < s.in && !rateRuns()) // any rate fills gaps of any length. a card sending too few: say that instead
+        return _starved ? [NSString stringWithFormat:@"the card sends only %d of %.0f frames a second", _starveGot, _fps]
+             : !gSet.repeatTol && ![self curLayout].empty() ? @"source sends no repeated frames (compressed: a repeat is unpacked a little differently, try tolerant repeats, P)" // mjpeg noise hides repeats
+             : @"source sends no repeated frames";
     if (s.genSkipped) return @"too much changes from frame to frame";
     if (s.genLate) return @"generated frames not ready in time";
     return @"waiting for a pair of frames";
 }
 
+// any rate: slots that fell back to a real frame because this generator only makes the middle of a gap
+- (NSString *)rateNote:(const renderer::Stats &)s {
+    return renderer::rateInfo().on && s.slotMid ? @"apple's and the second generator make only the middle: pick block matching or blend" : nil;
+}
+
 // new frames in the signal's frames, as counted this second
 - (NSString *)cadence:(const renderer::Stats &)s {
     int in = roundRate(s.in), real = roundRate(s.real);
-    NSString *what = !s.in ? @"" : !s.real ? @" (still picture)" : s.repeats * 4 < s.in ? @" (no repeated frames)" : abs(2 * real - in) <= 2 ? @" (every frame comes twice)" : @"";
+    NSString *what = !s.in ? @"" : !s.real ? @" (still picture)" : _starved ? @" (too few frames from the card)" : s.repeats * 4 < s.in ? @" (no repeated frames)" : abs(2 * real - in) <= 2 ? @" (every frame comes twice)" : @"";
     return [NSString stringWithFormat:@"%d in %d%@", real, in, what];
 }
 
 // the order line: what the frames drawn this second went through, in the order it happened. a stage that is switched
 // on and did not run is named with the reason
+// side bars: there are some, the window leaves room around the picture
+static bool sideBarsNow() {
+    int w, h, fw, fh, up;
+    renderer::lastSize(w, h, fw, fh, up);
+    CGSize d = renderer::layer().drawableSize;
+    int ca[4] = {}, cs[4] = {};
+    renderer::cropRects(ca, cs);
+    if (cs[2] > 0) return cs[2] < d.width || cs[3] < d.height;
+    return w && (fw < d.width || fh < d.height);
+}
+static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"very dark" : v > 0.62f ? @"dark" : v > 0.47f ? @"medium" : @"light"; }
 - (NSArray<NSString *> *)orderParts:(const renderer::Stats &)s {
     int w, h, fw, fh, up;
     renderer::lastSize(w, h, fw, fh, up);
@@ -967,9 +1273,13 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     if (gSet.frameGen && !pass) {
         NSString *why = [self genWhy:s];
         int gm = framegen::model();
-        NSString *by = gm == 3 ? [NSString stringWithFormat:@", block matching%@%@", gSet.genShift ? @", shift first" : @"", gSet.genDoubt ? @", one side" : @""]
+        NSString *by = gm == 3 ? [NSString stringWithFormat:@", block matching%@%@%@%@%@%@%@%@", gSet.genShift ? @", shift first" : @"", gSet.genDoubt ? @", one side" : @"", gSet.genSmallFast ? @", small fast things" : @"", gSet.genFallback && renderer::rateInfo().on ? @", soft where bad" : @"", gSet.genSides ? @", one side steady" : @"", gSet.genOutline ? @", character whole" : @"", gSet.genCutGuard && renderer::rateInfo().on ? @", real frame at a cut" : @"", gSet.genSharp ? @", sharp" : @""]
                      : gm ? [NSString stringWithFormat:@", second generator at %d lines", gm == 2 ? 720 : 480] : *framegen::modelNote() ? [NSString stringWithFormat:@", apple's: %s", framegen::modelNote()] : @"";
-        if (!why) [o addObject:[NSString stringWithFormat:@"frame generation (%@%@%@%@%@%@)", renderer::deepNow() ? @"in turns" : gSet.early ? @"early" : @"tick", by,
+        bool rateOn = renderer::rateInfo().on; // set but not running (another picture format, starting): the usual schedule names it
+        if (rateOn) by = gSet.rateBlend ? @", blend" : by;
+        NSString *rt = rateOn ? [@"output rate: " stringByAppendingString:rateText()] : nil;
+        if (rt && why && gSet.rate == 6) [o addObject:[NSString stringWithFormat:@"frame generation (%@)", rt]]; // nothing in between is what was asked
+        else if (!why) [o addObject:[NSString stringWithFormat:@"frame generation (%@%@%@%@%@%@)", rt ?: renderer::deepNow() ? @"in turns" : gSet.early ? @"early" : @"tick", by,
                                renderer::genSmallNow() ? [NSString stringWithFormat:@", at %dp", kGenSmallH[renderer::genSmallNow()]] : @"", gSet.hudLock ? @", hud lock" : @"", gSet.cutTest ? @", cut test" : @"",
                                gSet.hudN ? [NSString stringWithFormat:@", %d hud area%s", gSet.hudN.load(), gSet.hudN == 1 ? "" : "s"] : @""]];
         else if ([why isEqual:@"starting"]) [o addObject:@"frame generation starting"];
@@ -983,7 +1293,8 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     if (did(kDidE0)) [o addObject:net];
     if (en && !pass && !anyNet) {
         const char *st = en > nets::count() ? "no such net" : nets::status(en);
-        [o addObject:!strcmp(st, "starting") ? @"enhance starting" : *st ? [NSString stringWithFormat:@"enhance idle: %@", @(st)] : @"enhance idle"];
+        [o addObject:renderer::rateInfo().on ? @"enhance idle: not after frame generation with an output rate, made and real frames would differ in sharpness"
+                     : !strcmp(st, "starting") ? @"enhance starting" : *st ? [NSString stringWithFormat:@"enhance idle: %@", @(st)] : @"enhance idle"];
     }
     NSString *sharp = [NSString stringWithFormat:@"sharpen %.1f", effSharpen()];
     if (did(kDidSharpFirst)) [o addObject:sharp];
@@ -992,7 +1303,7 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     for (int i = 1; i <= 5; i++) if (s.did[kDidUp + i] > (best ? s.did[kDidUp + best] : 0)) best = i;
     if (best) {
         NSString *t = [NSString stringWithFormat:@"%@ %d×%d%@", kUp[best], fw, fh, gSet.superSample ? @" (supersample)" : @""];
-        if (want == 2 && best != 2) t = [t stringByAppendingFormat:@" (apple super resolution %s)", srYields() ? "waits while frame generation is on" : anyNet && effFrameGen() ? "steps aside for the enhance net while frame generation is on" : *superres::status() ? superres::status() : "was late"];
+        if (want == 2 && best != 2) t = [t stringByAppendingFormat:@" (apple super resolution %s)", srYields() ? (rateRuns() && gSet.srWithGen ? "waits while made frames go up" : "waits while frame generation is on") : anyNet && effFrameGen() ? "steps aside for the enhance net while frame generation is on" : *superres::status() ? superres::status() : "was late"];
         [o addObject:t];
     } else if (!pass && w) {
         bool larger = fw > w && fh > h;
@@ -1006,8 +1317,11 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
     if (gSet.look && !pass) [o addObject:[NSString stringWithFormat:@"look %s", kLookName[gSet.look]]];
     if (gSet.grain > 0 && !pass) [o addObject:[NSString stringWithFormat:@"grain %.2f", gSet.grain.load()]];
     if (did(kDidSharp)) [o addObject:sharp];
+    if (gSet.sideFill && !pass && sideBarsNow()) [o addObject:gSet.sideFill == 1 ? @"side bars grey" : gSet.sideFill == 3 ? @"side bars canvas" : @"side bars glow"];
+    if (renderer::cropOn() && !pass) [o addObject:@"letterbox crop"];
+    { float sr = 1, sc = 0; renderer::stretchNow(sr, sc); if (sr > 1.001f && !pass) [o addObject:@"side stretch"]; }
     if (gSet.freeze) [o addObject:@"frozen"];
-    [o addObject:pass ? @"screen (plain passthrough: all else is off)" : gSet.ptsTime ? @"screen (capture clock)" : @"screen"];
+    [o addObject:pass ? @"screen (plain passthrough: all else is off)" : gSet.ptsTime || renderer::rateClock() ? @"screen (capture clock)" : @"screen"];
     return o;
 }
 
@@ -1140,10 +1454,22 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
         }
         put(@"\n", dim);
     }
-    double delay = s.toGlassN ? s.toGlassSum / s.toGlassN + (s.lagN ? s.lagSum / s.lagN : 0) : 0;
-    put([NSString stringWithFormat:@"%d fps in, %d new   delay %.0f ms   gpu %@", s.in, s.real, delay, gpuT], dim);
-    if (gSet.frameGen) put([NSString stringWithFormat:@"   %@", why ? [@"not generating: " stringByAppendingString:why] : [NSString stringWithFormat:@"generating %d /s", s.gen]], why ? idleC : dim);
+    double vg = renderer::rateInfo().on && s.cNewN ? s.cNewSum / s.cNewN : s.toGlassN ? s.toGlassSum / s.toGlassN : 0; // any rate: glass - content, as the audio
+    double delay = vg > 0 ? vg + (s.lagN ? s.lagSum / s.lagN : 0) : 0;
+    renderer::RateInfo ri = renderer::rateInfo(); // (the cushion: part of the delay, held on purpose to ride out dropped frames)
+    put([NSString stringWithFormat:@"%d fps in, %d new   delay %.0f ms%@   gpu %@", s.in, s.real, delay,
+                                   ri.on && ri.cushion > 0 && delay > 0 ? [NSString stringWithFormat:@" (%.0f held for drops)", ri.cushion * 1000] : @"", gpuT], dim);
+    if (ri.on) { // any rate: what went up this second, by kind. nearer real: the in-between was never asked for
+        int all = s.slotReal + s.slotGen + s.slotLate + s.slotFall + s.slotHold;
+        put([NSString stringWithFormat:@"   out %d /s: %d real %d made %d nearer real %d late %d held%@%@%@", all, s.slotReal, s.slotGen, s.slotFall, s.slotLate, s.slotHold,
+                                       s.drained ? [NSString stringWithFormat:@" %d left out", s.drained] : @"",
+                                       ri.even ? [NSString stringWithFormat:@", late evened: %.1f %% speed, %+.0f ms", ri.speed * 100, ri.level * 1000] : @"",
+                                       ri.screen > 0 ? [NSString stringWithFormat:@", the screen takes %.0f /s", ri.screen] : ri.hz > 0 ? [NSString stringWithFormat:@", screen %.2f hz", ri.hz] : @""], dim);
+        NSString *note = [self rateNote:s] ?: why ? [@"not generating: " stringByAppendingString:why] : nil;
+        if (note) put([@"   " stringByAppendingString:note], idleC);
+    } else if (gSet.frameGen) put([NSString stringWithFormat:@"   %@", why ? [@"not generating: " stringByAppendingString:why] : [NSString stringWithFormat:@"generating %d /s", s.gen]], why ? idleC : dim);
     put(gSet.overlayFull ? @"   [H] hide\n" : @"   [H] all switches\n", keyC);
+    if (_starved) for (NSString *l in [self wrap:[self starveHint] cols:cols]) put([l stringByAppendingString:@"\n"], idleC); // the card sends too few frames
     { // the ten presets in a row, the one in use lit. changed by hand since: amber, with a mark
         NSColor *onP = [NSColor colorWithRed:0.45 green:0.9 blue:0.5 alpha:1];
         NSUInteger col = 0;
@@ -1175,9 +1501,10 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
         int genSt = !gSet.frameGen ? kOff : why ? kIdle : kOn;
         int e0 = ex(0), e1 = ex(1), e2 = ex(2);
         int smallSt = !gSet.genSmall ? kOff : renderer::genSmallNow() ? kOn : kIdle, hudN = gSet.hudN;
+        renderer::RateInfo netRi = renderer::rateInfo(); // rateEnhanceMade's row
         NSString *smallT = !gSet.genSmall ? @"full size" : [NSString stringWithFormat:@"%d×%d%@", kGenSmallW[gSet.genSmall], kGenSmallH[gSet.genSmall], smallSt == kIdle ? @", idle" : @""];
         // the two only act on the early schedule resp. a screen quicker than the source: amber when chosen and idle
-        bool usual = gSet.genDeadline == 1, dlOn = genSt == kOn && (gSet.early || renderer::deepNow());
+        bool usual = gSet.genDeadline == 1, dlOn = genSt == kOn && (gSet.early || renderer::deepNow()), byRate = renderer::rateInfo().on; // the output rate decides: its own budget and holds
         NSString *dlT = [NSString stringWithFormat:@"%@%@", dlOn ? usual ? @"usual" : @"slowest" : usual ? @"by the usual" : @"by the slowest", dlOn ? [NSString stringWithFormat:@", %.1f ms", renderer::genBudgetMs()] : usual ? @", idle" : @""];
         int lateSt = !gSet.genLateNext ? kOff : genSt == kOn && renderer::genLateRoom() ? kOn : kIdle;
         // the value column is narrow: what the net was trained on and half precision get a row of their own
@@ -1189,7 +1516,21 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
         NSString *gm = !gmSet ? @"apple's" : gmSet == 3 ? @"blocks" : [NSString stringWithFormat:@"second, %d", gmSet == 2 ? 720 : 480];
         // the block generator's two switches only act while it makes the frames: amber when on and it does not
         auto blk = [&](bool on) { return !on ? kOff : gmNow == 3 && genSt == kOn ? kOn : kIdle; };
+        // soft where bad and real frame at a cut act only on the output rate's frames
+        bool rateNow = renderer::rateInfo().on;
+        auto blkR = [&](bool on) { return !on ? kOff : rateNow ? blk(on) : kIdle; };
+        auto ooR = [&](bool on) { return on && !rateNow ? @"idle: needs an output rate" : oo(on); };
         int grainSt = gSet.grain <= 0 ? kOff : gSet.passthrough ? kIdle : kOn;
+        int sideSt = !gSet.sideFill ? kOff : gSet.passthrough || !sideBarsNow() ? kIdle : kOn;
+        NSString *sideW = gSet.sideFill == 1 ? @"grey" : gSet.sideFill == 3 ? (gSet.sideStretch > 0 || gSet.rate != 0 || renderer::cropOn() ? @"canvas, glow only" : @"canvas") : @"glow";
+        int cropA[4] = {}, cropS[4] = {};
+        renderer::cropRects(cropA, cropS);
+        int cropSt = !gSet.letterboxCrop ? kOff : gSet.passthrough || gSet.compare || !renderer::cropOn() ? kIdle : kOn;
+        float stR = 1, stC = 0;
+        renderer::stretchNow(stR, stC);
+        int stretchSt = !gSet.sideStretch ? kOff : gSet.passthrough || gSet.compare || stR <= 1.001f ? kIdle : kOn;
+        int stretchV = gSet.sideStretch;
+        NSString *stretchW = stretchV == 1 ? @"a third" : stretchV == 2 ? @"two thirds" : @"to fill";
         std::vector<Row> pic = {
             {kHead, nil, @"colour", nil, nil},
             {kPick, @"R", @"levels", lv, @"levels"}, {kPick, @"C", @"colour", gSet.colour == 1 ? @"srgb" : gSet.colour == 2 ? @"screen's own" : @"bt.709", @"colour"},
@@ -1205,6 +1546,9 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
             {effSharpen() > 0 ? kPick : kOff, @"[ ]", @"sharpening", effSharpen() > 0 ? [NSString stringWithFormat:@"%.1f", effSharpen()] : @"off", @"sharp"},
             {!gSet.look ? kOff : gSet.passthrough ? kIdle : kOn, @".", @"look", gSet.look ? @(kLookName[gSet.look]) : @"off", @"look"},
             {grainSt, @"", @"grain", grainSt == kOff ? @"off" : [NSString stringWithFormat:@"%.2f%@", gSet.grain.load(), grainSt == kIdle ? @", idle" : @""], @"grain"},
+            {sideSt, @"", @"side bars", sideSt == kOff ? @"black" : sideSt == kIdle ? [sideW stringByAppendingString:@", idle"] : [[sideW stringByAppendingString:@", "] stringByAppendingString:sideDimName()], @"sidefill"},
+            {cropSt, @"", @"letterbox crop", cropSt == kOff ? @"off" : cropSt == kOn ? @"filling" : @"no bands", @"letterboxcrop"},
+            {stretchSt, @"", @"side stretch", stretchSt == kOff ? @"off" : stretchSt == kIdle ? [stretchW stringByAppendingString:@", idle"] : stretchW, @"sidestretch"},
             {kGap, nil, nil, nil, nil}, {kHead, nil, @"bypass", nil, nil},
             {sw(gSet.passthrough), @"Z", @"plain passthrough", oo(gSet.passthrough), @"passthrough"}};
         if (half || enSub.length) for (size_t i = 0; i < pic.size(); i++) if ([pic[i].cmd isEqual:@"enhance"]) {
@@ -1216,16 +1560,27 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
             {genSt, @"G", @"frame generation", genSt == kOn ? [NSString stringWithFormat:@"on, %.0f ms each", g.n ? g.sumMs / g.n : 0] : word(genSt), @"framegen"},
             {gmSet && !gmNow ? kIdle : kPick, @"I", @" generator", (gmSet == 1 || gmSet == 2) && !flyhigh::complete() ? (flyhigh::downloading() ? @"downloading" : @"⏎ downloads it") : gmSet && !gmNow ? [gm stringByAppendingString:@", idle"] : gm, @"genmodel"},
             {blk(gSet.genShift), @"", @" shift first", oo(gSet.genShift), @"genshift"}, {blk(gSet.genDoubt), @"", @" one side", oo(gSet.genDoubt), @"gendoubt"},
+            {blk(gSet.genSmallFast), @"", @" small fast things", oo(gSet.genSmallFast), @"gensmallfast"}, {blkR(gSet.genFallback), @"", @" soft where bad", ooR(gSet.genFallback), @"genfallback"},
+            {blk(gSet.genSides), @"", @" one side, steady", oo(gSet.genSides), @"gensides"},
+            {blk(gSet.genOutline), @"", @" character whole", oo(gSet.genOutline), @"genoutline"},
+            {blkR(gSet.genCutGuard), @"", @" real frame at a cut", ooR(gSet.genCutGuard), @"gencutguard"},
+            {blk(gSet.genSharp), @"", @" made frames sharp", oo(gSet.genSharp), @"gensharp"},
             {kPick, @"S", @" still areas", still, @"genstill"},
             {sw(gSet.hudLock), @"L", @" hud lock", oo(gSet.hudLock), @"hudlock"},
             {_view.marking ? kOn : !hudN ? kPick : genSt == kOn ? kOn : kIdle, @"Q", @" hud areas", _view.marking ? @"drag one now" : hudN ? [NSString stringWithFormat:@"%d marked%@", hudN, gSet.hudShow ? @", shown" : @""] : @"mark one", @"hudmark"},
             {sw(gSet.cutTest), @"K", @" better cut test", oo(gSet.cutTest), @"cuttest"},
             {smallSt == kOff ? kPick : smallSt, @"T", @" made at", smallT, @"gensmall"},
-            {usual && !dlOn ? kIdle : kPick, @"", @" deadline", dlT, @"gendeadline"},
-            {lateSt, @"", @" late frames", lateSt == kOn ? @"a refresh later" : lateSt == kIdle ? @"idle" : @"left out", @"genlatenext"},
+            {byRate ? kIdle : usual && !dlOn ? kIdle : kPick, @"", @" deadline", byRate ? @"the output rate decides" : dlT, @"gendeadline"},
+            {byRate ? kIdle : lateSt, @"", @" late frames", byRate ? @"the output rate decides" : lateSt == kOn ? @"a refresh later" : lateSt == kIdle ? @"idle" : @"left out", @"genlatenext"},
             {kGap, nil, nil, nil, nil}, {kHead, nil, @"timing", nil, nil},
-            {kPick, @"E", @"schedule", renderer::deepNow() ? @"in turns" : gSet.early ? @"early" : @"on the tick", @"schedule"},
-            {sw(gSet.ptsTime), @"J", @"capture clock", oo(gSet.ptsTime), @"ptstime"}, {sw(gSet.repeatTol), @"P", @"tolerant repeats", oo(gSet.repeatTol), @"repeattol"},
+            {byRate ? kIdle : kPick, @"E", @"schedule", byRate ? @"the output rate decides" : renderer::deepNow() ? @"in turns" : gSet.early ? @"early" : @"on the tick", @"schedule"},
+            {gSet.rate && !renderer::rateInfo().on ? kIdle : kPick, @"", @"output rate", gSet.rate && !rateRuns() ? [rateText() stringByAppendingString:gSet.passthrough ? @", idle in passthrough" : !gSet.frameGen ? @", needs frame generation" : !framegen::available() ? @", idle: frame generation is not there" : !renderer::rateSourceOk() ? @", idle: the source's picture format is not one it takes" : @", idle"] : gSet.rate && !renderer::rateInfo().on ? [rateText() stringByAppendingString:@", starting"] : rateText(), @"rate"},
+            {rateRuns() ? sw(gSet.rateBlend) : gSet.rateBlend ? kIdle : kOff, @"", @" blend in-betweens", oo(gSet.rateBlend), @"rateblend"},
+            {rateRuns() ? kPick : kIdle, @"", @" real frames", snapName(gSet.rateSnap), @"ratesnap"},
+            {rateRuns() ? kPick : kIdle, @"", @" ride out drops", cushionName(), @"ratecushion"},
+            {!rateRuns() || !gSet.rateCushion ? (gSet.rateEvenLate ? kIdle : kOff) : sw(gSet.rateEvenLate), @"", @" even out late frames", gSet.rateEvenLate && !gSet.rateCushion ? @"idle: needs ride out drops" : oo(gSet.rateEvenLate), @"rateevenlate"},
+            {!gSet.rateEnhanceMade ? kOff : rateRuns() && netRi.net == 1 ? kOn : kIdle, @"", @" enhance made frames", netMadeName(netRi), @"rateenhancemade"},
+            {renderer::rateClock() ? kIdle : sw(gSet.ptsTime), @"J", @"capture clock", renderer::rateClock() ? @"on: the output rate uses it" : oo(gSet.ptsTime), @"ptstime"}, {sw(gSet.repeatTol), @"P", @"tolerant repeats", oo(gSet.repeatTol), @"repeattol"},
             {sw(gSet.repeatRoll), @"", @"skip after backlog", oo(gSet.repeatRoll), @"repeatroll"},
             {sw(gSet.vsync), @"V", @"vsync", oo(gSet.vsync), @"vsync"},
             {sw(gSet.lateDrawable), @"", @"late screen buffer", oo(gSet.lateDrawable), @"latedrawable"},
@@ -1246,6 +1601,16 @@ static NSString *oo(bool b) { return b ? @"on" : @"off"; }
             {kInfo, nil, @"display", @(display::status().c_str()).lowercaseString, nil},
             {kInfo, nil, @"audio", aud, nil},
             {kGap, nil, nil, nil, nil}, {kHead, nil, @"gpu ms per stage", nil, nil}};
+        { // system capture: only when there is something to see. after "frames"
+            std::vector<Row> cap;
+            const CaptureCounts &c = _cap;
+            if (_hasCap && c.mismatch) cap.push_back({kInfo, nil, @"macos runs", [NSString stringWithFormat:@"%s, asked %s", c.active.c_str(), c.asked.c_str()], nil});
+            if (_hasCap && (c.drops() || c.noImage))
+                cap.push_back({kInfo, nil, @"dropped", [NSString stringWithFormat:@"by avfoundation: %d late, %d out of buffers, %d discontinuity, %d other, %d without picture", c.late, c.outOfBuffers, c.discontinuity, c.otherDrop, c.noImage], nil});
+            size_t at = 1;
+            while (at < inf.size() && !(inf[at].st == kInfo && [inf[at].name isEqual:@"frames"])) at++;
+            if (at < inf.size()) inf.insert(inf.begin() + at + 1, cap.begin(), cap.end());
+        }
         for (NSString *st in stages) inf.push_back({kInfo, nil, [st componentsSeparatedByString:@" "].firstObject, [st substringFromIndex:MIN(st.length, [[st componentsSeparatedByString:@" "].firstObject length] + 1)], nil});
         if (!stages.count) inf.push_back({kInfo, nil, @"–", @"", nil});
         inf.insert(inf.end(), {{kGap, nil, nil, nil, nil}, {kHead, nil, @"window and presets", nil, nil},
@@ -1398,6 +1763,9 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         return;
     }
     if ([c isEqual:@"huddrag"]) { [self testDrag:arg]; return; }
+    // help menu: pages in the browser, nothing here changes
+    if ([c isEqual:@"helpfixes"]) { [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://github.com/k33bs/meyra#help"]]; return; }
+    if ([c isEqual:@"discord"]) { [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://discord.gg/UpgbaZEUj4"]]; return; }
     NSDictionary *before = presetNow(); // the preset's number stays up until one of its own switches is changed
     if (![c isEqual:@"overlay"]) _lastCmd = [c hasPrefix:@"trim"] ? @"trim" : c;
     if ([c isEqual:@"fullscreen"]) [_win toggleFullScreen:nil];
@@ -1409,7 +1777,7 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         settingsSave("overlay"); settingsSave("overlayFull");
         [_view showAreas:0]; // the hud areas' outlines go with the overlay
     }
-    else if ([c isEqual:@"framegen"]) { gSet.frameGen = !gSet.frameGen; settingsSave("frameGen"); }
+    else if ([c isEqual:@"framegen"]) { gSet.frameGen = !gSet.frameGen; settingsSave("frameGen"); [self applyRefresh]; } // every screen refresh runs or not
     else if ([c isEqual:@"schedule"]) { gSet.early = arg ? arg.intValue != 0 : !gSet.early; settingsSave("early"); }
     else if ([c isEqual:@"gensmall"]) { // the key steps down in size: full, 864, 768, 720 lines, full
         gSet.genSmall = arg ? MAX(0, MIN(3, arg.intValue)) : (gSet.genSmall + 3) % 4;
@@ -1460,11 +1828,29 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         else answer([a runModal]);
         return;
     }
+    else if ([c isEqual:@"rate"]) { // rate:MODE or rate:MODE:NUM
+        NSArray<NSString *> *v = [arg componentsSeparatedByString:@":"];
+        gSet.rate = clampRate(v.firstObject.intValue);
+        gSet.rateNum = clampRateNum(gSet.rate, v.count > 1 ? v[1].doubleValue : 0); // common.h: as the load does
+        settingsSave("rate"); settingsSave("rateNum");
+        [self applyRefresh]; // 2 leaves the screen's rate alone, the others match it again
+    }
+    else if ([c isEqual:@"rateblend"]) { gSet.rateBlend = !gSet.rateBlend; settingsSave("rateBlend"); }
+    else if ([c isEqual:@"ratesnap"]) { gSet.rateSnap = clampRateSnap(arg.floatValue); settingsSave("rateSnap"); }
+    else if ([c isEqual:@"ratecushion"]) { gSet.rateCushion = MIN(3, MAX(0, arg.intValue)); settingsSave("rateCushion"); }
+    else if ([c isEqual:@"rateevenlate"]) { gSet.rateEvenLate = !gSet.rateEvenLate; settingsSave("rateEvenLate"); }
+    else if ([c isEqual:@"rateenhancemade"]) { gSet.rateEnhanceMade = !gSet.rateEnhanceMade; settingsSave("rateEnhanceMade"); }
     else if ([c isEqual:@"genshift"]) { gSet.genShift = !gSet.genShift; settingsSave("genShift"); }
     else if ([c isEqual:@"gendoubt"]) { gSet.genDoubt = !gSet.genDoubt; settingsSave("genDoubt"); }
+    else if ([c isEqual:@"gensmallfast"]) { gSet.genSmallFast = !gSet.genSmallFast; settingsSave("genSmallFast"); }
+    else if ([c isEqual:@"genfallback"]) { gSet.genFallback = !gSet.genFallback; settingsSave("genFallback"); }
+    else if ([c isEqual:@"gensides"]) { gSet.genSides = !gSet.genSides; settingsSave("genSides"); }
+    else if ([c isEqual:@"genoutline"]) { gSet.genOutline = !gSet.genOutline; settingsSave("genOutline"); }
+    else if ([c isEqual:@"gencutguard"]) { gSet.genCutGuard = !gSet.genCutGuard; settingsSave("genCutGuard"); }
+    else if ([c isEqual:@"gensharp"]) { gSet.genSharp = !gSet.genSharp; settingsSave("genSharp"); }
     else if ([c isEqual:@"genstill"]) { gSet.genStill = ((arg.intValue % 5) + 5) % 5; settingsSave("genStill"); }
     else if ([c isEqual:@"genstill+"]) { gSet.genStill = (gSet.genStill + 1) % 4; settingsSave("genStill"); }
-    else if ([c isEqual:@"passthrough"]) { gSet.passthrough = !gSet.passthrough; settingsSave("passthrough"); }
+    else if ([c isEqual:@"passthrough"]) { gSet.passthrough = !gSet.passthrough; settingsSave("passthrough"); [self applyRefresh]; }
     else if ([c isEqual:@"levels"]) { gSet.levels = ((arg.intValue % 3) + 3) % 3; settingsSave("levels"); }
     else if ([c isEqual:@"levels+"]) { gSet.levels = (gSet.levels + 1) % 3; settingsSave("levels"); }
     else if ([c isEqual:@"colour"] || [c isEqual:@"colour+"]) {
@@ -1480,6 +1866,12 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         renderer::lastSize(w, h, fw, fh, up);
         int cm = gSet.passthrough ? 0 : gSet.compare.load();
         if (!_view.marking && (cm == 4 || cm == 5 || cm == 7)) { [self say:@"hud areas — not while the compare view shows the picture twice or in strips: the drag would land elsewhere. / changes the view"]; return; }
+        int ca[4] = {}, cs[4] = {};
+        renderer::cropRects(ca, cs);
+        if (!_view.marking && renderer::cropOn()) { [self say:@"hud areas — not while the letterbox crop zooms the picture: the bands are off screen. turn it off in side bars first"]; return; }
+        float sr = 1, sc = 0;
+        renderer::stretchNow(sr, sc);
+        if (!_view.marking && sr > 1.001f) { [self say:@"hud areas — not while the side stretch bends the picture: the drag would land elsewhere. turn it off in side bars first"]; return; }
         _view.marking = !_view.marking && gSet.hudN < kHudMax && w > 0;
     }
     else if ([c isEqual:@"hudclear"]) { gSet.hudN = 0; settingsSave("hudRects"); _view.marking = NO; logLine("hud areas: none"); }
@@ -1490,7 +1882,13 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     else if ([c isEqual:@"repeatroll"]) { gSet.repeatRoll = !gSet.repeatRoll; settingsSave("repeatRoll"); }
     else if ([c isEqual:@"stabilise"]) { gSet.stabilise = !gSet.stabilise; settingsSave("stabilise"); }
     else if ([c isEqual:@"grain"]) { gSet.grain = fminf(1, fmaxf(0, arg.floatValue)); settingsSave("grain"); }
-    else if ([c isEqual:@"enhancereal"]) { gSet.enhanceReal = !gSet.enhanceReal; settingsSave("enhanceReal"); }
+    else if ([c isEqual:@"sidefill"]) { gSet.sideFill = arg ? arg.intValue : gSet.sideFill ? 0 : 2; clampSide(); settingsSave("sideFill"); }
+    else if ([c isEqual:@"sidedim"]) { if (arg.length) { gSet.sideDim = arg.floatValue; clampSide(); settingsSave("sideDim"); } }
+    else if ([c isEqual:@"sideblur"]) { if (arg.length) { gSet.sideBlur = arg.floatValue; clampSide(); settingsSave("sideBlur"); } }
+    else if ([c isEqual:@"sidesmooth"]) { if (arg.length) { gSet.sideSmooth = arg.floatValue; clampSide(); settingsSave("sideSmooth"); } }
+    else if ([c isEqual:@"letterboxcrop"]) { gSet.letterboxCrop = !gSet.letterboxCrop; settingsSave("letterboxCrop"); }
+    else if ([c isEqual:@"sidestretch"]) { gSet.sideStretch = arg ? arg.intValue : gSet.sideStretch ? 0 : 2; clampSide(); settingsSave("sideStretch"); }
+    else if ([c isEqual:@"enhancereal"]) { gSet.enhanceReal =!gSet.enhanceReal; settingsSave("enhanceReal"); }
     else if ([c isEqual:@"enhancehold"]) { gSet.enhanceHold = !gSet.enhanceHold; settingsSave("enhanceHold"); }
     else if ([c isEqual:@"look"] || [c isEqual:@"look+"]) { gSet.look = ((([c isEqual:@"look"] ? arg.intValue : gSet.look + 1) % 4) + 4) % 4; settingsSave("look"); }
     else if ([c isEqual:@"supersample"]) { gSet.superSample = !gSet.superSample; settingsSave("superSample"); }
@@ -1514,6 +1912,13 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     else if ([c isEqual:@"refresh"]) { gSet.refresh = ((arg.intValue % 3) + 3) % 3; settingsSave("refresh"); [self applyRefresh]; }
     else if ([c isEqual:@"source"]) [self startSource:arg.UTF8String persist:YES];
     else if ([c isEqual:@"format"]) [self setPerSource:@"formats" value:arg];
+    else if ([c isEqual:@"layout"]) [self setPerSource:@"layouts" value:arg ?: @""];
+    else if ([c isEqual:@"debugreport"]) {
+        NSPasteboard *pb = NSPasteboard.generalPasteboard;
+        [pb clearContents];
+        [pb setString:ns([self debugReport]) forType:NSPasteboardTypeString];
+        [self say:@"debug report copied: paste it into your message"];
+    }
     else if ([c isEqual:@"ain"]) [self setPerSource:@"audioInputs" value:arg];
     else if ([c isEqual:@"restart"]) { // a deliberate restart also forgets the detected levels
         std::string id = _sourceId;
@@ -1551,10 +1956,7 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     else if ([c isEqual:@"latedrawable"]) { gSet.lateDrawable = !gSet.lateDrawable; settingsSave("lateDrawable"); }
     else if ([c isEqual:@"drawables"]) { gSet.drawables = gSet.drawables == 2 ? 3 : 2; settingsSave("drawables"); renderer::applyDrawables(); }
     else if ([c isEqual:@"gamemode"]) {
-        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-        bool on = ![d boolForKey:@"gameMode"];
-        if (setGameMode(on)) { [d setBool:on forKey:@"gameMode"]; gGameModeChanged = !gGameModeChanged; }
-        else NSBeep();
+        if (!setGameMode(!gameModeOn())) NSBeep();
     }
     else if ([c isEqual:@"updatesAtLaunch"]) {
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -1613,7 +2015,8 @@ static int recSecs() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
 static NSArray<NSString *> *presetKeys() {
     return @[@"passthrough", @"deband", @"upscale", @"sharpen", @"enhance", @"enhanceAt", @"enhanceReal", @"enhanceHold", @"superSample", @"denoise", @"frameGen", @"early",
              @"genSmall", @"genStill", @"genModel", @"hudLock", @"cutTest", @"repeatTol", @"ptsTime", @"vsync", @"netHalf", @"genDeadline", @"genLateNext", @"look", @"enhanceDown", @"srWithGen", @"srPad",
-             @"genShift", @"genDoubt", @"repeatRoll", @"grain", @"stabilise"];
+             @"genShift", @"genDoubt", @"repeatRoll", @"grain", @"stabilise", @"rate", @"rateNum", @"rateBlend",
+             @"genSmallFast", @"genFallback", @"genSides", @"genOutline", @"genCutGuard", @"genSharp", @"rateSnap", @"rateCushion", @"rateEvenLate", @"rateEnhanceMade"];
 }
 // what those are set to right now, as the running state has them (a command line's -key value included)
 static NSDictionary *presetNow() {
@@ -1625,7 +2028,10 @@ static NSDictionary *presetNow() {
              @"netHalf": @((bool)gSet.netHalf), @"genDeadline": @(gSet.genDeadline.load()), @"genLateNext": @((bool)gSet.genLateNext), @"look": @(gSet.look.load()),
              @"enhanceDown": @(gSet.enhanceDown.load()), @"srWithGen": @((bool)gSet.srWithGen), @"srPad": @((bool)gSet.srPad),
              @"genShift": @((bool)gSet.genShift), @"genDoubt": @((bool)gSet.genDoubt), @"repeatRoll": @((bool)gSet.repeatRoll), @"grain": @(round(gSet.grain * 100) / 100),
-             @"stabilise": @((bool)gSet.stabilise)};
+             @"stabilise": @((bool)gSet.stabilise), @"rate": @(gSet.rate.load()), @"rateNum": @(round(gSet.rateNum * 100) / 100), @"rateBlend": @((bool)gSet.rateBlend),
+             @"genSmallFast": @((bool)gSet.genSmallFast), @"genFallback": @((bool)gSet.genFallback), @"genSides": @((bool)gSet.genSides), @"genOutline": @((bool)gSet.genOutline),
+             @"genCutGuard": @((bool)gSet.genCutGuard), @"genSharp": @((bool)gSet.genSharp), @"rateSnap": @(round(gSet.rateSnap * 1000) / 1000), @"rateCushion": @(gSet.rateCushion.load()),
+             @"rateEvenLate": @((bool)gSet.rateEvenLate), @"rateEnhanceMade": @((bool)gSet.rateEnhanceMade)};
 }
 static void logPreset(const char *what, int n) {
     NSDictionary *v = presetNow();
@@ -1653,7 +2059,9 @@ static void logPreset(const char *what, int n) {
     NSMutableDictionary *v = [@{@"passthrough": @NO, @"deband": @YES, @"upscale": @1, @"sharpen": @0.6, @"enhance": @0, @"enhanceAt": @0, @"enhanceReal": @NO, @"enhanceHold": @NO,
                                @"superSample": @NO, @"denoise": @NO, @"frameGen": @YES, @"early": @NO, @"genSmall": @0, @"genStill": @0, @"genModel": @0, @"hudLock": @NO,
                                @"cutTest": @NO, @"repeatTol": @NO, @"ptsTime": @NO, @"vsync": @YES, @"netHalf": @NO, @"genDeadline": @0, @"genLateNext": @NO, @"look": @0, @"enhanceDown": @0, @"srWithGen": @YES, @"srPad": @YES,
-                               @"genShift": @NO, @"genDoubt": @NO, @"repeatRoll": @NO, @"grain": @0, @"stabilise": @NO} mutableCopy];
+                               @"genShift": @NO, @"genDoubt": @NO, @"repeatRoll": @NO, @"grain": @0, @"stabilise": @NO, @"rate": @0, @"rateNum": @0, @"rateBlend": @NO,
+                               @"genSmallFast": @NO, @"genFallback": @NO, @"genSides": @NO, @"genOutline": @NO, @"genCutGuard": @NO, @"genSharp": @NO,
+                               @"rateSnap": @0.1, @"rateCushion": @0, @"rateEvenLate": @NO, @"rateEnhanceMade": @NO} mutableCopy]; // built-ins: no output rate. your own keep theirs (saved before these keys: the defaults, what they were then)
     [v addEntriesFromDictionary:own ?: p.set];
     NSString *netNote = @"";
     if (NSString *name = v[@"enhanceName"]) { // your own: the net by its name
@@ -1683,6 +2091,7 @@ static void logPreset(const char *what, int n) {
         if (!framegen::model()) netNote = [netNote stringByAppendingFormat:@" (second generator: %s, apple's stays in use)", !flyhigh::complete() ? "not installed, return downloads it, 1.6 mb" : *framegen::modelNote() ? framegen::modelNote() : "not in use"];
     }
     _preset = n; _presetWas = 0; _genWant = 0;
+    [self applyRefresh]; // frame generation, passthrough or the rate may have changed
     logPreset("applied", n);
     // a command line's -key value outranks what a preset stores: say so, a test run would look like a broken preset
     NSMutableArray<NSString *> *kept = [NSMutableArray new];
@@ -1700,7 +2109,7 @@ static void logPreset(const char *what, int n) {
     static NSString *const kLevels[] = {@"automatic", @"video range", @"full range"}, *const kColour[] = {@"bt.709", @"srgb", @"the screen's own"};
     static NSString *const kUp[] = {@"plain", @"metalfx", @"apple super resolution", @"edge-aware (fsr 1)", @"edge-aware (sgsr 1)", @"hashed filters"};
     static NSString *const kRefresh[] = {@"off", @"automatic", @"source rate"}, *const kAt[] = {@"after dither removal", @"before dither removal", @"after the upscaler"};
-    if ([@[@"source", @"format", @"ain", @"replay", @"picker", @"keys", @"updates", @"revertUpdate"] containsObject:c]) return;
+    if ([@[@"source", @"format", @"layout", @"ain", @"replay", @"picker", @"keys", @"updates", @"revertUpdate", @"debugreport"] containsObject:c]) return;
     NSString *b = [c stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"+-"]], *state = nil, *key = c;
     auto valued = [&](int v, NSString *name) { key = [NSString stringWithFormat:@"%@:%d", b, v]; state = name; };
     if ([b isEqual:@"genstill"]) valued(gSet.genStill, kStill[gSet.genStill % 5]);
@@ -1709,6 +2118,14 @@ static void logPreset(const char *what, int n) {
         const char *note = framegen::modelNote();
         valued(gSet.genModel, *note ? [NSString stringWithFormat:@"%@ (%s%s, apple's stays in use)", kGen[gSet.genModel % 4], flyhigh::complete() ? note : "not installed", flyhigh::complete() ? "" : ", return downloads it, 1.6 mb"] : kGen[gSet.genModel % 4]);
     }
+    else if ([b isEqual:@"rate"]) { // the tip of the one picked, by its menu key
+        int r = gSet.rate;
+        double n = r == 3 ? (gSet.rateNum > 0 ? gSet.rateNum.load() : 60) : fmin(8, fmax(2, round(gSet.rateNum)));
+        key = r >= 3 && r <= 5 ? [NSString stringWithFormat:@"rate:%d:%.0f", r, n] : [NSString stringWithFormat:@"rate:%d", r];
+        state = rateText();
+    }
+    else if ([b isEqual:@"ratesnap"]) { key = [NSString stringWithFormat:@"ratesnap:%g", snapKey(gSet.rateSnap)]; state = snapName(gSet.rateSnap); }
+    else if ([b isEqual:@"ratecushion"]) { key = [NSString stringWithFormat:@"ratecushion:%d", gSet.rateCushion.load()]; state = cushionName(); }
     else if ([b isEqual:@"gensmall"]) { int n = gSet.genSmall; valued(n, n ? [NSString stringWithFormat:@"%d×%d", kGenSmallW[n], kGenSmallH[n]] : @"full size"); }
     else if ([b isEqual:@"gendeadline"]) valued(gSet.genDeadline, gSet.genDeadline ? @"by the usual" : @"by the slowest");
     else if ([b isEqual:@"levels"]) valued(gSet.levels, kLevels[gSet.levels % 3]);
@@ -1719,6 +2136,17 @@ static void logPreset(const char *what, int n) {
     else if ([b isEqual:@"enhancedown"]) valued(gSet.enhanceDown, gSet.enhanceDown ? @"lanczos" : @"area filter");
     else if ([b isEqual:@"schedule"]) valued(gSet.early, gSet.early ? @"early" : @"on the tick");
     else if ([b isEqual:@"enhance"]) { int n = gSet.enhance; valued(n, n && n <= nets::count() ? @(nets::name(n)).lowercaseString : @"off"); }
+    else if ([b isEqual:@"sidefill"]) valued(gSet.sideFill, gSet.sideFill == 3 ? (gSet.rate != 0 ? @"glow with past picture, idle: output rate" : gSet.sideStretch > 0 ? @"glow with past picture, idle: stretched" : renderer::cropOn() ? @"glow with past picture, idle: cropped" : @"glow with past picture") : gSet.sideFill == 2 ? @"glow" : gSet.sideFill == 1 ? @"grey" : @"black");
+    else if ([b isEqual:@"sidedim"]) state = sideDimName();
+    else if ([b isEqual:@"sideblur"]) { float v = gSet.sideBlur; state = v < 0.75f ? @"less soft" : v < 1.3f ? @"soft" : @"very soft"; }
+    else if ([b isEqual:@"sidesmooth"]) state = [NSString stringWithFormat:@"%.0f ms", gSet.sideSmooth.load()];
+    else if ([b isEqual:@"letterboxcrop"]) state = !gSet.letterboxCrop ? @"off" : renderer::cropOn() ? @"on, filling the window" : @"on, no bands now";
+    else if ([b isEqual:@"sidestretch"]) {
+        float sr = 1, sc = 0;
+        renderer::stretchNow(sr, sc);
+        int v = gSet.sideStretch;
+        state = !v ? @"off" : [NSString stringWithFormat:@"%@%@", v == 1 ? @"a third" : v == 2 ? @"two thirds" : @"all of the bars", sr <= 1.001f ? @", idle" : @""];
+    }
     else if ([b isEqual:@"grain"]) { float g = gSet.grain; state = g <= 0 ? @"off" : g < 0.375f ? @"light" : g < 0.625f ? @"medium" : g < 0.875f ? @"strong" : @"full"; }
     else if ([b isEqual:@"sharp"]) state = gSet.sharpen > 0 ? [NSString stringWithFormat:@"%.1f", gSet.sharpen.load()] : @"off";
     else if ([b hasPrefix:@"trim"]) state = fabs(gSet.audioTrim) > 0.0005 ? [NSString stringWithFormat:@"%+.0f ms", gSet.audioTrim * 1000] : @"no nudge";
@@ -1740,7 +2168,10 @@ static void logPreset(const char *what, int n) {
     mi.representedObject = key;
     bool can = [self validateMenuItem:mi];
     if (!state && ![b isEqual:@"fullscreen"]) state = mi.state == NSControlStateValueOn ? @"on" : @"off";
-    if (!can && ![b isEqual:@"trim0"] && ![b isEqual:@"hudclear"]) state = [state stringByAppendingString:gSet.passthrough ? @" (does nothing while plain passthrough is on)" : @" (cannot run here)"];
+    if (!can && ![b isEqual:@"trim0"] && ![b isEqual:@"hudclear"])
+        state = [state stringByAppendingString:gSet.passthrough ? @" (does nothing while plain passthrough is on)" : [b isEqual:@"refresh"] ? @" (every screen refresh keeps the screen's rate)"
+                                             : ([b isEqual:@"rate"] || [b isEqual:@"rateblend"]) && !gSet.frameGen ? @" (needs frame generation on)" : @" (cannot run here)"];
+    else if (renderer::rateInfo().on && ([b isEqual:@"schedule"] || [b isEqual:@"gendeadline"] || [b isEqual:@"genlatenext"] || ([b isEqual:@"ptstime"] && renderer::rateClock()))) state = [state ?: @"" stringByAppendingString:@" (the output rate decides)"];
     const Tip *t = tipFor(key), *named = tipRow(b) ?: tipRow(c) ?: t;
     if (!t || !named || !named->name) return;
     _hint = state ? [NSString stringWithFormat:@"%s: %@ — %s", named->name, state, t->what] : [NSString stringWithFormat:@"%s — %s", named->name, t->what];
@@ -2001,6 +2432,27 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     [gr addItem:item(@"Medium", @"grain:0.5", nil)];
     [gr addItem:item(@"Strong", @"grain:0.75", nil)];
     [gr addItem:item(@"Full", @"grain:1", nil)];
+    NSMenu *sb = submenu(pic, @"Side Bars");
+    [sb addItem:item(@"Off", @"sidefill:0", nil)];
+    [sb addItem:item(@"Grey", @"sidefill:1", nil)];
+    [sb addItem:item(@"Glow", @"sidefill:2", nil)];
+    [sb addItem:item(@"Glow with Past Picture", @"sidefill:3", nil)];
+    [sb addItem:NSMenuItem.separatorItem];
+    [sb addItem:item(@"Very Dark", @"sidedim:0.85", nil)];
+    [sb addItem:item(@"Dark", @"sidedim:0.7", nil)];
+    [sb addItem:item(@"Medium", @"sidedim:0.55", nil)];
+    [sb addItem:item(@"Light", @"sidedim:0.4", nil)];
+    [sb addItem:NSMenuItem.separatorItem];
+    [sb addItem:item(@"Less Soft", @"sideblur:0.5", nil)];
+    [sb addItem:item(@"Soft", @"sideblur:1", nil)];
+    [sb addItem:item(@"Very Soft", @"sideblur:1.6", nil)];
+    [sb addItem:NSMenuItem.separatorItem];
+    [sb addItem:item(@"Fill the Window with Letterboxed Pictures", @"letterboxcrop", nil)];
+    [sb addItem:NSMenuItem.separatorItem];
+    [sb addItem:item(@"No Stretch", @"sidestretch:0", nil)];
+    [sb addItem:item(@"Stretch a Third", @"sidestretch:1", nil)];
+    [sb addItem:item(@"Stretch Two Thirds", @"sidestretch:2", nil)];
+    [sb addItem:item(@"Stretch to Fill", @"sidestretch:3", nil)];
     [pic addItem:item(@"Dither Removal", @"deband", @"b", NSEventModifierFlagCommand | NSEventModifierFlagOption)];
     NSMenu *up = submenu(pic, @"Upscaling");
     [up addItem:item(@"Plain", @"upscale:0", nil)];
@@ -2011,7 +2463,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     [up addItem:item(@"Apple Super Resolution", @"upscale:2", nil)];
     [up addItem:NSMenuItem.separatorItem];
     [up addItem:item(@"Super Resolution: Pad Edges", @"srpad", nil)];
-    [up addItem:item(@"Super Resolution: Run With Frame Generation (9 ms more delay)", @"srgen", nil)];
+    [up addItem:item(@"Super Resolution: Run with Frame Generation (9 ms more delay)", @"srgen", nil)];
     NSMenu *en = submenu(pic, @"Enhance");
     [en addItem:item(@"Off", @"enhance:0", nil)];
     for (int i = 1; i <= nets::count(); i++) [en addItem:item(ns(nets::name(i)), [NSString stringWithFormat:@"enhance:%d", i], nil)];
@@ -2040,6 +2492,30 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     NSMenu *sc = submenu(mo, @"Frame Schedule");
     [sc addItem:item(@"Early (less delay)", @"schedule:1", nil)];
     [sc addItem:item(@"On the Tick", @"schedule:0", nil)];
+    NSMenu *orr = submenu(mo, @"Output Rate");
+    [orr addItem:item(@"Off", @"rate:0", nil)];
+    [orr addItem:item(@"Every Signal Tick", @"rate:1", nil)];
+    [orr addItem:item(@"Every Screen Refresh", @"rate:2", nil)];
+    [orr addItem:NSMenuItem.separatorItem];
+    for (NSString *f in @[@"30", @"50", @"60"]) [orr addItem:item([NSString stringWithFormat:@"Fixed %@ fps", f], [@"rate:3:" stringByAppendingString:f], nil)];
+    [orr addItem:NSMenuItem.separatorItem];
+    for (NSString *m in @[@"2", @"3", @"4"]) [orr addItem:item([@"Times " stringByAppendingString:m], [@"rate:4:" stringByAppendingString:m], nil)];
+    [orr addItem:item(@"Times 2 Following the Gap", @"rate:5:2", nil)];
+    [orr addItem:item(@"Source Rate (real frames only)", @"rate:6", nil)]; // not match display refresh's source rate
+    [orr addItem:NSMenuItem.separatorItem];
+    [orr addItem:item(@"Blend In-Betweens Instead of Generating", @"rateblend", nil)];
+    NSMenu *real = submenu(orr, @"Real Frames");
+    [real addItem:item(@"Fewest (evenest motion)", @"ratesnap:0.05", nil)];
+    [real addItem:item(@"Some", @"ratesnap:0.1", nil)];
+    [real addItem:item(@"More", @"ratesnap:0.15", nil)];
+    [real addItem:item(@"All", @"ratesnap:0.45", nil)];
+    NSMenu *ride = submenu(orr, @"Ride Out Dropped Frames");
+    [ride addItem:item(@"Off", @"ratecushion:0", nil)];
+    [ride addItem:item(@"One Tick (+17 ms)", @"ratecushion:1", nil)];
+    [ride addItem:item(@"Two Ticks (+33 ms)", @"ratecushion:2", nil)];
+    [ride addItem:item(@"Three Ticks (+50 ms)", @"ratecushion:3", nil)];
+    [orr addItem:item(@"Even Out the Game's Late Frames", @"rateevenlate", nil)];
+    [orr addItem:item(@"Enhance the Made Frames Too", @"rateenhancemade", nil)];
     NSMenu *gm = submenu(mo, @"Frame Generator");
     [gm addItem:item(@"Apple's Interpolator", @"genmodel:0", nil)];
     [gm addItem:item(@"Second Generator, 480 Lines", @"genmodel:1", nil)];
@@ -2048,6 +2524,12 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     [gm addItem:NSMenuItem.separatorItem];
     [gm addItem:item(@"Find the Whole Picture's Shift First", @"genshift", nil)];
     [gm addItem:item(@"Take One Side Where the Frames Disagree", @"gendoubt", nil)];
+    [gm addItem:item(@"Find Small Fast Things", @"gensmallfast", nil)];
+    [gm addItem:item(@"Go Soft Where the Match Is Bad", @"genfallback", nil)];
+    [gm addItem:item(@"Take One Side, Steady", @"gensides", nil)];
+    [gm addItem:item(@"Keep the Followed Character Whole", @"genoutline", nil)];
+    [gm addItem:item(@"Show a Real Frame Across a Cut", @"gencutguard", nil)];
+    [gm addItem:item(@"Made Frames as Sharp as Real Ones", @"gensharp", nil)];
     NSMenu *ga = submenu(mo, @"Generate At");
     [ga addItem:item(@"Full Size", @"gensmall:0", nil)];
     [ga addItem:item(@"1536×864 (faster, a little softer)", @"gensmall:3", nil)];
@@ -2109,19 +2591,19 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     [pm addItem:pr];
     NSMenu *rc = submenu(bar, @"Recording");
     [rc addItem:item(@"Start Recording (Tab)", @"record", nil)];
-    [rc addItem:item(@"Keep The Last 30 Seconds (Shift + Tab)", @"reckeep", nil)];
+    [rc addItem:item(@"Keep the Last 30 Seconds (Shift + Tab)", @"reckeep", nil)];
     [rc addItem:NSMenuItem.separatorItem];
     NSMenu *rs = [[NSMenu alloc] initWithTitle:@"Size"], *rb = [[NSMenu alloc] initWithTitle:@"Bitrate"];
     [rs addItem:item(@"As Shown", @"recsize:0", nil)];
     for (NSString *h in @[@"2160", @"1440", @"1080", @"720"]) [rs addItem:item([NSString stringWithFormat:@"At Most %@p", h], [@"recsize:" stringByAppendingString:h], nil)];
-    [rb addItem:item(@"Automatic: By Size (17 Mbit/s At 720p, 37 At 1080p, 66 At 1440p)", @"recrate:0", nil)];
+    [rb addItem:item(@"Automatic: by Size (17 Mbit/s at 720p, 37 at 1080p, 66 at 1440p)", @"recrate:0", nil)];
     // what they look like at 1080p: a bigger picture wants more for the same
     NSArray *rates = @[@[@"10", @"Small File, Soft In Fast Motion"], @[@"20", @"Good, Fine For Sharing"], @[@"40", @"Very Good, For Uploads"],
                        @[@"60", @"Excellent"], @[@"100", @"Close To Lossless, Large File"]];
     for (NSArray *m in rates) [rb addItem:item([NSString stringWithFormat:@"%@ Mbit/s: %@ (%d MB A Minute)", m[0], m[1], (int)lround([m[0] intValue] * 7.5)], [@"recrate:" stringByAppendingString:m[0]], nil)];
     [[rc addItemWithTitle:@"Size" action:nil keyEquivalent:@""] setSubmenu:rs];
     [[rc addItemWithTitle:@"Bitrate" action:nil keyEquivalent:@""] setSubmenu:rb];
-    [rc addItem:item(@"Include Overlay In Recordings", @"recoverlay", nil)];
+    [rc addItem:item(@"Include Overlay in Recordings", @"recoverlay", nil)];
     [rc addItem:NSMenuItem.separatorItem];
     [rc addItem:item(@"Open Recordings Folder", @"recfolder", nil)];
     NSMenu *wm = submenu(bar, @"Window");
@@ -2155,6 +2637,10 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
 
     NSMenu *hm = submenu(bar, @"Help");
     [hm addItem:item(@"Keyboard Shortcuts", @"keys", nil)];
+    [hm addItem:item(@"Copy Debug Report", @"debugreport", nil)];
+    [hm addItem:NSMenuItem.separatorItem];
+    [hm addItem:item(@"Common Problems and Fixes", @"helpfixes", nil)];
+    [hm addItem:item(@"Discord", @"discord", nil)];
     NSApp.helpMenu = hm;
     setTips(bar); // every item says what it does, from the same table as the overlay's hint line
     NSApp.mainMenu = bar;
@@ -2215,7 +2701,15 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     if (cur && !cur->formats.empty()) {
         if (cur->pickAudio || cur->formats.size() > 1) {
             NSMenu *f = submenu(m, ns(cur->formatLabel));
-            for (auto &c : cur->formats) [f addItem:item(ns(c.name), ns("format:" + c.id), nil)];
+            // the default marked: meyra starts at 1080p even where the device offers more, the larger ones are above it
+            for (auto &c : cur->formats) [f addItem:item(cur->pickAudio && c.id == cur->defaultFormat && cur->formats.size() > 1 ? [ns(c.name) stringByAppendingString:@" (default)"] : ns(c.name), ns("format:" + c.id), nil)];
+            // the pixel layout, where the format in use offers a compressed one besides the uncompressed
+            if (cur->id == _sourceId && (([self curLayouts]) || [[NSUserDefaults.standardUserDefaults dictionaryForKey:@"layouts"][ns(_sourceId)] length])) {
+                [f addItem:NSMenuItem.separatorItem];
+                [f addItem:[NSMenuItem sectionHeaderWithTitle:@"Layout"]];
+                [f addItem:item(@"Uncompressed (least delay)", @"layout:", nil)];
+                if (const std::vector<Choice> *l = [self curLayouts]) for (auto &c : *l) [f addItem:item(ns(c.name), ns("layout:" + c.id), nil)];
+            }
         }
     }
     if (cur && cur->pickAudio) {
@@ -2263,7 +2757,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
         if (arg.intValue == 2) { // say why it is off or not running
             const char *st = superres::status();
             mi.title = !superres::available() ? @"Apple Super Resolution (needs macOS 26 and Apple silicon)"
-                     : on && srYields() ? @"Apple Super Resolution (frame generation off only, using MetalFX)"
+                     : on && srYields() ? (rateRuns() && gSet.srWithGen ? @"Apple Super Resolution (output rate off only, using MetalFX)" : @"Apple Super Resolution (frame generation off only, using MetalFX)")
                      : on && *st && strcmp(st, "starting") ? [NSString stringWithFormat:@"Apple Super Resolution (%s, using MetalFX)", st] : @"Apple Super Resolution";
         }
     }
@@ -2290,8 +2784,26 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
         static NSString *const kTitle[] = {@"Apple's Interpolator", @"Second Generator, 480 Lines", @"Second Generator, 720 Lines"};
         if (arg.intValue > 0 && arg.intValue < 3 && mi.title.length) mi.title = !flyhigh::complete() ? [kTitle[arg.intValue] stringByAppendingString:@" (Download…)"] : *flyhigh::note() ? [NSString stringWithFormat:@"%@ (%s)", kTitle[arg.intValue], flyhigh::note()] : kTitle[arg.intValue];
     }
+    else if ([c isEqual:@"rate"]) {
+        NSArray<NSString *> *v = [arg componentsSeparatedByString:@":"];
+        int r = v.firstObject.intValue;
+        double n = r == 3 ? (gSet.rateNum > 0 ? gSet.rateNum.load() : 60) : fmin(8, fmax(2, round(gSet.rateNum)));
+        on = gSet.rate == r && (v.count < 2 || fabs(n - v[1].doubleValue) < 0.01);
+        enabled = !r || (framegen::available() && !pass && gSet.frameGen); // off: always, a way out. the others need frame generation on (rateRuns)
+    }
+    else if ([c isEqual:@"rateblend"]) { on = gSet.rateBlend; enabled = rateRuns(); }
+    else if ([c isEqual:@"ratesnap"]) { on = snapKey(gSet.rateSnap) == arg.floatValue; enabled = rateRuns(); }
+    else if ([c isEqual:@"ratecushion"]) { on = gSet.rateCushion == arg.intValue; enabled = rateRuns(); }
+    else if ([c isEqual:@"rateevenlate"]) { on = gSet.rateEvenLate; enabled = rateRuns(); }
+    else if ([c isEqual:@"rateenhancemade"]) { on = gSet.rateEnhanceMade; enabled = rateRuns(); }
     else if ([c isEqual:@"genshift"]) { on = gSet.genShift; enabled = framegen::available() && !pass && gSet.genModel == 3; }
     else if ([c isEqual:@"gendoubt"]) { on = gSet.genDoubt; enabled = framegen::available() && !pass && gSet.genModel == 3; }
+    else if ([c isEqual:@"gensmallfast"]) { on = gSet.genSmallFast; enabled = framegen::available() && !pass && gSet.genModel == 3; }
+    else if ([c isEqual:@"genfallback"]) { on = gSet.genFallback; enabled = framegen::available() && !pass && gSet.genModel == 3 && rateRuns(); }
+    else if ([c isEqual:@"gensides"]) { on = gSet.genSides; enabled = framegen::available() && !pass && gSet.genModel == 3; }
+    else if ([c isEqual:@"genoutline"]) { on = gSet.genOutline; enabled = framegen::available() && !pass && gSet.genModel == 3; }
+    else if ([c isEqual:@"gencutguard"]) { on = gSet.genCutGuard; enabled = framegen::available() && !pass && gSet.genModel == 3 && rateRuns(); }
+    else if ([c isEqual:@"gensharp"]) { on = gSet.genSharp; enabled = framegen::available() && !pass && gSet.genModel == 3; }
     else if ([c isEqual:@"hudlock"]) { on = gSet.hudLock; enabled = !pass; }
     else if ([c isEqual:@"hudmark"]) { on = _view.marking; enabled = !pass; mi.title = gSet.hudN ? [NSString stringWithFormat:@"Mark HUD Area (%d of %d marked)", gSet.hudN.load(), kHudMax] : @"Mark HUD Area"; }
     else if ([c isEqual:@"hudclear"]) enabled = gSet.hudN > 0;
@@ -2302,12 +2814,21 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     else if ([c isEqual:@"repeatroll"]) on = gSet.repeatRoll; // passthrough drains too
     else if ([c isEqual:@"stabilise"]) { on = gSet.stabilise; enabled = !pass; }
     else if ([c isEqual:@"grain"]) { on = fabsf(gSet.grain - arg.floatValue) < 0.05f; enabled = !pass; }
+    else if ([c isEqual:@"sidefill"]) { on = gSet.sideFill == arg.intValue; enabled = !pass && !(arg.intValue == 3 && (gSet.sideStretch > 0 || gSet.rate != 0)); }
+    else if ([c isEqual:@"sidedim"]) { on = fabsf(gSet.sideDim - arg.floatValue) < 0.05f; enabled = !pass && gSet.sideFill; }
+    else if ([c isEqual:@"sideblur"]) { on = fabsf(gSet.sideBlur - arg.floatValue) < 0.2f; enabled = !pass && gSet.sideFill >= 2; }
+    else if ([c isEqual:@"letterboxcrop"]) { on = gSet.letterboxCrop; enabled = !pass; }
+    else if ([c isEqual:@"sidestretch"]) { on = gSet.sideStretch == arg.intValue; enabled = !pass; }
     else if ([c isEqual:@"enhancereal"]) { on = gSet.enhanceReal; enabled = !pass; }
     else if ([c isEqual:@"enhancehold"]) { on = gSet.enhanceHold; enabled = !pass; }
     else if ([c isEqual:@"look"]) { on = gSet.look == arg.intValue; enabled = !pass; }
     else if ([c isEqual:@"supersample"]) { on = gSet.superSample; enabled = !pass; }
     else if ([c isEqual:@"genstill"]) { on = gSet.genStill == arg.intValue; enabled = framegen::available() && !pass; }
-    else if ([c isEqual:@"refresh"]) on = gSet.refresh == arg.intValue;
+    else if ([c isEqual:@"refresh"]) { // any rate 2 keeps the screen's own rate, while it can run
+        static NSString *const kRefT[] = {@"Off", @"Automatic", @"Source Rate"};
+        on = gSet.refresh == arg.intValue; enabled = !(gSet.rate == 2 && rateRuns());
+        if (mi.title.length && arg.intValue >= 0 && arg.intValue < 3) mi.title = enabled ? kRefT[arg.intValue] : [kRefT[arg.intValue] stringByAppendingString:@" (every screen refresh keeps the screen's rate)"];
+    }
     else if ([c isEqual:@"audio"]) on = gSet.audio;
     else if ([c isEqual:@"trim0"]) {
         mi.title = fabs(gSet.audioTrim) > 0.0005 ? [NSString stringWithFormat:@"Reset Delay (now %+.0f ms)", gSet.audioTrim * 1000] : @"Reset Delay";
@@ -2328,6 +2849,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
         if (!v) v = ns(_curDefaultFormat);
         on = [v isEqual:arg];
     }
+    else if ([c isEqual:@"layout"]) on = [ns([self curLayout]) isEqual:arg ?: @""];
     else if ([c isEqual:@"ain"]) on = [([d dictionaryForKey:@"audioInputs"][ns(_sourceId)] ?: @"auto") isEqual:arg];
     else if ([c isEqual:@"restart"] || [c isEqual:@"snapshot"] || [c isEqual:@"actual"]) enabled = !_sourceId.empty();
     else if ([c isEqual:@"updates"]) enabled = !_updating;
@@ -2338,15 +2860,16 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     else if ([c isEqual:@"power"]) mi.title = _off ? @"Turn Meyra On" : @"Turn Meyra Off";
     else if ([c isEqual:@"keepres"]) on = gSet.keepRes;
     else if ([c isEqual:@"freeze"]) on = gSet.freeze;
-    else if ([c isEqual:@"record"]) { int st = record::state(); on = st == 2; mi.title = st == 1 ? [NSString stringWithFormat:@"Save The Last %d Seconds (Tab)", recSecs()] : st == 2 ? @"Stop Recording (Tab)" : @"Start Recording (Tab)"; }
-    else if ([c isEqual:@"reckeep"]) { on = record::state() == 1; mi.title = [NSString stringWithFormat:@"Keep The Last %d Seconds (Shift + Tab)", recSecs()]; }
+    else if ([c isEqual:@"record"]) { int st = record::state(); on = st == 2; mi.title = st == 1 ? [NSString stringWithFormat:@"Save the Last %d Seconds (Tab)", recSecs()] : st == 2 ? @"Stop Recording (Tab)" : @"Start Recording (Tab)"; }
+    else if ([c isEqual:@"reckeep"]) { on = record::state() == 1; mi.title = [NSString stringWithFormat:@"Keep the Last %d Seconds (Shift + Tab)", recSecs()]; }
     else if ([c isEqual:@"recoverlay"]) on = [d boolForKey:@"recOverlay"];
     else if ([c isEqual:@"recsize"]) on = recMaxH() == arg.intValue;
     else if ([c isEqual:@"recrate"]) on = (int)[d integerForKey:@"recMbit"] == arg.intValue;
     else if ([c isEqual:@"compare"]) { on = gSet.compare == arg.intValue; enabled = !pass; }
     else if ([c isEqual:@"gamemode"]) {
-        on = [d boolForKey:@"gameMode"];
-        mi.title = gGameModeChanged ? @"Game Mode in Full Screen (from the next start of Meyra)" : @"Game Mode in Full Screen";
+        on = gameModeOn();
+        enabled = update::gameModeOff(appURL()) >= 0;
+        mi.title = enabled ? @"Game Mode in Full Screen" : @"Game Mode in Full Screen (this macOS has no switch for it)";
     }
     else if ([c isEqual:@"revertUpdate"]) {
         std::string v;
@@ -2361,7 +2884,7 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
 
 - (void)showPicker {
     if (!_picker) {
-        _picker = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 460, 230) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:YES];
+        _picker = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 460, 264) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:YES];
         _picker.title = @"Choose a Source";
         NSView *v = _picker.contentView;
         auto label = [&](NSString *t, CGFloat y) {
@@ -2376,12 +2899,16 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
             [v addSubview:p];
             return p;
         };
-        label(@"Source:", 186);
-        _pickSource = popup(186);
+        label(@"Source:", 220);
+        _pickSource = popup(220);
         _pickSource.target = self;
         _pickSource.action = @selector(pickerSourceChanged:);
-        _pickFormatLabel = label(@"Format:", 152);
-        _pickFormat = popup(152);
+        _pickFormatLabel = label(@"Format:", 186);
+        _pickFormat = popup(186);
+        _pickFormat.target = self;
+        _pickFormat.action = @selector(pickerFormatChanged:);
+        _pickLayoutLabel = label(@"Layout:", 152);
+        _pickLayout = popup(152);
         _pickAudioLabel = label(@"Audio input:", 118);
         _pickAudio = popup(118);
         _pickNote = [NSTextField wrappingLabelWithString:@""];
@@ -2436,13 +2963,14 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     if (s) {
         NSString *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"formats"][ns(s->id)] ?: ns(s->defaultFormat);
         for (auto &c : s->formats) {
-            [_pickFormat addItemWithTitle:ns(c.name)];
+            [_pickFormat addItemWithTitle:s->pickAudio && c.id == s->defaultFormat && s->formats.size() > 1 ? [ns(c.name) stringByAppendingString:@" (default)"] : ns(c.name)];
             _pickFormat.lastItem.representedObject = ns(c.id);
             if ([saved isEqual:ns(c.id)]) [_pickFormat selectItem:_pickFormat.lastItem];
         }
         if (!s->pickAudio && s->formats.size() <= 1) [_pickFormat addItemWithTitle:@"Automatic"];
     }
     _pickFormat.enabled = s && s->formats.size() > 1;
+    [self pickerFormatChanged:nil];
     bool avf = s && s->pickAudio;
     [_pickAudio addItemWithTitle:avf ? @"Automatic" : s && !s->audioLabel.empty() ? ns(s->audioLabel) : @"None"];
     _pickAudio.lastItem.representedObject = @"auto";
@@ -2460,20 +2988,98 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     _pickAudio.enabled = avf;
 }
 
+// the layouts the chosen format offers. none to choose: automatic, greyed
+- (void)pickerFormatChanged:(id)sender {
+    [_pickLayout removeAllItems];
+    NSInteger i = _pickSource.selectedItem.tag;
+    const SourceInfo *s = !_pickList.empty() && i >= 0 && i < (NSInteger)_pickList.size() ? &_pickList[i] : nullptr;
+    NSString *f = _pickFormat.selectedItem.representedObject;
+    auto it = s && f ? s->layouts.find(f.UTF8String) : std::map<std::string, std::vector<Choice>>::const_iterator();
+    bool choice = s && f && it != s->layouts.end() && !it->second.empty();
+    [_pickLayout addItemWithTitle:choice ? @"Uncompressed (least delay)" : @"Automatic"];
+    _pickLayout.lastItem.representedObject = @"";
+    if (choice) {
+        NSString *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"layouts"][ns(s->id)] ?: @"";
+        for (auto &c : it->second) {
+            [_pickLayout addItemWithTitle:ns(c.name)];
+            _pickLayout.lastItem.representedObject = ns(c.id);
+            if ([saved isEqual:ns(c.id)]) [_pickLayout selectItem:_pickLayout.lastItem];
+        }
+    }
+    _pickLayout.enabled = choice;
+}
+
 - (void)pickerStart:(id)sender {
     NSInteger i = _pickSource.selectedItem.tag;
     if (_pickList.empty() || i < 0 || i >= (NSInteger)_pickList.size()) return;
     std::string id = _pickList[i].id;
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    for (NSString *key in @[@"formats", @"audioInputs"]) {
-        NSString *v = ([key isEqual:@"formats"] ? _pickFormat : _pickAudio).selectedItem.representedObject;
-        if (!v) continue;
+    for (NSString *key in @[@"formats", @"audioInputs", @"layouts"]) {
+        NSString *v = ([key isEqual:@"formats"] ? _pickFormat : [key isEqual:@"layouts"] ? _pickLayout : _pickAudio).selectedItem.representedObject;
+        if (!v || ([key isEqual:@"layouts"] && !_pickLayout.enabled)) continue; // no layout to choose: a saved one stays for the formats that have it
         NSMutableDictionary *m = [[d dictionaryForKey:key] mutableCopy] ?: [NSMutableDictionary new];
         m[ns(id)] = v;
         [d setObject:m forKey:key];
     }
     [_win endSheet:_picker];
     [self startSource:id persist:YES];
+}
+
+// the debug report's parts that only the running app knows
+- (NSScreen *)reportScreen { return _win.screen; }
+- (std::string)debugReport { return reportText(self); }
+- (void)reportLive:(const std::function<void(const char *, const std::string &)> &)section {
+    using debugreport::scrub;
+    std::string t;
+    auto add = [&](NSString *l) { t += "  " + scrub(l.UTF8String) + "\n"; };
+    if (_sourceId.empty()) add(_off ? @"none, meyra is turned off" : @"none chosen");
+    else {
+        std::string f = [self curFormat], fn = f, ln = "uncompressed";
+        for (auto &c : _sourceInfo.formats) if (c.id == f) fn = c.name;
+        if (const std::vector<Choice> *l = [self curLayouts]) for (auto &c : *l) { if (c.id == [self curLayout]) ln = c.name; }
+        add([NSString stringWithFormat:@"%@ [%@], %@", ns(_sourceName), ns(debugreport::shortId(_sourceId)), ns(_sourceInfo.kind)]);
+        add([NSString stringWithFormat:@"format %@%@, layout %@%@", ns(fn), f == _sourceInfo.defaultFormat ? @" (default)" : @"", ns(ln).lowercaseString,
+                                       [self curLayouts] && [self curLayout].empty() ? @" (compressed offered)" : @""]);
+        NSString *ain = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"audioInputs"][ns(_sourceId)] ?: @"auto";
+        add([NSString stringWithFormat:@"audio input %@, state %d \"%@\", %.2f fps asked", [ain isEqual:@"auto"] || [ain isEqual:@"none"] ? ain : @"chosen", (int)_status.state, ns(_status.text), _fps]);
+        if (_starved) add([self starveHint]);
+    }
+    section("source", t);
+    t.clear();
+    const renderer::Stats &s = _last;
+    if (s.in || s.drawn) {
+        add([@"order " stringByAppendingString:[[self orderParts:s] componentsJoinedByString:@" -> "]]);
+        double vg = renderer::rateInfo().on && s.cNewN ? s.cNewSum / s.cNewN : s.toGlassN ? s.toGlassSum / s.toGlassN : 0;
+        double delay = vg > 0 ? vg + (s.lagN ? s.lagSum / s.lagN : 0) : 0, gpu = s.gpuN ? s.gpuSum / s.gpuN : 0, budget = _fps > 0 ? 1000 / _fps : 0;
+        add([NSString stringWithFormat:@"%d fps in, %d new, cadence %@, delay %.0f ms, gpu %.1f of %.1f ms a frame, rolled %d, late %d", s.in, s.real, [self cadence:s], delay, gpu, budget, s.rolled, s.late]);
+        if (gSet.frameGen) { NSString *why = [self genWhy:s]; add(why ? [@"not generating: " stringByAppendingString:why] : [NSString stringWithFormat:@"generating %d /s", s.gen]); }
+        NSArray *st = [self stageParts:s];
+        if (st.count) add([@"gpu ms per stage " stringByAppendingString:[st componentsJoinedByString:@"  "]]);
+    } else add(@"no frames in the last second");
+    add([NSString stringWithFormat:@"window %.0f×%.0f px%@, overlay %@", _win.contentView.bounds.size.width * (_win.backingScaleFactor ?: 1), _win.contentView.bounds.size.height * (_win.backingScaleFactor ?: 1),
+                                   (_win.styleMask & NSWindowStyleMaskFullScreen) ? @", full screen" : @"", gSet.overlay ? @"on" : @"off"]);
+    add([NSString stringWithFormat:@"preset %@", _preset ? [NSString stringWithFormat:@"%d", _preset % 10] : _presetWas ? [NSString stringWithFormat:@"%d, changed by hand", _presetWas % 10] : @"none"]);
+    if (_lastMessage.length) add([@"last message: " stringByAppendingString:[_lastMessage stringByReplacingOccurrencesOfString:@"\n" withString:@" "]]);
+    if (_status.state == SourceState::Error) add([@"last error: " stringByAppendingString:ns(_status.text)]);
+    if (_hasCap) {
+        add([@"capture " stringByAppendingString:[self capText]]);
+        const CaptureCounts &a = _capAll;
+        add([NSString stringWithFormat:@"capture since the source started: %d frames, dropped late %d, out of buffers %d, discontinuity %d, other %d, no image %d",
+                                       a.frames, a.late, a.outOfBuffers, a.discontinuity, a.otherDrop, a.noImage]);
+    }
+    section("now", t);
+    t.clear();
+    // start-up facts, kept apart from the ring so a minute of per-second lines does not push them out. written
+    // without device ids
+    for (auto &l : logPinned()) t += "  " + scrub(l) + "\n";
+    section("capture start (kept)", t.empty() ? "  (no system capture device started this run)" : t);
+    t.clear();
+    std::vector<std::string> lines; // only the per-second lines and what the card runs: others carry device ids and paths
+    for (auto &l : logTail(64))
+        for (const char *p : {"t ", "   ", "source: starved", "source: frames back"})
+            if (!l.rfind(p, 0)) { lines.push_back(l); break; }
+    for (size_t i = lines.size() > 20 ? lines.size() - 20 : 0; i < lines.size(); i++) t += "  " + scrub(lines[i]) + "\n";
+    section("log, last lines", t);
 }
 
 - (void)pickerCancel:(id)sender { [_win endSheet:_picker]; }
@@ -2538,22 +3144,71 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
 @end
 
 
-static void listDevices() {
+// what --list-devices and the debug report print. names scrubbed, ids cut to what may be shown plus a short hash to
+// tell two alike apart (debugreport.mm). raw (--list-devices --ids): the ids as they are, for --source
+static std::string deviceText(bool raw) {
     std::vector<std::string> hints;
+    std::string t;
+    auto add = [&](const char *fmt, auto... a) { char b[1024]; snprintf(b, sizeof b, fmt, a...); t += b; };
+    auto idText = [&](const std::string &id) { std::string k = debugreport::shortId(id); return raw ? id : (k.empty() ? "" : k + " ") + debugreport::idHash(id); };
     for (auto &s : listSources(&hints)) {
-        printf("  %s  [%s]  %s, %s:", s.name.c_str(), s.id.c_str(), s.kind.c_str(), s.formatLabel.c_str());
-        for (auto &c : s.formats) printf(" %s%s", c.name.c_str(), c.id == s.defaultFormat ? "*" : "");
-        printf("\n");
+        add("  %s  [%s]  %s, %s:", (raw ? s.name : debugreport::scrub(s.name)).c_str(), idText(s.id).c_str(), s.kind.c_str(), s.formatLabel.c_str());
+        for (auto &c : s.formats) add(" %s%s", c.name.c_str(), c.id == s.defaultFormat ? "*" : "");
+        t += "\n";
+        auto rows = listAVFLayouts(s.id); // every layout the device reports per size and rate
+        if (!rows.empty()) t += "    layouts by size and rate (* what the format opens, + offered as compressed):\n";
+        for (auto &r : rows) t += "      " + r + "\n";
     }
-    for (auto &h : hints) printf("note: %s\n", h.c_str());
-    printf("avfoundation audio inputs:\n");
-    for (auto &c : listAVFAudioInputs()) printf("  %s  [%s]\n", c.name.c_str(), c.id.c_str());
-    printf("frame generation: %s\n", framegen::available() ? "available" : "not available");
+    for (auto &h : hints) add("note: %s\n", h.c_str());
+    t += "avfoundation audio inputs:\n";
+    for (auto &c : listAVFAudioInputs()) add("  %s  [%s]\n", (raw ? c.name : debugreport::scrub(c.name)).c_str(), (raw ? c.id : debugreport::idHash(c.id)).c_str());
+    add("frame generation: %s\n", framegen::available() ? "available" : "not available");
+    return t;
+}
+
+static void listDevices() { printf("%s", deviceText(gArgs.ids).c_str()); }
+
+// the debug report: plain text to paste into a message. app: the running one, nil from the command line
+static std::string reportText(AppDelegate *app) {
+    NSDateFormatter *df = [NSDateFormatter new];
+    df.dateFormat = @"yyyy-MM-dd HH:mm";
+    std::string t = "meyra debug report, " + std::string([df stringFromDate:NSDate.date].UTF8String) + "\n";
+    auto section = [&](const char *title, const std::string &body) { t += "\n" + std::string(title) + "\n" + body + (body.empty() || body.back() == '\n' ? "" : "\n"); };
+    section("machine", debugreport::machine());
+    section("displays", debugreport::displays(app ? [app reportScreen] : nil));
+    section("access", debugreport::access(!app));
+    if (app) [app reportLive:section];
+    else section("running", "  (from the command line: no source running, no window)");
+    section("devices", deviceText(false));
+    section("changed settings", debugreport::settings());
+    return t;
+}
+
+// --gamemode-test [on|off|-] [KEPT]: the launch step, then the menu's switch, on this bundle. KEPT: a saved signed
+// plist to put back first, instead of the usual one. prints and exits, no window
+static int gameModeTest(const std::string &set, const char *kept) {
+    NSURL *app = appURL();
+    if (kept) printf("restore from %s: %d\n", kept, update::restoreSignedPlist(app, [NSURL fileURLWithPath:@(kept)]));
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    auto show = [&](const char *when) {
+        printf("%s: flag %d, on %d, verifies %d, gameMode %s, gameModeOff %s\n", when, update::gameModeOff(app), gameModeOn(), update::verifies(app),
+               [[d objectForKey:@"gameMode"] description].UTF8String ?: "-", [[d objectForKey:@"gameModeOff"] description].UTF8String ?: "-");
+    };
+    show("before");
+    gameModeAtLaunch();
+    show("launch");
+    if (set == "on" || set == "off") {
+        printf("switch %s: %s\n", set.c_str(), setGameMode(set == "on") ? "ok" : "failed");
+        show("after");
+    }
+    printf("message: %s\n", permissionText("Meyra is not allowed to use capture devices. Turn it on in System Settings > Privacy & Security > Camera.").UTF8String);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc > 1 && !strncmp(argv[1], "--update-", 9)) return update::selfTest(std::vector<std::string>(argv + 1, argv + argc));
+        if (argc > 1 && !strcmp(argv[1], "--gamemode-test")) return gameModeTest(argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : nullptr);
         for (int i = 1; i < argc; i++) {
             bool more = i + 1 < argc;
             std::string a = argv[i];
@@ -2568,6 +3223,8 @@ int main(int argc, char **argv) {
             else if (a == "--window" && more) sscanf(argv[++i], "%dx%d", &gArgs.winW, &gArgs.winH);
             else if (a == "--fullscreen") gArgs.fullscreen = true;
             else if (a == "--list-devices") gArgs.listDevices = true;
+            else if (a == "--ids") gArgs.ids = true; // with --list-devices: the raw ids, for --source
+            else if (a == "--debug-report") gArgs.debugReport = true;
             else if (a == "--command" && more) gArgs.commands.push_back(argv[++i]);
             else if (a == "--menu-dump") gArgs.menuDump = true;
             else if (a == "--set" && more) {
@@ -2577,7 +3234,7 @@ int main(int argc, char **argv) {
             }
         }
         // anything automated must never ask for permissions or keep running
-        gArgs.test = gArgs.seconds > 0 || gArgs.listDevices;
+        gArgs.test = gArgs.seconds > 0 || gArgs.listDevices || gArgs.debugReport;
         if (!gArgs.log.empty()) logOpen(gArgs.log.c_str());
         // --set key=value: store a setting as if chosen in the menu (for testing that settings persist)
         for (auto &kv : gArgs.set) {
@@ -2590,14 +3247,27 @@ int main(int argc, char **argv) {
             else [d setObject:v forKey:ns(kv.first)];
         }
         settingsLoad();
+        if (gArgs.debugReport) { printf("%s", reportText(nil).c_str()); return 0; } // before the settings line: only the report on stdout
         logLine("settings: levels %d deband %d upscale %d sharpen %.2f framegen %d early %d passthrough %d audio %d trim %+.0f ms refresh %d overlay %d enhance %d at %d gensmall %d genstill %d denoise %d",
                 gSet.levels.load(), (int)gSet.deband, gSet.upscale.load(), gSet.sharpen.load(), (int)gSet.frameGen, (int)gSet.early, (int)gSet.passthrough,
                 (int)gSet.audio, gSet.audioTrim * 1000, gSet.refresh.load(), (int)gSet.overlay, gSet.enhance.load(), gSet.enhanceAt.load(), gSet.genSmall.load(), gSet.genStill.load(), (int)gSet.denoise);
         if (gSet.netHalf || gSet.genDeadline || gSet.genLateNext || gSet.gpuAwake)
             logLine("settings: nethalf %d gendeadline %d genlatenext %d gpuawake %d", (int)gSet.netHalf, gSet.genDeadline.load(), (int)gSet.genLateNext, (int)gSet.gpuAwake);
+        if (gSet.genSmallFast || gSet.genFallback || gSet.genSides || gSet.genOutline || gSet.genCutGuard || gSet.genSharp) logLine("settings: gensmallfast %d genfallback %d gensides %d genoutline %d gencutguard %d gensharp %d", (int)gSet.genSmallFast, (int)gSet.genFallback, (int)gSet.genSides, (int)gSet.genOutline, (int)gSet.genCutGuard, (int)gSet.genSharp);
         if (gSet.genShift || gSet.genDoubt || gSet.repeatRoll || gSet.grain > 0 || gSet.stabilise || gSet.lateDrawable || gSet.drawables != 3)
             logLine("settings: genshift %d gendoubt %d repeatroll %d grain %.2f stabilise %d latedrawable %d drawables %d", (int)gSet.genShift, (int)gSet.genDoubt,
                     (int)gSet.repeatRoll, gSet.grain.load(), (int)gSet.stabilise, (int)gSet.lateDrawable, gSet.drawables.load());
+        if (gSet.sideFill || gSet.letterboxCrop || gSet.sideStretch)
+            logLine("settings: sidefill %d sidedim %.2f sideblur %.2f sidesmooth %.0f letterboxcrop %d sidestretch %d", gSet.sideFill.load(), gSet.sideDim.load(), gSet.sideBlur.load(), gSet.sideSmooth.load(), (int)gSet.letterboxCrop.load(), gSet.sideStretch.load());
+        if (gSet.rate || gSet.rateNum > 0 || gSet.rateBlend || gSet.rateEven || fabsf(gSet.rateSnap - 0.1f) > 1e-4f || gSet.rateCushion || gSet.rateEvenLate || gSet.rateEnhanceMade)
+            logLine("settings: rate %d ratenum %.2f rateblend %d ratesnap %.2f rateeven %d ratecushion %d%s%s", gSet.rate.load(), gSet.rateNum.load(), (int)gSet.rateBlend, gSet.rateSnap.load(), (int)gSet.rateEven, gSet.rateCushion.load(),
+                    gSet.rateEvenLate ? " rateevenlate 1" : "", gSet.rateEnhanceMade ? " rateenhancemade 1" : "");
+        { NSDictionary *ad = [NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain]; // the test switches, so a run says what it had
+          for (NSString *k in @[@"rateCap", @"rateDrain", @"rateClock", @"rateTestLate", @"rateTestMax"]) if (ad[k]) logLine("settings: %s %s (test)", k.UTF8String, [ad[k] description].UTF8String);
+          for (NSString *k in @[@"replayJitter", @"replayJitterSeed", @"replayJitterShape", @"replayLate", @"rateFastWin"]) { // these read every domain
+              id v = [NSUserDefaults.standardUserDefaults objectForKey:k];
+              if (v) logLine("settings: %s %s (test)", k.UTF8String, [v description].UTF8String);
+          } }
         if (gSet.genModel) logLine("settings: frame generator %d%s%s", gSet.genModel.load(), *framegen::modelNote() ? ", " : "", framegen::modelNote());
         if (gArgs.listDevices) { listDevices(); return 0; }
         NSApplication *app = NSApplication.sharedApplication;
