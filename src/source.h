@@ -34,6 +34,13 @@ struct CaptureCounts {
 
 struct Choice { std::string id, name; };   // an option in a submenu (format, connection, audio input)
 
+// system capture: the audio input a source opened, or why it has none. state 0: not known (still starting, or a
+// source that does not say: decklink, replay), 1 open, 2 none. off: 0 none found or failed, 1 set to none, 2 no
+// microphone access
+struct AudioInputInfo { int state = 0, off = 0; std::string name, how, format, why; };
+// an audio input as --list-devices and the debug report show it: how it is connected, usb vendor:product if any
+struct AudioInputFacts { std::string id, name, transport, usb; };
+
 struct SourceInfo {
     std::string id;        // "avf:<uniqueID>", "replay:<path>", or "<driver prefix>:<device>"
     std::string name;
@@ -58,6 +65,7 @@ public:
     virtual double frameDuration() = 0;          // seconds, best known
     virtual bool hasAudio() = 0;
     virtual bool takeCounts(CaptureCounts &) { return false; } // avf: what the device delivered since the last call. false: not counted
+    virtual AudioInputInfo audioInput() { return {}; }         // avf: the audio input it opened, or why none
     StatusFn onStatus;
 protected:
     void report(SourceState s, const std::string &t) { if (onStatus) onStatus({s, t}); }
@@ -88,6 +96,9 @@ extern const Driver kDeckLinkDriver;
 // enumeration. cheap enough to call when a menu opens. hints: one line per driver whose software is missing
 std::vector<SourceInfo> listAVF(const std::vector<std::string> &vendorsWithDriver);
 std::vector<Choice> listAVFAudioInputs();
+std::vector<AudioInputFacts> listAVFAudioFacts();
+// what "automatic" takes for a system capture source: true and the input's name and how, or false and why not
+bool autoAVFAudio(const std::string &id, std::string &name, std::string &how);
 std::vector<std::string> listAVFLayouts(const std::string &id); // every pixel layout per size and rate, for --list-devices
 std::vector<SourceInfo> listSources(std::vector<std::string> *hints = nullptr);
 

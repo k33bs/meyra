@@ -14,6 +14,7 @@ std::string scrub(const std::string &s);     // privacy: see below
 std::string scrubName(const std::string &s); // the same for a bare device name: an owner after it goes to the end
 std::string scrubKnown(const std::string &s, std::vector<std::string> names); // scrub, the names given replaced by their scrubName first
 int scrubTest();                             // --self-test: prints each case, returns how many failed
+int settingsTest();                          // --self-test: which saved values count as changed, the per-source labels
 std::string shortId(const std::string &id);  // a source id as far as it may be shown
 std::string idHash(const std::string &id);   // "#3fa2": tells two devices apart without showing the id
 std::string access(bool commandLine);        // camera / microphone permission, whether the app's signature verifies

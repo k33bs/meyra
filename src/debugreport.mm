@@ -69,7 +69,7 @@ std::string shortId(const std::string &id) {
     if (c == std::string::npos) return "";
     std::string pre = id.substr(0, c), rest = id.substr(c + 1);
     if (pre == "avf") {
-        if (rest.compare(0, 2, "0x") == 0 && rest.size() >= 18 && isHex(rest.substr(2))) {
+        if (rest.compare(0, 2, "0x") == 0 && rest.size() >= 17 && isHex(rest.substr(2))) { // the location's leading zero can be missing
             std::string t = rest.substr(rest.size() - 8);
             return "avf usb " + t.substr(0, 4) + ":" + t.substr(4);
         }
@@ -161,7 +161,7 @@ const std::vector<Rule> &idRules() {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         r.push_back({rx(@"(?<![0-9a-fA-F])[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}(?![0-9a-fA-F])"), @"(id)"}); // a mac address (bluetooth audio ids)
-        r.push_back({rx(@"0x[0-9a-fA-F]{8}([0-9a-fA-F]{4})([0-9a-fA-F]{4})(?![0-9a-fA-F])"), @"usb $1:$2"});
+        r.push_back({rx(@"0x[0-9a-fA-F]{7,8}([0-9a-fA-F]{4})([0-9a-fA-F]{4})(?![0-9a-fA-F])"), @"usb $1:$2"});
         r.push_back({rx(@"0x[0-9a-fA-F]{12,}"), @"(id)"});
         r.push_back({rx(@"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"), @"(id)"});
         r.push_back({rx(@"[0-9a-fA-F]{24,}"), @"(id)"});
@@ -329,6 +329,10 @@ int scrubTest() {
         {"last message: iPhone (Алекс) Camera was disconnected.", "iPhone (Алекс) Camera", "last message: iPhone Camera was disconnected."},
         {"last message: No picture from iPhone von alex (running).", "iPhone von alex", "last message: No picture from iPhone (running)."},
         {"last error: Câmera do Studio Display is in use", "Câmera do Studio Display", "last error: Câmera do Studio Display is in use"},
+        {"avfoundation: audio from Alexin iPhone Microphone (chosen), device runs 48000 Hz 1 ch", "Alexin iPhone Microphone", "avfoundation: audio from iPhone Microphone (chosen), device runs 48000 Hz 1 ch"},
+        {"sound no sound coming in (input: Alex’s AirPods Pro, chosen; output: Alex’s AirPods Pro)", "Alex’s AirPods Pro", "sound no sound coming in (input: AirPods Pro, chosen; output: AirPods Pro)"},
+        {"sound in step with the picture (input: Alexin iPhone Microphone, auto: same name; output: MacBook Pro Speakers)", "Alexin iPhone Microphone", "sound in step with the picture (input: iPhone Microphone, auto: same name; output: MacBook Pro Speakers)"},
+        {"avfoundation: USB Video started, 1920 × 1080 @ 60, audio from Alex’s AirPods Pro (auto: same id, of the ones alike by same name)", "Alex’s AirPods Pro", "avfoundation: USB Video started, 1920 × 1080 @ 60, audio from AirPods Pro (auto: same id, of the ones alike by same name)"},
     };
     for (auto &c : known) {
         std::string got = scrubKnown(c.in, {c.name, "USB Video"});
@@ -451,6 +455,52 @@ static std::string valueText(id o) {
 
 static bool skipKey(NSString *k) { return [k hasPrefix:@"NS"] || [k hasPrefix:@"Apple"] || [k hasPrefix:@"com.apple"]; }
 
+// a saved value that is what meyra uses anyway. most settings have no registered default: missing reads as 0, no or
+// "", so a preset that writes them all off is not a change. a few count as something else when missing, and some
+// change things by being there at all: those are always listed
+static bool atDefault(NSString *k, id o, NSDictionary *reg) {
+    static NSDictionary *implied = @{@"genFloor": @12, @"rateSnap": @0.1, @"drawables": @3, @"sideDim": @0.7, @"sideBlur": @1, @"sideSmooth": @200,
+                                     @"stretchCentre": @0.3, @"recMaxHeight": @1080, @"recKeepSeconds": @30};
+    static NSSet *present = [NSSet setWithArray:@[@"avfOut", @"avfReapply", @"chain", @"drain", @"enhanceAhead", @"genSpinWait", @"holdMargin",
+                                                  @"snapFrames", @"stageTimes", @"gameModeOff", @"replayJitterSeed"]];
+    id def = reg[k];
+    if (!def) {
+        if ([present containsObject:k]) return false;
+        def = implied[k];
+    }
+    if ([o isKindOfClass:NSNumber.class]) { // a float saved as 0.6f is not equal to the double 0.6
+        if (def && ![def isKindOfClass:NSNumber.class]) return false;
+        double v = [o doubleValue], dv = def ? [def doubleValue] : 0;
+        return fabs(v - dv) <= 1e-5 * fmax(1, fabs(dv));
+    }
+    if ([o isKindOfClass:NSString.class]) return def ? [o isEqual:def] : [o length] == 0;
+    return def && [o isEqual:def];
+}
+
+// one entry of a per-source dictionary: its id as far as it may be shown, and the short hash that tells two apart
+static std::string entryLabel(const std::string &key, const std::string &id) {
+    std::string k = shortId(id);
+    return key + "[" + (k.empty() ? "" : k + " ") + idHash(id) + "]";
+}
+
+int settingsTest() {
+    int bad = 0;
+    auto check = [&](const char *what, bool ok) { printf("%s %s\n", ok ? "ok  " : "FAIL", what); bad += !ok; };
+    NSDictionary *reg = @{@"sharpen": @0.6, @"deband": @YES, @"gameMode": @YES};
+    check("settings: sharpen saved as a float 0.6 is the default", atDefault(@"sharpen", @(0.6f), reg));
+    check("settings: deband off is a change", !atDefault(@"deband", @NO, reg));
+    check("settings: genShift off with no registered default is not a change", atDefault(@"genShift", @NO, reg));
+    check("settings: rate 0 is not a change, rate 2 is", atDefault(@"rate", @0, reg) && !atDefault(@"rate", @2, reg));
+    check("settings: rateSnap 0.1 is not a change, 0.2 is", atDefault(@"rateSnap", @(0.1f), reg) && !atDefault(@"rateSnap", @0.2, reg));
+    check("settings: avfReapply off is listed (being there changes it)", !atDefault(@"avfReapply", @NO, reg));
+    check("settings: drawables 3 is not a change", atDefault(@"drawables", @3, reg));
+    check("settings: a dictionary is listed", !atDefault(@"formats", @{@"avf:x": @"1"}, reg));
+    check("settings: two sources with the same short id get two labels",
+          entryLabel("audioInputs", "avf:4F2B8D10-3A6C-4E97-B5D1-8C0E6A29F347") != entryLabel("audioInputs", "avf:5A3E9C21-7B40-4D8E-A1F6-3C9B0E7D2A15"));
+    check("settings: a uvc source's label shows usb vendor:product", entryLabel("formats", "avf:0x3a9e40c345f2131").rfind("formats[avf usb 345f:2131 #", 0) == 0);
+    return bad;
+}
+
 std::string settings() {
     std::vector<std::string> v;
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -462,7 +512,7 @@ std::string settings() {
     else {
         for (NSString *k in [saved.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
             id o = saved[k];
-            if (skipKey(k) || [o isEqual:reg[k]]) continue;
+            if (skipKey(k) || atDefault(k, o, reg)) continue;
             if ([k isEqual:@"muteOutput"] || [k isEqual:@"frameLog"]) continue; // saved by 0.6.0, no effect since: command line only
             std::string key = str(k);
             if ([k hasPrefix:@"customPreset"]) v.push_back(key + " = (saved)");
@@ -475,7 +525,7 @@ std::string settings() {
                     if ([k isEqual:@"audioInputs"])
                         t = ([sv isEqual:@"auto"] || [sv isEqual:@"none"]) ? str(sv) : "(a chosen input)";
                     else t = valueText(sv);
-                    v.push_back(key + "[" + shortId(str(sk)) + "] = " + t);
+                    v.push_back(entryLabel(key, str(sk)) + " = " + t);
                 }
             }
             else if ([k isEqual:@"source"] && [o isKindOfClass:NSString.class]) v.push_back(key + " = " + shortId(str(o)));

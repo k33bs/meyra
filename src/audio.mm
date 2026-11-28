@@ -45,6 +45,8 @@ static std::atomic<double> gDevLat{0};  // output device latency after the rende
 static std::atomic<float> gOutPeak{0};     // what actually went to the speakers, render thread
 static int64_t wNext = -1;                 // decklink packet time expected next, capture thread
 static std::string gLine = "off"; // main thread
+static std::string gInput;        // main thread: the input and how it was found, for the status line. empty if not known
+static std::atomic<double> gLastIn{0}; // host time of the last packet pushed. "in step" only while packets come
 
 static double hostNow() { return AudioConvertHostTimeToNanos(AudioGetCurrentHostTime()) * 1e-9; }
 static inline float tap(int64_t i, int c) { return gRing[((i & (kRing - 1)) << 1) + c]; }
@@ -104,6 +106,7 @@ static void clockIn(double t, int64_t w, long n, float pl, float pr, float rawPe
     if (!wSeen || (fabs(dev) > 0.02 && ++wOdd > 3)) { wEpoch = raw; wSeen = 1; wOdd = 0; dev = 0; }
     else if (fabs(dev) <= 0.02) { wOdd = 0; wSeen = std::min(wSeen + 1, 32); wEpoch += dev / wSeen; }
     gEpoch = wSeen >= 8 ? wEpoch : 0;
+    gLastIn.store(hostNow(), std::memory_order_relaxed);
     os_unfair_lock_lock(&gLock);
     gS.frames += (int)n; gS.packets++;
     gS.jitterMs = fmax(gS.jitterMs, fabs(dev) * 1000);
@@ -165,6 +168,7 @@ void lost() { wSeen = 0; wNext = -1; }
 
 void reset() {
     gEpoch = 0;
+    gLastIn = 0;
     gInLag = 0;
     wSeen = wOdd = 0;
     wEpoch = 0;
@@ -258,13 +262,19 @@ void retarget(double videoDelay, double trim, bool mute) {
     floor += gInLag.load();
     double want = videoDelay + trim - dev;
     gDelay = fmax(floor, want);
-    char b[160];
+    // the input it comes from and how it was found, then where it plays. nothing pushed for a second: no sound coming
+    // in, whatever the clock still knows
+    char b[400];
+    bool coming = gEpoch.load() != 0 && hostNow() - gLastIn.load(std::memory_order_relaxed) < 1.0;
+    std::string where = (gInput.empty() ? "" : "input: " + gInput + "; ") + "output: " + d.name;
     if (mute) snprintf(b, sizeof b, "muted");
-    else if (gEpoch.load() == 0) snprintf(b, sizeof b, "no sound coming in (%s)", d.name.c_str());
-    else if (want < floor - 0.004) snprintf(b, sizeof b, "%.0f ms behind the picture (%s)", (floor - want) * 1000, d.name.c_str());
-    else snprintf(b, sizeof b, "in step with the picture (%s)", d.name.c_str());
+    else if (!coming) snprintf(b, sizeof b, "no sound coming in (%s)", where.c_str());
+    else if (want < floor - 0.004) snprintf(b, sizeof b, "%.0f ms behind the picture (%s)", (floor - want) * 1000, where.c_str());
+    else snprintf(b, sizeof b, "in step with the picture (%s)", where.c_str());
     gLine = b;
 }
+
+void setInput(const std::string &name) { gInput = name; }
 
 void setMute(bool m) { gMute = m; }
 

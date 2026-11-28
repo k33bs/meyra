@@ -24,6 +24,7 @@ void lost();                     // no signal: packets until the next push are n
 void retarget(double videoDelay, double trim, bool mute);
 void setMute(bool mute);
 std::string statusLine();        // for the overlay
+void setInput(const std::string &input); // main thread: the input and how it was found ("usb3 digital audio, auto: same name"), "" if not known
 
 struct Stats {
     int frames = 0, packets = 0, underruns = 0, overruns = 0, resyncs = 0, gaps = 0;

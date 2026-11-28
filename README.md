@@ -174,7 +174,7 @@ more in the manual: [the screen and the last few ms](MANUAL.md#the-screen-and-th
 | the list of devices | | picks which capture card is shown |
 | format | | picks the signal format to ask the card for. the one meyra picks by itself says (default) |
 | format: layout | | only where the card offers it: uncompressed (least delay) or compressed (mjpeg). experimental. some usb cards only reach 60 fps compressed |
-| audio input | | picks where the sound comes from |
+| audio input | | picks where the sound comes from. automatic looks for the card's own sound; a camera (built-in, iphone, camera or webcam in its name) gets none |
 | choose source | <kbd>⇧</kbd><kbd>⌘</kbd><kbd>O</kbd> | card, format and sound in one window |
 | open replay folder | <kbd>⌘</kbd><kbd>O</kbd> | plays a folder of recorded test frames |
 | restart source | <kbd>⌘</kbd><kbd>R</kbd> | stops the card and starts it again |
@@ -468,8 +468,15 @@ fixes. stuck: ask on [discord](https://discord.gg/UpgbaZEUj4).
   later by 5 ms, reset delay). bluetooth headphones cannot be brought in step.
 - **a blackmagic card plays about 50 ms behind**: pick its "(blackmagic driver)" entry under source, not "(standard
   capture)". that entry needs blackmagic's desktop video installed.
-- **no sound**: audio > play audio (<kbd>A</kbd>), source > audio input. the console sends dolby or dts: set it to
-  pcm, meyra does not decode bitstreams. after an update allow the microphone again.
+- **no sound from a capture card**: source > audio input, pick the card's own sound. a usb card's is often named
+  differently ("usb3 digital audio" for "usb3 video"). the audio menu only has play audio (<kbd>A</kbd>) and the delay.
+  the overlay's audio row says "no audio input" when automatic found none.
+- **still no sound**: audio > play audio (<kbd>A</kbd>) on. the console sends dolby or dts: set it to pcm, meyra does
+  not decode bitstreams. after an update allow the microphone again.
+- **no sound from a camera**: a camera (built-in, iphone, camera or webcam in its name) gets no sound on automatic, out
+  of the speakers its microphone feeds back. pick it under source > audio input if you want it.
+- **echo from a webcam**: a webcam without camera or webcam in its name whose microphone shares its usb maker and model
+  can get its microphone on automatic. the overlay's audio row names the input. choose none in source > audio input.
 
 ### picture too small, black bars
 

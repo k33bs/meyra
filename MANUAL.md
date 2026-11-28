@@ -145,6 +145,19 @@ got a card from another maker with its own sdk? see
 source > format lists what the device offers. meyra opens 1080p by itself even where the device offers more; that
 entry says (default) where system capture offers more than one format, the larger ones sit above it.
 
+source > audio input: a card's sound is a separate audio device to macos, often with another name ("usb3 digital
+audio" for "usb3 video"). automatic looks for it in this order and takes the first hit: the device macos links to the
+card, the same name, the same id up to its last colon (blackmagic), the same usb vendor and product, the card's name
+inside the audio device's id. never a microphone by default, never the default input. a camera (built-in, iphone, a
+usb webcam with camera or webcam in its name) gets none on automatic: its own microphone out of the speakers feeds
+back. a webcam without such a word is taken for a card, see [known limits](#known-limits). two devices that match
+under one rule (two alike cards plugged in) go on to the later rules: the one left wins (two alike blackmagic units
+told apart by the id). none left gives none, which is which cannot be told; the overlay's audio row then says "no
+audio input: choose one in source > audio input". with an input open it names it and how it was found, next to the
+output: "in step with the picture (input: usb3 digital audio, auto: same usb vendor:product; output: …)". the start
+line in the log and the debug report say the same, or why none. `--list-devices` prints what automatic takes for each
+device.
+
 ### too few frames from the card
 
 cheap usb cards often cannot push uncompressed 1080p60 through: the format says 60, 20 or 30 arrive. meyra watches
@@ -731,6 +744,9 @@ what meyra does with the display, and what it asks of macos and the gpu.
 - **play audio**: the source's sound, held back so it lands with the picture. off if the console's sound
   goes somewhere else.
 - **earlier / later**: nudges the sound 5 ms at a time, for when lips and voices are off.
+- **where it comes from**: source > audio input, not the audio menu. the overlay's audio row says "in step with the
+  picture" only while sound comes in; in brackets the input it comes from and how it was found, then the output it
+  plays on. without an input it says "no audio input" and where to pick one.
 - with an output rate the sound follows the picture's delay as it lands on the glass, ride out included. with even out
   the game's late frames it stays at the mean while the picture swings around it.
 
@@ -896,18 +912,23 @@ without asking ten questions first.
 - **machine**: meyra's version and build, macos, the mac's model, chip, memory, cores, gpu, thermal state, low power mode.
 - **displays**: each screen's size in points and pixels, scale, refresh, its top rate and variable refresh range, which
   one is built in, main, and has the window.
-- **source**: name, kind, format and layout, whether compressed is offered, audio input as automatic, none or chosen,
-  its state, the too-few-frames line.
+- **source**: name, kind, format and layout, whether compressed is offered, audio input as automatic, none or chosen
+  with the input's name, how automatic found it and what it runs (`audio input auto -> USB3 Digital Audio (same usb
+  vendor:product), 48000 Hz 2 ch, open`), or why there is none, its state, the too-few-frames line.
 - **now**: the order line, frames in, new, cadence, delay, gpu, why frame generation makes nothing if it does not, gpu
-  ms per stage, window size, overlay, preset, the last message and error, the capture line (frames from the device,
+  ms per stage, window size, overlay, preset, the sound line, the message on screen or the last one and how long it
+  has been gone, the last error, the capture line (frames from the device,
   timestamp spacing, drops by reason, what macos runs) and the same counts since the source started.
 - **capture start (kept)**: kept apart from the log so they are still there after minutes of play: each source start
   with its format and layout, what was asked and what macos ran after the start and a second later, whether meyra had
-  to set it again, the first frame's size and layout, the first too-few-frames line and test switches in use.
+  to set it again, the first frame's size and layout, the audio input and how it was found or why there is none, the
+  first too-few-frames line and test switches in use.
 - **access**: camera and microphone permission as macos has it (read only, never asks; from terminal they are the
   terminal's), whether the app's signature holds, and whether it is signed ad hoc.
-- **devices**: what `--list-devices` prints.
-- **changed settings**: every saved setting that differs from its default, and test switches given on the command line.
+- **devices**: what `--list-devices` prints: per device what audio input > automatic takes and how, or why none; per
+  audio input how it is connected (usb, built-in, virtual, continuity, bluetooth) and its usb vendor:product.
+- **changed settings**: every saved setting that differs from what meyra uses when it is not set, and test switches
+  given on the command line. per-source entries carry the short hash, so two sources can be told apart.
 - **log, last lines**: the last 20 of the once-a-second lines and the source lines; the others carry device ids and
   folders, so they stay out.
 
@@ -931,6 +952,12 @@ capture start and log sections.
 - some consoles at 1440p are reported by the ultrastudio recorder 3g as 1080i and give no picture. set the
   console to 1080p.
 - surround sound is folded down to stereo. dolby and dts bitstreams are not decoded, set the console to pcm.
+- a usb webcam without camera or webcam in its name ("logitech brio") is taken for a card: on automatic it can get its
+  own microphone, by the same name as before 0.6.2, and since 0.6.2 also when the microphone shares its usb maker and
+  model or carries its name in its id. the overlay's audio row names the input; if it echoes, choose none in source >
+  audio input.
+- an audio input picked by hand is kept per source id, and macos likely gives a usb card a new id on another port: moved,
+  it starts on automatic again (which finds a card's own sound by itself since 0.6.2). pick it again if needed.
 - interlaced formats are shown without deinterlacing.
 - capture cards that deliver compressed video may defeat repeated-frame detection, which frame generation needs. the
   compressed layout has not been tried on a card that offers it.

@@ -1,5 +1,37 @@
 # changelog
 
+## v0.6.2
+
+released: 2026-11-28
+
+no sound from a usb capture card whose audio has another name.
+
+- fixed: audio input > automatic found a card's sound only by the same name or a shared id prefix, so a usb card like
+  "usb3 video" with its audio as "usb3 digital audio" got none, and nothing said so. automatic now tries, first hit
+  wins: the device macos links to the card, the same name, the id prefix, the same usb vendor and product, the card's
+  name inside the audio id. never a microphone by default, never the default input. a camera (built-in, iphone, a usb
+  webcam with camera or webcam in its name) gets none on automatic, it would feed back on speakers. a webcam without
+  such a word whose microphone shares its usb maker and model can get its microphone on automatic: choose none in
+  source > audio input if it echoes. two devices alike under one rule go on to the later rules (two blackmagic units
+  told apart by the id); none left gives none and says why. `--self-test` walks the rules over cards, cameras and
+  headsets.
+- fixed: without an audio input the overlay said "no sound coming in (headset)", the name being the output. it now
+  says "no audio input: choose one in source > audio input". with an input open the sound line names it and how it
+  was found, next to the output: "in step with the picture (input: usb3 digital audio, auto: same usb vendor:product;
+  output: …)", so a webcam microphone picked on automatic shows at once. "in step with the picture" shows only while
+  sound comes in, it no longer stays after the packets stop.
+- the log says at every source start which audio input it took and how (also in the start line), and what the device
+  runs, or why there is none: none found, set to none, not connected, no microphone access, could not be opened, not accepted by the
+  session. these were silent before.
+- debug report: the audio input's name, how automatic found it, its format and state, or why there is none; the
+  sound line; per audio input how it is connected and its usb vendor:product; per device what automatic takes.
+  changed settings lists only values that differ from what meyra uses when they are not set (a preset writing its
+  switches off is no change), and per-source entries carry the short hash: two "formats[avf]" are now two labels.
+  the window's message comes with its age, so a "starting…" from minutes ago reads as gone. a usb card id with its
+  leading zero dropped is shown as usb vendor:product too.
+- help: the sound entries say where the audio input is (source > audio input; the audio menu only has play and the
+  delay).
+
 ## v0.6.1
 
 released: 2026-11-27

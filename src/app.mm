@@ -8,6 +8,7 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <ImageIO/ImageIO.h>
 #include "audio.h"
+#include "audiomatch.h"
 #include "awake.h"
 #include "capcheck.h"
 #include "common.h"
@@ -367,7 +368,8 @@ static const Tip kTips[] = {
                          "a repeated frame can come unpacked a little differently: if frame generation says the source sends no repeated frames, turn on tolerant repeats (P). "
                          "if black looks dark grey (darkest about 30), the card packs video levels as full range jpeg: levels cannot undo that, uncompressed or a lower format can (experimental)"},
     {"debugreport", 0, "copies a text about this mac, its screens, the capture devices and their formats, what runs now and the changed settings, to paste into a message to the developer. no names, serial numbers or folders"},
-    {"ain", "audio input", "where the sound is taken from. choosing one restarts the source"},
+    {"ain", "audio input", "where the sound is taken from. automatic looks for the card's own sound. a camera (built-in, iphone, camera or webcam in its name) gets none; "
+                           "a webcam without such a word can get its microphone: choose none here if it echoes. choosing one restarts the source"},
     {"restart", "source", "stopped and started again, the levels are detected afresh"},
     {"replay", 0, "plays a folder of recorded raw frames (NAME_f000.uyvy, ...) as the source"},
     {"picker", 0, "the capture device, its format and its audio input in one window"},
@@ -699,6 +701,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     std::unique_ptr<Source> _source;
     std::string _sourceId, _sourceName;
     std::vector<std::string> _sourceNames; // every source started this run: the debug report scrubs their kept lines by name
+    std::vector<std::string> _audioNames;  // the same for every audio input opened this run, also one that is gone since
     SourceStatus _status;
     bool _sourceAudio;
     bool _hadFrames;
@@ -737,6 +740,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     bool _hasCap, _signalRateNoted, _starvePinned;
     std::set<std::string> _autoPacked; // sources switched to a compressed layout on their own this run, once each
     NSString *_lastMessage;        // the last message shown in the window, for the debug report
+    double _lastMessageAt, _lastMessageGone; // when it came up, when it went (0: still shown), sinceStart()
 }
 
 
@@ -1018,6 +1022,9 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         _videoDelay = _videoDelay > 0 ? _videoDelay + (vd - _videoDelay) * 0.5 : vd; // halfway each second: steady, still quick
     }
     // muteOutput: automated tests keep the speakers quiet while still measuring the sound path
+    { AudioInputInfo ai = _source ? _source->audioInput() : AudioInputInfo();
+      audio::setInput(ai.state == 1 ? ai.name + ", " + ai.how : "");
+      if (!ai.name.empty() && std::find(_audioNames.begin(), _audioNames.end(), ai.name) == _audioNames.end()) _audioNames.push_back(ai.name); }
     audio::retarget(_videoDelay > 0 ? _videoDelay : kDefaultVideoDelay, gSet.audioTrim, !gSet.audio || muteOutput());
 
     int w, h, fw, fh, up;
@@ -1102,7 +1109,7 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
         logLine("   audio %d frames/s | delay %.0f ms (video %.0f, trim %+.0f) | underruns %d overruns %d resyncs %d gaps %d | jitter %.1f ms | "
                 "peak in %.3f %.3f (any channel %.3f) out %.3f | %s",
                 a.frames, a.delayMs, _videoDelay * 1000, gSet.audioTrim * 1000, a.underruns, a.overruns, a.resyncs, a.gaps, a.jitterMs,
-                a.peakL, a.peakR, a.rawPeak, a.outPeak, audio::statusLine().c_str());
+                a.peakL, a.peakR, a.rawPeak, a.outPeak, [self soundText].UTF8String);
     if (s.in) logLine("   order %s | cadence %s%s%s", [[self orderParts:s] componentsJoinedByString:@" -> "].UTF8String, [self cadence:s].UTF8String,
                       gSet.frameGen && [self genWhy:s] ? " | not generating: " : "", gSet.frameGen ? ([self genWhy:s] ?: @"").UTF8String : "");
     // content time per present (renderer.h): even motion moves content exactly as far as the presents are apart. only
@@ -1129,8 +1136,24 @@ static int recMaxH() { id v = [NSUserDefaults.standardUserDefaults objectForKey:
     if (_win.styleMask & NSWindowStyleMaskFullScreen) [NSCursor setHiddenUntilMouseMoves:YES];
 }
 
+// the sound line for the overlay and the log. a system capture source without an audio input says so and where to
+// pick one, instead of the output's "no sound coming in"
+- (NSString *)soundText {
+    if (!audio::running()) return @"off";
+    AudioInputInfo ai = _source ? _source->audioInput() : AudioInputInfo();
+    if (ai.state == 2)
+        return ai.off == 1 ? @"no audio input: set to none in source > audio input"
+             : ai.off == 2 ? @"no audio input: no microphone access, allow it in system settings > privacy & security"
+                           : @"no audio input: choose one in source > audio input";
+    return @(audio::statusLine().c_str());
+}
+
 - (void)showMessage:(NSString *)m {
-    if (m.length) _lastMessage = m;
+    if (m.length) {
+        if (![m isEqual:_lastMessage] || _lastMessageGone) _lastMessageAt = sinceStart();
+        _lastMessage = m;
+        _lastMessageGone = 0;
+    } else if (_lastMessage.length && !_lastMessageGone) _lastMessageGone = sinceStart();
     _view.message.stringValue = m ?: @"";
     _view.message.hidden = m == nil;
 }
@@ -1610,7 +1633,7 @@ static NSString *sideDimName() { float v = gSet.sideDim; return v > 0.78f ? @"ve
             {sw(audio::running()), @"A", @"audio", !audio::running() ? @"off" : fabs(gSet.audioTrim) > 0.0005 ? [NSString stringWithFormat:@"on, %+.0f ms", gSet.audioTrim * 1000] : @"on", @"audio"},
             {kPick, @"; '", @" earlier / later", @"5 ms a press", @"trim"}};
         const NSUInteger keyW = 4, nameW = 21, valW = 18, cellW = 4 + keyW + nameW + valW;
-        NSString *aud = audio::running() ? @(audio::statusLine().c_str()).lowercaseString : @"off";
+        NSString *aud = [self soundText].lowercaseString;
         std::vector<Row> inf = {
             {kHead, nil, @"now", nil, nil},
             {kInfo, nil, @"source", @(_sourceName.c_str()), nil}, {kInfo, nil, @"signal", @(_status.text.c_str()).lowercaseString, nil},
@@ -3065,6 +3088,8 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     // name rules, also for a source used earlier this run and gone since
     std::vector<std::string> names = _sourceNames;
     names.push_back(_sourceName);
+    names.insert(names.end(), _audioNames.begin(), _audioNames.end());
+    if (_source) names.push_back(_source->audioInput().name);
     for (auto &d : listSources()) names.push_back(d.name);
     for (auto &c : listAVFAudioInputs()) names.push_back(c.name);
     std::string t;
@@ -3077,8 +3102,22 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
         add([NSString stringWithFormat:@"%@ [%@], %@", ns(_sourceName), ns(debugreport::shortId(_sourceId)), ns(_sourceInfo.kind)]);
         add([NSString stringWithFormat:@"format %@%@, layout %@%@", ns(fn), f == _sourceInfo.defaultFormat ? @" (default)" : @"", ns(ln).lowercaseString,
                                        [self curLayouts] && [self curLayout].empty() ? @" (compressed offered)" : @""]);
-        NSString *ain = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"audioInputs"][ns(_sourceId)] ?: @"auto";
-        add([NSString stringWithFormat:@"audio input %@, state %d \"%@\", %.2f fps asked", [ain isEqual:@"auto"] || [ain isEqual:@"none"] ? ain : @"chosen", (int)_status.state, ns(_status.text), _fps]);
+        NSString *ain = [[NSUserDefaults.standardUserDefaults dictionaryForKey:@"audioInputs"][ns(_sourceId)] description] ?: @"auto";
+        bool picked = ![ain isEqual:@"auto"] && ![ain isEqual:@"none"];
+        AudioInputInfo ai = _source ? _source->audioInput() : AudioInputInfo();
+        std::string chosen; // a hand-picked input's name, also when it is not connected (then: not connected)
+        if (picked) for (auto &c : listAVFAudioInputs()) if (c.id == ain.UTF8String) chosen = c.name;
+        NSString *line = [NSString stringWithFormat:@"audio input %@", picked ? @"chosen" : ain];
+        if (ai.state == 1) {
+            NSString *how = [ns(ai.how) hasPrefix:@"auto: "] ? [NSString stringWithFormat:@" (%@)", [ns(ai.how) substringFromIndex:6]] : @"";
+            line = [line stringByAppendingFormat:@" -> %@%@, %@, open", ns(ai.name), how, ns(ai.format)];
+        } else if (ai.state == 2) {
+            NSString *why = [ns(ai.why) hasPrefix:@"auto: "] ? [ns(ai.why) substringFromIndex:6] : ns(ai.why); // the line starts with auto already
+            line = [line stringByAppendingFormat:@" -> none%@: %@", picked ? [NSString stringWithFormat:@" (%@)", chosen.empty() ? @"not connected" : ns(chosen)] : @"", why];
+        } else if (picked) line = [line stringByAppendingFormat:@" -> %@", chosen.empty() ? @"not connected" : ns(chosen)];
+        if (_sourceId.rfind("avf:", 0) == 0 && ai.state == 0) line = [line stringByAppendingString:@", not open yet"];
+        add(line);
+        add([NSString stringWithFormat:@"state %d \"%@\", %.2f fps asked", (int)_status.state, ns(_status.text), _fps]);
         if (_starved) add([self starveHint]);
     }
     section("source", t);
@@ -3096,7 +3135,13 @@ static NSMenu *submenu(NSMenu *parent, NSString *title) {
     add([NSString stringWithFormat:@"window %.0f×%.0f px%@, overlay %@", _win.contentView.bounds.size.width * (_win.backingScaleFactor ?: 1), _win.contentView.bounds.size.height * (_win.backingScaleFactor ?: 1),
                                    (_win.styleMask & NSWindowStyleMaskFullScreen) ? @", full screen" : @"", gSet.overlay ? @"on" : @"off"]);
     add([NSString stringWithFormat:@"preset %@", _preset ? [NSString stringWithFormat:@"%d", _preset % 10] : _presetWas ? [NSString stringWithFormat:@"%d, changed by hand", _presetWas % 10] : @"none"]);
-    if (_lastMessage.length) add([@"last message: " stringByAppendingString:[_lastMessage stringByReplacingOccurrencesOfString:@"\n" withString:@" "]]);
+    if (_source) add([@"sound " stringByAppendingString:[self soundText]]);
+    if (_lastMessage.length) { // with its age: a "starting…" from minutes ago is not what is on screen now
+        NSString *m = [_lastMessage stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        double now = sinceStart();
+        add(_lastMessageGone ? [NSString stringWithFormat:@"last message (gone for %.0f s, was up %.0f s): %@", now - _lastMessageGone, _lastMessageGone - _lastMessageAt, m]
+                             : [NSString stringWithFormat:@"message on screen (for %.0f s): %@", now - _lastMessageAt, m]);
+    }
     if (_status.state == SourceState::Error) add([@"last error: " stringByAppendingString:ns(_status.text)]);
     if (_hasCap) {
         add([@"capture " stringByAppendingString:[self capText]]);
@@ -3187,18 +3232,29 @@ static std::string deviceText(bool raw) {
     std::vector<std::string> hints;
     std::string t;
     auto add = [&](const char *fmt, auto... a) { char b[1024]; snprintf(b, sizeof b, fmt, a...); t += b; };
+    std::vector<std::string> names; // device names inside a reason line get their own rule
+    for (auto &c : listAVFAudioInputs()) names.push_back(c.name);
+    for (AVCaptureDevice *d in [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeExternal, AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeContinuityCamera] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified].devices)
+        names.push_back(d.localizedName.UTF8String ?: "");
     auto idText = [&](const std::string &id) { std::string k = debugreport::shortId(id); return raw ? id : (k.empty() ? "" : k + " ") + debugreport::idHash(id); };
     for (auto &s : listSources(&hints)) {
         add("  %s  [%s]  %s, %s:", (raw ? s.name : debugreport::scrubName(s.name)).c_str(), idText(s.id).c_str(), s.kind.c_str(), s.formatLabel.c_str());
         for (auto &c : s.formats) add(" %s%s", c.name.c_str(), c.id == s.defaultFormat ? "*" : "");
         t += "\n";
+        if (s.pickAudio) { // what audio input > automatic takes for it, and how it was found
+            std::string an, how;
+            if (autoAVFAudio(s.id, an, how)) add("    audio on automatic: %s (%s)\n", (raw ? an : debugreport::scrubName(an)).c_str(), how.c_str());
+            else add("    audio on automatic: none, %s\n", (raw ? how : debugreport::scrubKnown(how, names)).c_str());
+        }
         auto rows = listAVFLayouts(s.id); // every layout the device reports per size and rate
         if (!rows.empty()) t += "    layouts by size and rate (* what the format opens, + offered as compressed):\n";
         for (auto &r : rows) t += "      " + r + "\n";
     }
     for (auto &h : hints) add("note: %s\n", (raw ? h : debugreport::scrub(h)).c_str());
     t += "avfoundation audio inputs:\n";
-    for (auto &c : listAVFAudioInputs()) add("  %s  [%s]\n", (raw ? c.name : debugreport::scrubName(c.name)).c_str(), (raw ? c.id : debugreport::idHash(c.id)).c_str());
+    for (auto &c : listAVFAudioFacts())
+        add("  %s  [%s]  %s%s%s\n", (raw ? c.name : debugreport::scrubName(c.name)).c_str(), (raw ? c.id : debugreport::idHash(c.id)).c_str(), c.transport.c_str(),
+            c.usb.empty() ? "" : c.transport == "usb" ? " " : ", usb ", c.usb.c_str());
     add("frame generation: %s\n", framegen::available() ? "available" : "not available");
     return t;
 }
@@ -3253,6 +3309,11 @@ static int selfTest() {
     check("M: plain, metalfx, apple sr, fsr 1, sgsr 1, hashed, plain", walk([](int u) { return nextUpscale(u, true); }, 0, 6) == std::vector<int>({0, 1, 2, 3, 4, 5, 0}));
     check("M without apple sr: plain, metalfx, fsr 1, sgsr 1, hashed, plain", walk([](int u) { return nextUpscale(u, false); }, 0, 5) == std::vector<int>({0, 1, 3, 4, 5, 0}));
     bad += debugreport::scrubTest();
+    bad += audiomatch::selfTest();
+    check("short id of a uvc id with its leading zero dropped: avf usb 345f:2131", debugreport::shortId("avf:0x3a9e40c345f2131") == "avf usb 345f:2131");
+    check("short id of a full uvc id: avf usb 046d:082d", debugreport::shortId("avf:0x14100000046d082d") == "avf usb 046d:082d");
+    check("scrub of a uvc id with its leading zero dropped", debugreport::scrub("id 0x3a9e40c345f2131") == "id usb 345f:2131");
+    bad += debugreport::settingsTest();
     printf("%s\n", bad ? "self-test failed" : "self-test passed");
     return bad ? 1 : 0;
 }

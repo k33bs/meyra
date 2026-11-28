@@ -8,6 +8,7 @@
 #import <CoreMedia/CoreMedia.h>
 #include "source.h"
 #include "audio.h"
+#include "audiomatch.h"
 #include "capcheck.h"
 #include "common.h"
 #include "renderer.h"
@@ -23,6 +24,11 @@ static NSArray<AVCaptureDevice *> *videoDevices() {
 
 static NSArray<AVCaptureDevice *> *audioDevices() {
     return [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeMicrophone] mediaType:AVMediaTypeAudio position:AVCaptureDevicePositionUnspecified].devices;
+}
+
+// built-in and iphone cameras. a usb webcam is listed like any card (audiomatch::cameraLike tells it by name)
+static bool isCamera(AVCaptureDevice *d) {
+    return d.continuityCamera || [d.deviceType isEqual:AVCaptureDeviceTypeBuiltInWideAngleCamera] || [d.deviceType isEqual:AVCaptureDeviceTypeContinuityCamera];
 }
 
 struct Mode { int w, h; double fps; AVCaptureDeviceFormat *fmt; AVFrameRateRange *range; int rank; };
@@ -116,7 +122,7 @@ std::vector<SourceInfo> listAVF(const std::vector<std::string> &vendorsWithDrive
         for (auto &v : vendorsWithDriver)
             if ([d.manufacturer rangeOfString:@(v.c_str()) options:NSCaseInsensitiveSearch].location != NSNotFound ||
                 [d.localizedName rangeOfString:@(v.c_str()) options:NSCaseInsensitiveSearch].location != NSNotFound) { s.name += " (standard capture)"; break; }
-        bool camera = d.continuityCamera || [d.deviceType isEqual:AVCaptureDeviceTypeBuiltInWideAngleCamera] || [d.deviceType isEqual:AVCaptureDeviceTypeContinuityCamera];
+        bool camera = isCamera(d);
         s.group = camera ? "Cameras" : "Capture devices";
         s.captureDevice = !camera && s.name.find(" (standard capture)") == std::string::npos; // the driver entry counts, once
         if (camera) s.kind = "camera";
@@ -192,16 +198,65 @@ std::vector<Choice> listAVFAudioInputs() {
     return v;
 }
 
-// the audio half of a capture card is a separate device. match it by name, or by a shared id prefix
-static AVCaptureDevice *matchingAudio(AVCaptureDevice *video) {
-    NSString *vid = video.uniqueID;
-    NSRange colon = [vid rangeOfString:@":" options:NSBackwardsSearch];
-    NSString *prefix = colon.location != NSNotFound ? [vid substringToIndex:colon.location] : nil;
-    for (AVCaptureDevice *a in audioDevices()) {
-        if ([a.localizedName isEqualToString:video.localizedName]) return a;
-        if (prefix && [a.uniqueID hasPrefix:prefix]) return a;
+static std::string s8(NSString *s) { return s.UTF8String ?: ""; }
+
+static std::string transportText(int32_t t) {
+    switch ((uint32_t)t) {
+    case 'usb ': return "usb";
+    case 'bltn': return "built-in";
+    case 'virt': return "virtual";
+    case 'ccwd': return "continuity";
+    case 'blue': case 'blea': return "bluetooth";
+    case 'thun': return "thunderbolt";
+    case 'pci ': return "pci";
+    case 'hdmi': return "hdmi";
+    case 'dprt': return "displayport";
+    case 'airp': return "airplay";
+    case 'avb ': return "avb";
+    case 'othr': return "other";
+    case 0: return "unknown";
     }
-    return nil;
+    std::string f = fourcc((FourCharCode)t);
+    while (!f.empty() && f.back() == ' ') f.pop_back();
+    return f;
+}
+
+std::vector<AudioInputFacts> listAVFAudioFacts() {
+    std::vector<AudioInputFacts> v;
+    for (AVCaptureDevice *d in audioDevices()) v.push_back({s8(d.uniqueID), d.localizedName.UTF8String ?: "?", transportText(d.transportType), audiomatch::audioUsb(s8(d.modelID))});
+    return v;
+}
+
+// the audio half of a capture card is a separate device: audiomatch says which, on "automatic"
+static audiomatch::Result matchingAudio(AVCaptureDevice *video, AVCaptureDevice **out) {
+    NSArray<AVCaptureDevice *> *aud = audioDevices();
+    audiomatch::Video v{s8(video.localizedName), s8(video.uniqueID), s8(video.modelID), isCamera(video) ? "camera" : "capture device", {}};
+    for (AVCaptureDevice *l in video.linkedDevices) if ([l hasMediaType:AVMediaTypeAudio]) v.linked.push_back(s8(l.uniqueID));
+    std::vector<audiomatch::Dev> list;
+    for (AVCaptureDevice *a in aud) list.push_back({s8(a.localizedName), s8(a.uniqueID), s8(a.modelID)});
+    audiomatch::Result r = audiomatch::match(v, list);
+    *out = r.index >= 0 && r.index < (int)aud.count ? aud[r.index] : nil;
+    return r;
+}
+
+bool autoAVFAudio(const std::string &id, std::string &name, std::string &how) {
+    AVCaptureDevice *d = id.rfind("avf:", 0) == 0 ? [AVCaptureDevice deviceWithUniqueID:@(id.substr(4).c_str())] : nil;
+    if (!d) { how = "not connected"; return false; }
+    AVCaptureDevice *a = nil;
+    audiomatch::Result r = matchingAudio(d, &a);
+    if (!a) { how = r.why; return false; }
+    name = s8(a.localizedName);
+    how = r.how;
+    return true;
+}
+
+// what the device itself runs, "48000 Hz 2 ch" (avfoundation converts it to what the output asks for)
+static std::string audioFormatText(AVCaptureDevice *a) {
+    const AudioStreamBasicDescription *d = a.activeFormat ? CMAudioFormatDescriptionGetStreamBasicDescription(a.activeFormat.formatDescription) : nullptr;
+    if (!d) return "format unknown";
+    char b[64];
+    snprintf(b, sizeof b, "%.0f Hz %u ch", d->mSampleRate, (unsigned)d->mChannelsPerFrame);
+    return b;
 }
 
 // hidden test switches for capture the way some other apps do it, as launch arguments (-avfKeepLock YES) or saved
@@ -280,6 +335,7 @@ public:
     double lastPts_ = -1;
     bool firstSeen_ = false;
     std::string askedText_, activeText_;
+    AudioInputInfo ain_; // under cl_
     double askedFps_ = 0, activeFps_ = 0, activeMinFps_ = 0;
     bool mismatch_ = false;
 
@@ -287,6 +343,12 @@ public:
     ~AVFSource() override { stop(); }
     double frameDuration() override { return dur_; }
     bool hasAudio() override { return audioOn_; }
+    AudioInputInfo audioInput() override {
+        os_unfair_lock_lock(&cl_);
+        AudioInputInfo a = ain_;
+        os_unfair_lock_unlock(&cl_);
+        return a;
+    }
     bool takeCounts(CaptureCounts &out) override {
         std::vector<double> v;
         v.reserve(512); // the capture queue gets this one: no allocation there
@@ -323,7 +385,10 @@ public:
         auto go = [this, alive, q, opt, dev] { // `this` only on the session queue, behind the alive check
             void (^run)(BOOL) = ^(BOOL) { dispatch_async(q, ^{ if (*alive) configure(); }); };
             bool wanted = opt.audio && opt.audioInput != "none" && opt.mayPrompt;
-            bool have = wanted && (opt.audioInput.empty() || opt.audioInput == "auto" ? matchingAudio(dev) : [AVCaptureDevice deviceWithUniqueID:@(opt.audioInput.c_str())]) != nil;
+            AVCaptureDevice *a = nil;
+            if (wanted && (opt.audioInput.empty() || opt.audioInput == "auto")) matchingAudio(dev, &a);
+            else if (wanted) a = [AVCaptureDevice deviceWithUniqueID:@(opt.audioInput.c_str())];
+            bool have = a != nil;
             bool ask = have && [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusNotDetermined;
             if (ask) [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:run];
             else run(YES);
@@ -341,13 +406,26 @@ public:
 
     // session queue
     void configure() {
+        // the audio input, and why there is none. every way out says why, in the log and in audioInput()
         AVCaptureDevice *audioDev = nil;
-        if (opt_.audio && opt_.audioInput != "none") {
-            audioDev = opt_.audioInput.empty() || opt_.audioInput == "auto" ? matchingAudio(dev_) : [AVCaptureDevice deviceWithUniqueID:@(opt_.audioInput.c_str())];
-            if (audioDev && [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] != AVAuthorizationStatusAuthorized) {
-                logLine("avfoundation: no microphone access, picture only");
-                audioDev = nil;
-            }
+        AudioInputInfo ai;
+        ai.state = 2;
+        bool autoIn = opt_.audioInput.empty() || opt_.audioInput == "auto";
+        ai.how = autoIn ? "auto" : opt_.audioInput == "none" ? "none" : "chosen";
+        if (!opt_.audio) ai.why = "play audio is off";
+        else if (opt_.audioInput == "none") { ai.off = 1; ai.why = "set to none in source > audio input"; }
+        else if (autoIn) {
+            audiomatch::Result r = matchingAudio(dev_, &audioDev);
+            if (audioDev) ai.how = "auto: " + r.how;
+            else ai.why = "auto: " + r.why;
+        } else if (!(audioDev = [AVCaptureDevice deviceWithUniqueID:@(opt_.audioInput.c_str())]))
+            ai.why = "the chosen input is not connected: choose one in source > audio input";
+        if (audioDev) ai.name = s8(audioDev.localizedName);
+        if (audioDev && [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] != AVAuthorizationStatusAuthorized) {
+            logLine("avfoundation: no microphone access, picture only");
+            ai.off = 2;
+            ai.why = "no microphone access: allow it in system settings > privacy & security > microphone";
+            audioDev = nil;
         }
         session_ = [AVCaptureSession new];
         [session_ beginConfiguration];
@@ -434,16 +512,27 @@ public:
         }
         [session_ addOutput:vout_];
         if (audioDev) {
-            AVCaptureDeviceInput *ain = [AVCaptureDeviceInput deviceInputWithDevice:audioDev error:nil];
-            if (ain && [session_ canAddInput:ain]) {
+            NSError *ae = nil;
+            AVCaptureDeviceInput *ain = [AVCaptureDeviceInput deviceInputWithDevice:audioDev error:&ae];
+            if (!ain) ai.why = "could not be opened: " + (ae ? s8(ae.localizedDescription) : std::string("no reason given"));
+            else if (![session_ canAddInput:ain]) ai.why = "cannot be added to the capture session";
+            else {
                 [session_ addInput:ain];
                 aout_ = [AVCaptureAudioDataOutput new];
                 aout_.audioSettings = @{AVFormatIDKey: @(kAudioFormatLinearPCM), AVSampleRateKey: @48000, AVNumberOfChannelsKey: @2,
                                         AVLinearPCMBitDepthKey: @32, AVLinearPCMIsFloatKey: @YES, AVLinearPCMIsNonInterleaved: @NO, AVLinearPCMIsBigEndianKey: @NO};
                 [aout_ setSampleBufferDelegate:del_ queue:audioQ_];
                 if ([session_ canAddOutput:aout_]) { [session_ addOutput:aout_]; audioOn_ = true; }
+                else ai.why = "its output was not accepted by the capture session";
             }
+            if (audioOn_) { ai.state = 1; ai.format = audioFormatText(audioDev); }
+            else ai.why = ai.name + " " + ai.why;
         }
+        if (ai.state == 1) logPin("avfoundation: audio from %s (%s), device runs %s", ai.name.c_str(), ai.how.c_str(), ai.format.c_str());
+        else logPin("avfoundation: audio off: %s", ai.why.c_str());
+        os_unfair_lock_lock(&cl_);
+        ain_ = ai;
+        os_unfair_lock_unlock(&cl_);
         if (!dg.early) setFormat();
         [session_ commitConfiguration];
         auto alive = alive_;
@@ -459,7 +548,8 @@ public:
         [session_ startRunning];
         if (held) [dev_ unlockForConfiguration];
         running_ = true;
-        logPin("avfoundation: %s started, %s, audio %s%s", dev_.localizedName.UTF8String, signal_.c_str(), audioOn_ ? "on" : "off",
+        logPin("avfoundation: %s started, %s, audio %s%s", dev_.localizedName.UTF8String, signal_.c_str(),
+               ai.state == 1 ? ("from " + ai.name + " (" + ai.how + ")").c_str() : "off",
                ![vout_.availableVideoCVPixelFormatTypes containsObject:@(outFmt)] ? [NSString stringWithFormat:@", %s not offered by the output", fourcc(outFmt).c_str()].UTF8String : "");
         // macos can run another format or rate than was set (it may reset them at start): read back, set again where
         // it differs. where it runs what was asked nothing is set a second time. once more a second later
